@@ -29,12 +29,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          # <!-- DEVELOPER: Update with your org/user name -->
           images: ghcr.io/strayer/doco-cd
           tags: |
             type=semver,pattern={{version}},value=${{ steps.get_version.outputs.tag }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ steps.get_version.outputs.tag }}
-            type=semver,pattern={{major}},value=${{ steps.get_version.outputs.tag }}
             type=raw,value=latest
       - name: Validate source directory
         run: |
@@ -43,13 +40,13 @@ jobs:
             echo "Make sure the source code has been synced before building"
             exit 1
           fi
-          
+
           if [[ ! -f "doco-cd-src/Dockerfile" ]]; then
             echo "Error: Dockerfile not found in doco-cd-src"
             echo "The vendored source must contain a Dockerfile"
             exit 1
           fi
-          
+
           echo "Source directory validated successfully"
       - name: Build and push image using upstream Dockerfile
         uses: docker/build-push-action@v6
