@@ -1,0 +1,25 @@
+# NOTE: This is just for testing deployments
+services:
+  app:
+    container_name: test
+    image: nginx:latest
+    ports:
+      - "80"  # use random published port
+    volumes:
+      - ./:/usr/share/nginx/html
+    environment:
+      TEST_ENV_VAR: example_value
+    env_file:
+      - test.env
+    secrets:
+      - test_secret
+    configs:
+      - test_config
+
+secrets:
+  test_secret:
+    file: ./secret.txt
+
+configs:
+  test_config:
+    file: ./config.conf
