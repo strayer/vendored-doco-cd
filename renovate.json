@@ -1,6 +1,7 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["config:base"],
+  "ignorePaths": ["doco-cd-src/"],
   "regexManagers": [
     {
       "fileMatch": ["^\\.doco-cd-version$"],
@@ -10,3 +11,4 @@
     }
   ]
 }
+
