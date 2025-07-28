@@ -1,0 +1,65 @@
+name: Build and Publish Image
+on:
+  push:
+    branches:
+      - main
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Log in to the GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up QEMU for multi-platform builds
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Get image version from file
+        id: get_version
+        run: echo "tag=$(cat .doco-cd-version)" >> $GITHUB_OUTPUT
+      - name: Extract metadata for the Docker image
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # <!-- DEVELOPER: Update with your org/user name -->
+          images: ghcr.io/strayer/doco-cd
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.get_version.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.get_version.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ steps.get_version.outputs.tag }}
+            type=raw,value=latest
+      - name: Validate source directory
+        run: |
+          if [[ ! -d "doco-cd-src" ]]; then
+            echo "Error: doco-cd-src directory not found"
+            echo "Make sure the source code has been synced before building"
+            exit 1
+          fi
+          
+          if [[ ! -f "doco-cd-src/Dockerfile" ]]; then
+            echo "Error: Dockerfile not found in doco-cd-src"
+            echo "The vendored source must contain a Dockerfile"
+            exit 1
+          fi
+          
+          echo "Source directory validated successfully"
+      - name: Build and push image using upstream Dockerfile
+        uses: docker/build-push-action@v6
+        with:
+          context: ./doco-cd-src
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.get_version.outputs.tag }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=registry,ref=${{ steps.meta.outputs.images[0] }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.images[0] }}:buildcache,mode=max
