@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:base"],
+  "regexManagers": [
+    {
+      "fileMatch": ["^\\.doco-cd-version$"],
+      "matchStrings": ["^v(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)$"],
+      "depNameTemplate": "kimdre/doco-cd",
+      "datasourceTemplate": "github-releases"
+    }
+  ]
+}
