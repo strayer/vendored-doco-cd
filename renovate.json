@@ -1,14 +1,22 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:base"],
-  "ignorePaths": ["doco-cd-src/"],
-  "regexManagers": [
+  "extends": [
+    "config:recommended"
+  ],
+  "ignorePaths": [
+    "doco-cd-src/"
+  ],
+  "customManagers": [
     {
-      "fileMatch": ["^\\.doco-cd-version$"],
-      "matchStrings": ["^v(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)$"],
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/^\\.doco-cd-version$/"
+      ],
+      "matchStrings": [
+        "^v(?<currentValue>[0-9]+\\.[0-9]+\\.[0-9]+)$"
+      ],
       "depNameTemplate": "kimdre/doco-cd",
       "datasourceTemplate": "github-releases"
     }
   ]
 }
-
