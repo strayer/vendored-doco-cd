@@ -1,0 +1,92 @@
+name: Sync Vendor Code
+on:
+  pull_request:
+    paths:
+      - '.doco-cd-version'
+
+concurrency:
+  group: sync-vendor-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: read
+    if: |
+      github.event.pull_request.author_association == 'OWNER' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.author_association == 'COLLABORATOR' ||
+      (startsWith(github.head_ref, 'renovate/') && github.actor == 'renovate[bot]')
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+      - name: Get Target Version
+        id: get_version
+        run: |
+          VERSION=$(cat .doco-cd-version)
+          echo "Target version from file: ${VERSION}"
+          
+          # Validate version format (v + semver)
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Error: Invalid version format in .doco-cd-version: $VERSION"
+            echo "Expected format: vX.Y.Z (e.g., v0.31.0)"
+            exit 1
+          fi
+          
+          echo "tag=${VERSION}" >> $GITHUB_OUTPUT
+      - name: Sync Source Code
+        run: |
+          set -euo pipefail
+          
+          TARGET_DIR="doco-cd-src"
+          UPSTREAM_REPO="kimdre/doco-cd"
+          VERSION_TAG="${{ steps.get_version.outputs.tag }}"
+          
+          echo "Cleaning old code from ${TARGET_DIR}"
+          rm -rf "${TARGET_DIR:?}"
+          mkdir -p "${TARGET_DIR}"
+          
+          echo "Downloading source for tag ${VERSION_TAG} from ${UPSTREAM_REPO}"
+          TEMP_FILE=$(mktemp)
+          
+          # Download with error handling
+          if ! curl -fsL "https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${VERSION_TAG}.tar.gz" -o "$TEMP_FILE"; then
+            echo "Error: Failed to download source code for ${VERSION_TAG}"
+            rm -f "$TEMP_FILE"
+            exit 1
+          fi
+          
+          # Extract with error handling
+          if ! tar -xzf "$TEMP_FILE" --strip-components=1 -C "${TARGET_DIR}"; then
+            echo "Error: Failed to extract source code"
+            rm -f "$TEMP_FILE"
+            exit 1
+          fi
+          
+          rm -f "$TEMP_FILE"
+          
+          # Verify critical files exist
+          if [[ ! -f "${TARGET_DIR}/Dockerfile" ]]; then
+            echo "Error: Dockerfile not found in extracted source"
+            exit 1
+          fi
+          
+          echo "Source code successfully synced"
+      - name: Commit and Push Changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet --exit-code; then
+            echo "No source code changes detected. Nothing to commit."
+            exit 0
+          fi
+          echo "Committing updated source code..."
+          git add doco-cd-src/
+          git commit -m "[Auto] Sync source code for ${{ steps.get_version.outputs.tag }}"
+          git push
