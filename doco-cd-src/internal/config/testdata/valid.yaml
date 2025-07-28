@@ -1,0 +1,4 @@
+name: test-deploy
+reference: refs/heads/main
+compose_files:
+  - dev.compose.yaml
