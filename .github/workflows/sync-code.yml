@@ -32,10 +32,10 @@ jobs:
           VERSION=$(cat .doco-cd-version)
           echo "Target version from file: ${VERSION}"
           
-          # Validate version format (v + semver)
-          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+          # Validate version format (v + semver with optional pre-release/build metadata)
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
             echo "Error: Invalid version format in .doco-cd-version: $VERSION"
-            echo "Expected format: vX.Y.Z (e.g., v0.31.0)"
+            echo "Expected format: vX.Y.Z (e.g., v0.31.0) with optional pre-release (e.g., v0.32.0-rc.2) or build metadata"
             exit 1
           fi
           

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kimdre/doco-cd/internal/notification"
+
 	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/docker/compose/v2/pkg/api"
@@ -90,7 +92,7 @@ func TestLoadCompose(t *testing.T) {
 
 	createComposeFile(t, filePath, composeContents)
 
-	project, err := LoadCompose(ctx, tmpDir, projectName, []string{filePath})
+	project, err := LoadCompose(ctx, tmpDir, projectName, []string{filePath}, []string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +179,7 @@ func TestDeployCompose(t *testing.T) {
 	t.Log("Load compose file")
 	createComposeFile(t, filePath, composeContents)
 
-	project, err := LoadCompose(ctx, tmpDir, projectName, []string{filePath})
+	project, err := LoadCompose(ctx, tmpDir, projectName, []string{filePath}, []string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,8 +223,15 @@ func TestDeployCompose(t *testing.T) {
 		log := logger.New(slog.LevelInfo)
 		jobLog := log.With(slog.String("job_id", jobID))
 
-		err = DeployStack(jobLog, repoPath, repoPath, &ctx, &dockerCli, dockerClient,
-			&p, deployConf, []git.ChangedFile{}, latestCommit, "test", "poll", false)
+		metadata := notification.Metadata{
+			Repository: p.FullName,
+			Stack:      deployConf.Name,
+			Revision:   notification.GetRevision(deployConf.Reference, latestCommit),
+			JobID:      jobID,
+		}
+
+		err = DeployStack(jobLog, repoPath, repoPath, &ctx, &dockerCli, dockerClient, &p, deployConf,
+			[]git.ChangedFile{}, latestCommit, "test", "poll", false, metadata)
 		if err != nil {
 			if errors.Is(err, config.ErrDeprecatedConfig) {
 				t.Log(err.Error())
@@ -344,7 +353,7 @@ func TestHasChangedConfigs(t *testing.T) {
 
 	t.Chdir(tmpDir)
 
-	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{"docker-compose.yml"})
+	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{"docker-compose.yml"}, []string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
@@ -407,7 +416,7 @@ func TestHasChangedSecrets(t *testing.T) {
 
 	t.Chdir(tmpDir)
 
-	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{"docker-compose.yml"})
+	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{"docker-compose.yml"}, []string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
@@ -470,7 +479,7 @@ func TestHasChangedBindMounts(t *testing.T) {
 
 	t.Chdir(tmpDir)
 
-	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{"docker-compose.yml"})
+	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{"docker-compose.yml"}, []string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
