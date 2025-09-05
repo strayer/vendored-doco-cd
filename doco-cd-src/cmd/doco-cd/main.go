@@ -24,6 +24,7 @@ import (
 )
 
 const (
+	apiPath     = "/v1/api"
 	webhookPath = "/v1/webhook"
 	healthPath  = "/v1/health"
 	dataPath    = "/data"
@@ -37,13 +38,11 @@ var (
 // getAppContainerID retrieves the application container ID from the cpuset file.
 func getAppContainerID() (string, error) {
 	const (
-		cgroupMounts = "/proc/self/mountinfo"
-		dockerPath   = "/docker/containers/"
-		podmanPath   = "/containers/storage/overlay-containers/"
+		cgroupMounts  = "/proc/self/mountinfo"
+		containerPath = "/containers/"
 	)
 
-	dockerPattern := regexp.MustCompile(dockerPath + `([a-z0-9]+)`)
-	podmanPattern := regexp.MustCompile(podmanPath + `([a-z0-9]+)`)
+	containerPattern := regexp.MustCompile(containerPath + `([a-z0-9]+)`)
 
 	data, err := os.ReadFile(cgroupMounts)
 	if err != nil {
@@ -57,24 +56,18 @@ func getAppContainerID() (string, error) {
 			continue
 		}
 
-		path := fields[3]
+		mountPath := fields[3]
 
 		if strings.Contains(line, "/etc/hostname") {
-			if strings.Contains(path, dockerPath) {
-				if matches := dockerPattern.FindStringSubmatch(path); len(matches) > 1 {
-					return matches[1], nil
-				}
-			}
-
-			if strings.Contains(path, podmanPath) {
-				if matches := podmanPattern.FindStringSubmatch(path); len(matches) > 1 {
+			if strings.Contains(mountPath, containerPath) {
+				if matches := containerPattern.FindStringSubmatch(mountPath); len(matches) > 1 {
 					return matches[1], nil
 				}
 			}
 		}
 	}
 
-	return "", errors.New("container ID not found")
+	return "", docker.ErrContainerIDNotFound
 }
 
 // GetProxyUrlRedacted takes a proxy URL string and redacts the password if it exists.
@@ -247,15 +240,13 @@ func main() {
 		log:            log,
 	}
 
-	http.HandleFunc(webhookPath, h.WebhookHandler)
-	http.HandleFunc(webhookPath+"/{customTarget}", h.WebhookHandler)
-
-	http.HandleFunc(healthPath, h.HealthCheckHandler)
+	// Register HTTP endpoints
+	enabledEndpoints := registerHttpEndpoints(c, &h, log)
 
 	log.Info(
 		"listening for events",
 		slog.Int("http_port", int(c.HttpPort)),
-		slog.String("path", webhookPath),
+		slog.Any("enabled_endpoints", enabledEndpoints),
 	)
 
 	if len(c.PollConfig) > 0 {
