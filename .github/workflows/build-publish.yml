@@ -73,6 +73,7 @@ jobs:
           context: ./doco-cd-src
           platforms: ${{ matrix.platform }}
           labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.REGISTRY_IMAGE }}
           build-args: |
             APP_VERSION=${{ steps.get_version.outputs.tag }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
