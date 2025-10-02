@@ -1,10 +1,25 @@
-# syntax=docker/dockerfile:1@sha256:38387523653efa0039f8e1c89bb74a30504e76ee9f565e25c9a09841f9427b05
-FROM golang:1.25.1@sha256:76a94c4a37aaab9b1b35802af597376b8588dc54cd198f8249633b4e117d9fcc AS build-stage
+# syntax=docker/dockerfile:1@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
+FROM golang:1.25.1@sha256:8305f5fa8ea63c7b5bc85bd223ccc62941f852318ebfbd22f53bbd0b358c07e1 AS build-stage
 
 ARG APP_VERSION=dev
 
 # Set destination for COPY
 WORKDIR /app
+
+# Install prerequisites for Bitwarden SDK
+RUN apt-get update && apt-get install -y \
+    musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set build environment
+# CGO_ENABLED=1 and CC=musl-gcc are required for Bitwarden SDK
+ENV GOCACHE=/root/.cache/go-build \
+    CGO_ENABLED=1 \
+    CC=musl-gcc \
+    GOOS=linux
+
+# Bitwarden SDK build flags https://github.com/bitwarden/sdk-go/blob/main/INSTRUCTIONS.md
+ARG BW_SDK_BUILD_FLAGS="-linkmode external -extldflags '-static -Wl,-unresolved-symbols=ignore-all'"
 
 # Download Go modules
 COPY go.mod go.sum ./
@@ -17,16 +32,11 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
 # Copy source code
 COPY . ./
 
-# Set build environment
-ENV GOCACHE=/root/.cache/go-build \
-    CGO_ENABLED=0 \
-    GOOS=linux
-
 # Build and strip binary
 RUN --mount=type=cache,target=/go/pkg/mod/ \
     --mount=type=cache,target="/root/.cache/go-build" \
     --mount=type=bind,target=. \
-    go build -ldflags="-s -w -X main.Version=${APP_VERSION}" -o / ./...
+    go build -ldflags="-s -w -X main.Version=${APP_VERSION} ${BW_SDK_BUILD_FLAGS}" -o / ./...
 
 #FROM busybox AS busybox-binaries
 #
@@ -34,7 +44,7 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
 #ADD https://busybox.net/downloads/binaries/$BUSYBOX_VERSION/busybox_WGET /wget
 #RUN chmod a+x /wget
 
-FROM gcr.io/distroless/base-debian12@sha256:d605e138bb398428779e5ab490a6bbeeabfd2551bd919578b1044718e5c30798 AS build-release-stage
+FROM gcr.io/distroless/base-debian12@sha256:fa15492938650e1a5b87e34d47dc7d99a2b4e8aefd81b931b3f3eb6bb4c1d2f6 AS build-release-stage
 
 WORKDIR /
 

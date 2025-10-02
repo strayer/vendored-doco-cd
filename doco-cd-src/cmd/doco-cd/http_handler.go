@@ -13,7 +13,10 @@ import (
 	"time"
 
 	apiInternal "github.com/kimdre/doco-cd/internal/api"
+	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/secretprovider"
+	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v2/pkg/api"
@@ -40,6 +43,7 @@ type handlerData struct {
 	dockerCli      command.Cli          // Docker CLI client
 	dockerClient   *client.Client       // Docker client
 	log            *logger.Logger       // Logger for logging messages
+	secretProvider *secretprovider.SecretProvider
 }
 
 // onError handles errors by logging them, sending a JSON error response, and sending a notification.
@@ -80,7 +84,10 @@ func getRepoName(cloneURL string) string {
 }
 
 // HandleEvent executes the deployment process for a given webhook event.
-func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter, appConfig *config.AppConfig, dataMountPoint container.MountPoint, payload webhook.ParsedPayload, customTarget, jobID string, dockerCli command.Cli, dockerClient *client.Client) {
+func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter, appConfig *config.AppConfig,
+	dataMountPoint container.MountPoint, payload webhook.ParsedPayload, customTarget, jobID string,
+	dockerCli command.Cli, dockerClient *client.Client, secretProvider *secretprovider.SecretProvider,
+) {
 	var err error
 
 	startTime := time.Now()
@@ -106,7 +113,7 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 
 	if appConfig.DockerSwarmFeatures {
 		// Check if docker host is running in swarm mode
-		docker.SwarmModeEnabled, err = docker.CheckDaemonIsSwarmManager(ctx, dockerCli)
+		swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(ctx, dockerCli)
 		if err != nil {
 			jobLog.Error("failed to check if docker host is running in swarm mode")
 			onError(w, jobLog.With(logger.ErrAttr(err)), "failed to check if docker host is running in swarm mode", err.Error(), http.StatusInternalServerError, metadata)
@@ -263,8 +270,8 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 		metadata.Revision = notification.GetRevision(deployConfig.Reference, latestCommit)
 
 		filterLabel := api.ProjectLabel
-		if docker.SwarmModeEnabled {
-			filterLabel = docker.StackNamespaceLabel
+		if swarm.ModeEnabled {
+			filterLabel = swarm.StackNamespaceLabel
 		}
 
 		if deployConfig.Destroy {
@@ -322,7 +329,7 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 				return
 			}
 
-			if docker.SwarmModeEnabled && deployConfig.DestroyOpts.RemoveVolumes {
+			if swarm.ModeEnabled && deployConfig.DestroyOpts.RemoveVolumes {
 				err = docker.RemoveLabeledVolumes(ctx, dockerClient, deployConfig.Name, filterLabel)
 				if err != nil {
 					onError(w, subJobLog.With(logger.ErrAttr(err)), "failed to remove volumes", err.Error(), http.StatusInternalServerError, metadata)
@@ -381,6 +388,7 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 			// Check if containers do not belong to this repository or if doco-cd does not manage the stack
 			correctRepo := true
 			deployedCommit := ""
+			deployedSecretHash := ""
 
 			for _, cont := range containers {
 				name, ok := cont.Labels[docker.DocoCDLabels.Repository.Name]
@@ -391,6 +399,7 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 				}
 
 				deployedCommit = cont.Labels[docker.DocoCDLabels.Deployment.CommitSHA]
+				deployedSecretHash = cont.Labels[docker.DocoCDLabels.Deployment.ExternalSecretsHash]
 			}
 
 			if !correctRepo {
@@ -398,6 +407,29 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 					map[string]string{"stack": deployConfig.Name}, http.StatusInternalServerError, metadata)
 
 				return
+			}
+
+			secretsChanged := false // Flag to indicate if external secrets have changed
+
+			resolvedSecrets := make(secrettypes.ResolvedSecrets)
+
+			if secretProvider != nil && *secretProvider != nil && len(deployConfig.ExternalSecrets) > 0 {
+				subJobLog.Debug("resolving external secrets", slog.Any("external_secrets", deployConfig.ExternalSecrets))
+
+				// Resolve external secrets
+				resolvedSecrets, err = (*secretProvider).ResolveSecretReferences(ctx, deployConfig.ExternalSecrets)
+				if err != nil {
+					onError(w, subJobLog.With(logger.ErrAttr(err)), "failed to resolve external secrets", err.Error(), http.StatusInternalServerError, metadata)
+
+					return
+				}
+
+				secretHash := secretprovider.Hash(resolvedSecrets)
+				if deployedSecretHash != "" && deployedSecretHash != secretHash {
+					subJobLog.Debug("external secrets have changed, proceeding with deployment")
+
+					secretsChanged = true
+				}
 			}
 
 			subJobLog.Debug("comparing commits",
@@ -437,7 +469,8 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 			}
 
 			err = docker.DeployStack(subJobLog, internalRepoPath, externalRepoPath, &ctx, &dockerCli, dockerClient,
-				&payload, deployConfig, changedFiles, latestCommit, Version, "webhook", false, metadata)
+				&payload, deployConfig, changedFiles, latestCommit, Version, "webhook", false, metadata,
+				resolvedSecrets, secretsChanged)
 			if err != nil {
 				onError(w, subJobLog.With(logger.ErrAttr(err)), "deployment failed", err.Error(), http.StatusInternalServerError, metadata)
 
@@ -457,12 +490,12 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 
 // WebhookHandler handles incoming webhook requests.
 func (h *handlerData) WebhookHandler(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx := context.WithoutCancel(r.Context())
 
 	customTarget := r.PathValue("customTarget")
 
 	// Add a job id to the context to track deployments in the logs
-	jobID := uuid.Must(uuid.NewRandom()).String()
+	jobID := uuid.Must(uuid.NewV7()).String()
 	jobLog := h.log.With(slog.String("job_id", jobID))
 
 	jobLog.Debug("received webhook event")
@@ -525,12 +558,12 @@ func (h *handlerData) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	defer lock.Unlock()
 
-	HandleEvent(ctx, jobLog, w, h.appConfig, h.dataMountPoint, payload, customTarget, jobID, h.dockerCli, h.dockerClient)
+	HandleEvent(ctx, jobLog, w, h.appConfig, h.dataMountPoint, payload, customTarget, jobID, h.dockerCli, h.dockerClient, h.secretProvider)
 }
 
 // HealthCheckHandler handles health check requests.
 func (h *handlerData) HealthCheckHandler(w http.ResponseWriter, _ *http.Request) {
-	jobID := uuid.Must(uuid.NewRandom()).String()
+	jobID := uuid.Must(uuid.NewV7()).String()
 
 	metadata := notification.Metadata{
 		JobID:      jobID,
@@ -616,7 +649,7 @@ func (h *handlerData) ProjectActionApiHandler(w http.ResponseWriter, r *http.Req
 	var err error
 
 	// Add a job id to the context to track deployments in the logs
-	jobID := uuid.Must(uuid.NewRandom()).String()
+	jobID := uuid.Must(uuid.NewV7()).String()
 	jobLog := h.log.With(slog.String("job_id", jobID), slog.String("ip", r.RemoteAddr))
 
 	jobLog.Debug("received api request")
@@ -719,7 +752,7 @@ func (h *handlerData) ProjectApiHandler(w http.ResponseWriter, r *http.Request) 
 	ctx := r.Context()
 
 	// Add a job id to the context to track deployments in the logs
-	jobID := uuid.Must(uuid.NewRandom()).String()
+	jobID := uuid.Must(uuid.NewV7()).String()
 	jobLog := h.log.With(slog.String("job_id", jobID), slog.String("ip", r.RemoteAddr))
 
 	jobLog.Debug("received api request")
@@ -798,7 +831,7 @@ func (h *handlerData) GetProjectsApiHandler(w http.ResponseWriter, r *http.Reque
 	}
 
 	// Add a job id to the context to track deployments in the logs
-	jobID := uuid.Must(uuid.NewRandom()).String()
+	jobID := uuid.Must(uuid.NewV7()).String()
 	jobLog := h.log.With(slog.String("job_id", jobID), slog.String("ip", r.RemoteAddr))
 
 	jobLog.Debug("received api request")

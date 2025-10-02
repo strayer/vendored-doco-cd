@@ -18,6 +18,10 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/google/uuid"
 
+	"github.com/kimdre/doco-cd/internal/secretprovider"
+
+	"github.com/kimdre/doco-cd/internal/docker/swarm"
+
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/encryption"
@@ -46,9 +50,15 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to verify docker socket connection: %v", err)
 	}
 
-	docker.SwarmModeEnabled, err = docker.CheckDaemonIsSwarmManager(ctx, dockerCli)
+	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(ctx, dockerCli)
 	if err != nil {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
+	}
+
+	if swarm.ModeEnabled {
+		log.Println("Testing in Docker Swarm mode")
+	} else {
+		log.Println("Testing in Docker Compose mode")
 	}
 
 	// Ensure the Docker client is closed after tests
@@ -176,7 +186,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "With Remote Repository and Swarm Mode",
 			payload: webhook.ParsedPayload{
 				Ref:       git.SwarmModeBranch,
-				CommitSHA: "e82246851a624b3906527764196e9d072da99762",
+				CommitSHA: "01435dad4e7ff8f7da70202ca1ca77bccca9eb62",
 				Name:      projectName,
 				FullName:  "kimdre/doco-cd_tests",
 				CloneURL:  "https://github.com/kimdre/doco-cd_tests",
@@ -207,7 +217,7 @@ func TestHandleEvent(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	docker.SwarmModeEnabled, err = docker.CheckDaemonIsSwarmManager(t.Context(), dockerCli)
+	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(t.Context(), dockerCli)
 	if err != nil {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
@@ -216,11 +226,11 @@ func TestHandleEvent(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if docker.SwarmModeEnabled && !tc.swarmMode {
+			if swarm.ModeEnabled && !tc.swarmMode {
 				t.Skipf("Skipping test %s because it requires Swarm mode to be disabled", tc.name)
 			}
 
-			if !docker.SwarmModeEnabled && tc.swarmMode {
+			if !swarm.ModeEnabled && tc.swarmMode {
 				t.Skipf("Skipping test %s because it requires Swarm mode to be enabled", tc.name)
 			}
 
@@ -260,7 +270,7 @@ func TestHandleEvent(t *testing.T) {
 			)
 
 			log := logger.New(12)
-			jobID := uuid.Must(uuid.NewRandom()).String()
+			jobID := uuid.Must(uuid.NewV7()).String()
 			jobLog := log.With(slog.String("job_id", jobID))
 
 			ctx := context.Background()
@@ -286,6 +296,19 @@ func TestHandleEvent(t *testing.T) {
 				t.Fatalf("Failed to verify docker socket connection: %v", err)
 			}
 
+			secretProvider, err := secretprovider.Initialize(ctx, appConfig.SecretProvider, "v0.0.0-test")
+			if err != nil {
+				t.Fatalf("failed to initialize secret provider: %s", err.Error())
+
+				return
+			}
+
+			if secretProvider != nil {
+				t.Cleanup(func() {
+					secretProvider.Close()
+				})
+			}
+
 			rr := httptest.NewRecorder()
 
 			t.Cleanup(func() {
@@ -299,7 +322,12 @@ func TestHandleEvent(t *testing.T) {
 
 				t.Log("Remove test container")
 
-				err = service.Down(ctx, tc.payload.Name, downOpts)
+				if swarm.ModeEnabled {
+					err = docker.RemoveSwarmStack(ctx, dockerCli, tc.payload.Name)
+				} else {
+					err = service.Down(ctx, tc.payload.Name, downOpts)
+				}
+
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -323,6 +351,7 @@ func TestHandleEvent(t *testing.T) {
 				jobID,
 				dockerCli,
 				dockerClient,
+				&secretProvider,
 			)
 
 			if status := rr.Code; status != tc.expectedStatusCode {
