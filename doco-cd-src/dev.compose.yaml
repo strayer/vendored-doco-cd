@@ -1,9 +1,9 @@
 x-poll-config: &poll-config
   POLL_CONFIG: |
     - url: https://github.com/kimdre/doco-cd_tests.git
-      reference: main
+      reference: secret-provider
       interval: 10
-      target: ""
+      target: "aws-sm"
 
 services:
   app:
@@ -16,7 +16,7 @@ services:
     restart: unless-stopped
     depends_on:
       - proxy
-      - apprise
+#      - apprise
     ports:
       - "80:80"
       - "9120:9120"
@@ -30,8 +30,8 @@ services:
       <<: *poll-config
       #POLL_CONFIG_FILE: /poll.yml
       HTTP_PROXY: http://username:password@proxy:8888
-      APPRISE_API_URL: http://apprise:8000/notify
-      APPRISE_NOTIFY_LEVEL: info
+#      APPRISE_API_URL: http://apprise:8000/notify
+#      APPRISE_NOTIFY_LEVEL: info
       # APPRISE_NOTIFY_URLS: # .env
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
@@ -42,6 +42,12 @@ services:
 #    configs: # Use with POLL_CONFIG_FILE
 #      - source: poll.yml
 #        target: /poll.yml
+    healthcheck:
+      test: [ "CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/v1/health" ]
+      start_period: 15s
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   proxy:
     image: vimagick/tinyproxy:latest
@@ -54,14 +60,14 @@ services:
       - source: tinyproxy.conf
         target: /etc/tinyproxy/tinyproxy.conf
 
-  apprise:
-    image: caronc/apprise:latest
-    restart: unless-stopped
-    ports:
-      - "8000:8000"
-    environment:
-      TZ: Europe/Berlin
-      APPRISE_WORKER_COUNT: 1
+#  apprise:
+#    image: caronc/apprise:latest
+#    restart: unless-stopped
+#    ports:
+#      - "8000:8000"
+#    environment:
+#      TZ: Europe/Berlin
+#      APPRISE_WORKER_COUNT: 1
 
 volumes:
   data:

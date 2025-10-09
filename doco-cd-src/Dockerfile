@@ -1,10 +1,25 @@
-# syntax=docker/dockerfile:1@sha256:38387523653efa0039f8e1c89bb74a30504e76ee9f565e25c9a09841f9427b05
-FROM golang:1.25.1@sha256:76a94c4a37aaab9b1b35802af597376b8588dc54cd198f8249633b4e117d9fcc AS build-stage
+# syntax=docker/dockerfile:1@sha256:dabfc0969b935b2080555ace70ee69a5261af8a8f1b4df97b9e7fbcf6722eddf
+FROM golang:1.25.1@sha256:d7098379b7da665ab25b99795465ec320b1ca9d4addb9f77409c4827dc904211 AS build-stage
 
 ARG APP_VERSION=dev
 
 # Set destination for COPY
 WORKDIR /app
+
+# Install prerequisites for Bitwarden SDK
+RUN apt-get update && apt-get install -y \
+    musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set build environment
+# CGO_ENABLED=1 and CC=musl-gcc are required for Bitwarden SDK
+ENV GOCACHE=/root/.cache/go-build \
+    CGO_ENABLED=1 \
+    CC=musl-gcc \
+    GOOS=linux
+
+# Bitwarden SDK build flags https://github.com/bitwarden/sdk-go/blob/main/INSTRUCTIONS.md
+ARG BW_SDK_BUILD_FLAGS="-linkmode external -extldflags '-static -Wl,-unresolved-symbols=ignore-all'"
 
 # Download Go modules
 COPY go.mod go.sum ./
@@ -17,24 +32,15 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
 # Copy source code
 COPY . ./
 
-# Set build environment
-ENV GOCACHE=/root/.cache/go-build \
-    CGO_ENABLED=0 \
-    GOOS=linux
-
 # Build and strip binary
 RUN --mount=type=cache,target=/go/pkg/mod/ \
     --mount=type=cache,target="/root/.cache/go-build" \
     --mount=type=bind,target=. \
-    go build -ldflags="-s -w -X main.Version=${APP_VERSION}" -o / ./...
+    go build -ldflags="-s -w -X main.Version=${APP_VERSION} ${BW_SDK_BUILD_FLAGS}" -o / ./...
 
-#FROM busybox AS busybox-binaries
-#
-#ARG BUSYBOX_VERSION=1.31.0-i686-uclibc
-#ADD https://busybox.net/downloads/binaries/$BUSYBOX_VERSION/busybox_WGET /wget
-#RUN chmod a+x /wget
+FROM busybox:1.37-uclibc@sha256:633928d4d846bc9877337776810c278189d7be3fdd734032e2c75893331d1d78 AS busybox-binaries
 
-FROM gcr.io/distroless/base-debian12@sha256:d605e138bb398428779e5ab490a6bbeeabfd2551bd919578b1044718e5c30798 AS build-release-stage
+FROM gcr.io/distroless/base-debian12@sha256:9e9b50d2048db3741f86a48d939b4e4cc775f5889b3496439343301ff54cdba8 AS build-release-stage
 
 WORKDIR /
 
@@ -42,7 +48,7 @@ WORKDIR /
 VOLUME /data
 
 COPY --from=build-stage /doco-cd /doco-cd
-# COPY --from=busybox-binaries /wget /usr/bin/wget
+COPY --from=busybox-binaries /bin/wget /usr/bin/wget
 
 ENV TZ=UTC \
     HTTP_PORT=80 \
@@ -51,5 +57,5 @@ ENV TZ=UTC \
 
 ENTRYPOINT ["/doco-cd"]
 
-#HEALTHCHECK --interval=30s --timeout=5s \
-#  CMD ["/usr/bin/wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/v1/health"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+  CMD ["/usr/bin/wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/v1/health"]

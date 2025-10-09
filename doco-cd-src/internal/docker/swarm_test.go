@@ -7,25 +7,13 @@ import (
 
 	"github.com/docker/docker/client"
 
+	"github.com/kimdre/doco-cd/internal/docker/swarm"
+
 	"github.com/kimdre/doco-cd/internal/git"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
-
-func TestCheckDaemonIsSwarmManager(t *testing.T) {
-	dockerCli, err := CreateDockerCli(false, false)
-	if err != nil {
-		t.Fatalf("Failed to create Docker CLI: %v", err)
-	}
-
-	_, err = CheckDaemonIsSwarmManager(t.Context(), dockerCli)
-	if err != nil {
-		t.Fatalf("Failed to check if Docker daemon is a swarm manager: %v", err)
-	}
-
-	t.Logf("Docker daemon is a swarm manager: %v", err == nil)
-}
 
 func TestDeploySwarmStack(t *testing.T) {
 	dockerCli, err := CreateDockerCli(false, false)
@@ -33,12 +21,12 @@ func TestDeploySwarmStack(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	SwarmModeEnabled, err = CheckDaemonIsSwarmManager(t.Context(), dockerCli)
+	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(t.Context(), dockerCli)
 	if err != nil {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
 
-	if !SwarmModeEnabled {
+	if !swarm.ModeEnabled {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
@@ -73,7 +61,7 @@ func TestDeploySwarmStack(t *testing.T) {
 	repoPath := worktree.Filesystem.Root()
 	filePath := filepath.Join(repoPath, "docker-compose.yml")
 
-	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{filePath}, []string{})
+	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{filePath}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +71,7 @@ func TestDeploySwarmStack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = DeploySwarmStack(t.Context(), dockerCli, project, deployConfigs[0], p, tmpDir, "e8e2d31f0fa0c924400b3bac751b6c2c6930adb1", "dev")
+	err = DeploySwarmStack(t.Context(), dockerCli, project, deployConfigs[0], p, tmpDir, "e8e2d31f0fa0c924400b3bac751b6c2c6930adb1", "dev", "", map[string]string{})
 	if err != nil {
 		t.Fatalf("Failed to deploy swarm stack: %v", err)
 	} else {
@@ -116,7 +104,7 @@ func TestDeploySwarmStack(t *testing.T) {
 		t.Logf("Stack secrets pruned successfully")
 	}
 
-	err = RemoveSwarmStack(t.Context(), dockerCli, deployConfigs[0])
+	err = RemoveSwarmStack(t.Context(), dockerCli, deployConfigs[0].Name)
 	if err != nil {
 		t.Fatalf("Failed to remove swarm stack: %v", err)
 	} else {
