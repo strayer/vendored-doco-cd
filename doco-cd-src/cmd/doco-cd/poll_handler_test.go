@@ -4,7 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/secretprovider"
 
 	"github.com/kimdre/doco-cd/internal/git"
 
@@ -32,7 +34,9 @@ func TestRunPoll(t *testing.T) {
 		CustomTarget: "",
 	}
 
-	if docker.SwarmModeEnabled {
+	const name = "test-deploy"
+
+	if swarm.ModeEnabled {
 		pollConfig.Reference = git.SwarmModeBranch
 
 		t.Log("Testing in Swarm mode, using 'swarm-mode' reference")
@@ -41,6 +45,19 @@ func TestRunPoll(t *testing.T) {
 	appConfig, err := config.GetAppConfig()
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	secretProvider, err := secretprovider.Initialize(ctx, appConfig.SecretProvider, "v0.0.0-test")
+	if err != nil {
+		t.Fatalf("failed to initialize secret provider: %s", err.Error())
+
+		return
+	}
+
+	if secretProvider != nil {
+		t.Cleanup(func() {
+			secretProvider.Close()
+		})
 	}
 
 	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
@@ -79,7 +96,12 @@ func TestRunPoll(t *testing.T) {
 	t.Cleanup(func() {
 		t.Log("Remove test container")
 
-		err = service.Down(ctx, "test-deploy", downOpts)
+		if swarm.ModeEnabled {
+			err = docker.RemoveSwarmStack(ctx, dockerCli, name)
+		} else {
+			err = service.Down(ctx, name, downOpts)
+		}
+
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -87,12 +109,12 @@ func TestRunPoll(t *testing.T) {
 
 	metadata := notification.Metadata{
 		Repository: getRepoName(string(pollConfig.CloneUrl)),
-		Stack:      "test-deploy",
+		Stack:      name,
 		Revision:   notification.GetRevision(pollConfig.Reference, ""),
 	}
 
 	// Run initial poll
-	_, err = RunPoll(ctx, pollConfig, appConfig, dataMountPoint, dockerCli, dockerClient, log.With(), metadata)
+	_, err = RunPoll(ctx, pollConfig, appConfig, dataMountPoint, dockerCli, dockerClient, log.With(), metadata, &secretProvider)
 	if err != nil {
 		t.Fatalf("Initial poll failed: %v", err)
 	}
@@ -100,7 +122,7 @@ func TestRunPoll(t *testing.T) {
 	pollConfig.Reference = "destroy"
 
 	// Run the second poll to destroy
-	_, err = RunPoll(ctx, pollConfig, appConfig, dataMountPoint, dockerCli, dockerClient, log.With(), metadata)
+	_, err = RunPoll(ctx, pollConfig, appConfig, dataMountPoint, dockerCli, dockerClient, log.With(), metadata, &secretProvider)
 	if err != nil {
 		t.Fatalf("Second poll failed: %v", err)
 	}

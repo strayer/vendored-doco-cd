@@ -18,6 +18,12 @@ The following tools need to be installed:
 - Golang (see the [`go.mod`](https://github.com/kimdre/doco-cd/blob/main/go.mod#L3) file for the currently used version.
 - [Make](https://www.gnu.org/software/make/)
 
+### Additional steps
+
+Follow the installation instructions for the following dependencies:
+
+- [Bitwarden Go SDK](https://github.com/bitwarden/sdk-go/tree/main?tab=readme-ov-file#installation)
+
 ### Getting started
 
 1. Set up [Git Commit Signing](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits) if you haven't already done so. Please always sign your commits!
@@ -41,6 +47,12 @@ The CI pipeline will fail, if the code is not formatted correctly.
 
 Always add unit tests to verify your code. 
 Run the tests with `make test` or `make test-verbose` and run specific tests with `make test-run <testName>` (Verbose with `make test-run "-v <testName>"`).
+
+#### With registry credentials
+
+You can provide container registry credentials to avoid rate limiting issues when running tests.
+
+Follow the [Accessing private container registries](https://github.com/kimdre/doco-cd/wiki/Tips-and-Tricks#accessing-private-container-registries) Guide in the Wiki for more information.
 
 ### Building from Source
 

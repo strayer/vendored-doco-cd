@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
         with:
           go-version-file: 'go.mod'
           cache: true
@@ -33,24 +33,34 @@ jobs:
           version: latest
           args: --timeout=5m
 
-  test_compose:
-    name: Test Docker Compose
+  test:
+    name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [standalone, swarm]
+
     services:
       squid-proxy:
-        image: ubuntu/squid:latest@sha256:98f98aaa024e4a58433450f8adde48ef5748f1ae05133b2367d64317cc881a3a
+        image: ubuntu/squid:latest@sha256:091114b5b1fff01311221e7ef15703c8f3c96f5845911001636d99dcd54a1479
         ports:
           - 3128:3128
 
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
         with:
           go-version-file: 'go.mod'
           cache: true
+      - name: Install packages
+        run: |
+          sudo apt install -y musl-tools
       - run: go mod download
-      - run: go test -p 1 -v -coverprofile=coverage.out -covermode=atomic ./... -timeout 10m
+      - run: if [ "${{ matrix.mode }}" = "swarm" ]; then docker swarm init; fi
+      - run: go test -ldflags="$BW_SDK_BUILD_FLAGS" -p 1 -v -coverprofile=coverage-${{ matrix.mode }}.out -covermode=atomic -timeout 10m ./...
         timeout-minutes: 10
         env:
           WEBHOOK_SECRET: test_Secret1
@@ -58,40 +68,17 @@ jobs:
           GIT_ACCESS_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
           HTTP_PROXY: http://localhost:3128
           SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
+          # Required for Bitwarden Go SDK, see CONTRIBUTING.md
+          CGO_ENABLED: 1
+          CC: musl-gcc
+          BW_SDK_BUILD_FLAGS: "-linkmode external -extldflags '-static -Wl,-unresolved-symbols=ignore-all'"
+          SECRET_PROVIDER_ACCESS_TOKEN: ${{ secrets.SECRET_PROVIDER_ACCESS_TOKEN }}
+          SECRET_PROVIDER: bitwarden_sm
+          SECRET_PROVIDER_API_URL: https://vault.bitwarden.eu/api
+          SECRET_PROVIDER_IDENTITY_URL: https://vault.bitwarden.eu/identity
       - name: Upload coverage reports to Codecov
         uses: codecov/codecov-action@5a1091511ad55cbe89839c7260b706298ca349f7 # v5.5.1
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage.out
-
-  test_swarm:
-    name: Tests Docker Swarm Mode
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    services:
-      squid-proxy:
-        image: ubuntu/squid:latest@sha256:98f98aaa024e4a58433450f8adde48ef5748f1ae05133b2367d64317cc881a3a
-        ports:
-          - 3128:3128
-
-    steps:
-      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
-      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
-        with:
-          go-version-file: 'go.mod'
-          cache: true
-      - run: go mod download
-      - run: docker swarm init
-      - run: go test -p 1 -v -coverprofile=coverage-swarm.out -covermode=atomic ./... -timeout 10m
-        timeout-minutes: 10
-        env:
-          WEBHOOK_SECRET: test_Secret1
-          API_SECRET: api_Secret1
-          GIT_ACCESS_TOKEN: ${{ secrets.GIT_ACCESS_TOKEN }}
-          HTTP_PROXY: http://localhost:3128
-          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}
-      - name: Upload coverage reports to Codecov
-        uses: codecov/codecov-action@5a1091511ad55cbe89839c7260b706298ca349f7 # v5.5.1
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          files: coverage-swarm.out
+          files: coverage-${{ matrix.mode }}.out
+          flags: unittests

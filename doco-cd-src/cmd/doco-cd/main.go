@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -15,6 +16,10 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/go-git/go-git/v5/plumbing/transport"
+
+	"github.com/kimdre/doco-cd/internal/secretprovider"
+
+	"github.com/kimdre/doco-cd/internal/docker/swarm"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -34,41 +39,6 @@ var (
 	Version string
 	errMsg  string
 )
-
-// getAppContainerID retrieves the application container ID from the cpuset file.
-func getAppContainerID() (string, error) {
-	const (
-		cgroupMounts  = "/proc/self/mountinfo"
-		containerPath = "/containers/"
-	)
-
-	containerPattern := regexp.MustCompile(containerPath + `([a-z0-9]+)`)
-
-	data, err := os.ReadFile(cgroupMounts)
-	if err != nil {
-		return "", fmt.Errorf("failed to read %s: %w", cgroupMounts, err)
-	}
-
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
-			continue
-		}
-
-		mountPath := fields[3]
-
-		if strings.Contains(line, "/etc/hostname") {
-			if strings.Contains(mountPath, containerPath) {
-				if matches := containerPattern.FindStringSubmatch(mountPath); len(matches) > 1 {
-					return matches[1], nil
-				}
-			}
-		}
-	}
-
-	return "", docker.ErrContainerIDNotFound
-}
 
 // GetProxyUrlRedacted takes a proxy URL string and redacts the password if it exists.
 func GetProxyUrlRedacted(proxyUrl string) string {
@@ -109,6 +79,8 @@ func CreateMountpointSymlink(m container.MountPoint) error {
 }
 
 func main() {
+	ctx := context.Background()
+
 	var wg sync.WaitGroup
 	// Set the default log level to debug
 	log := logger.New(slog.LevelDebug)
@@ -138,22 +110,6 @@ func main() {
 	} else {
 		log.Debug("no HTTP proxy configured")
 	}
-
-	go func() {
-		latestVersion, err := getLatestAppReleaseVersion()
-		if err != nil {
-			log.Error("failed to get latest application release version", logger.ErrAttr(err))
-		} else {
-			if Version != latestVersion {
-				log.Warn("new application version available",
-					slog.String("current", Version),
-					slog.String("latest", latestVersion),
-				)
-			} else {
-				log.Debug("application is up to date", slog.String("version", Version))
-			}
-		}
-	}()
 
 	// Test/verify the connection to the docker socket
 	err = docker.VerifySocketConnection()
@@ -188,30 +144,37 @@ func main() {
 		return
 	}
 
-	log.Debug("negotiated docker versions to use",
-		slog.Group("versions",
-			slog.String("docker_client", dockerClient.ClientVersion()),
-			slog.String("docker_api", dockerCli.CurrentVersion()),
-			slog.Bool("swarm_mode", docker.SwarmModeEnabled),
-		))
-
-	// Get container id of this application
-	appContainerID, err := getAppContainerID()
+	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(ctx, dockerCli)
 	if err != nil {
-		log.Critical("failed to retrieve application container id", logger.ErrAttr(err))
+		log.Critical("failed to check if docker daemon is a swarm manager", logger.ErrAttr(err))
 
 		return
 	}
 
-	log.Debug("retrieved application container id", slog.String("container_id", appContainerID))
+	log.Debug("negotiated docker versions to use",
+		slog.Group("versions",
+			slog.String("docker_client", dockerClient.ClientVersion()),
+			slog.String("docker_api", dockerCli.CurrentVersion()),
+			slog.Bool("swarm_mode", swarm.ModeEnabled),
+		))
 
-	// Check if the application has a data mount point and get the host path
+	// Get doco-cd container id
+	appContainerID, err := getAppContainerID()
+	if err != nil {
+		log.Critical("failed to retrieve doco-cd container id", logger.ErrAttr(err))
+
+		return
+	}
+
+	log.Debug("retrieved doco-cd container id", slog.String("container_id", appContainerID))
+
+	// Check if the doco-cd container has a data mount point and get the host path
 	dataMountPoint, err := docker.GetMountPointByDestination(dockerClient, appContainerID, dataPath)
 	if err != nil {
 		log.Critical(fmt.Sprintf("failed to retrieve %s mount point for container %s", dataPath, appContainerID), logger.ErrAttr(err))
 	}
 
-	log.Debug("retrieved data mount point",
+	log.Debug("retrieved doco-cd data mount point",
 		slog.Group("mount_point",
 			slog.String("source", dataMountPoint.Source),
 			slog.String("destination", dataMountPoint.Destination),
@@ -231,6 +194,36 @@ func main() {
 		return
 	}
 
+	go func() {
+		latestVersion, err := getLatestAppReleaseVersion()
+		if err != nil {
+			log.Error("failed to get latest application release version", logger.ErrAttr(err))
+		} else {
+			if Version != latestVersion {
+				log.Warn("new application version available",
+					slog.String("current", Version),
+					slog.String("latest", latestVersion),
+				)
+			} else {
+				log.Debug("application is up to date", slog.String("version", Version))
+			}
+		}
+	}()
+
+	// Initialize the secret provider
+	secretProvider, err := secretprovider.Initialize(ctx, c.SecretProvider, Version)
+	if err != nil {
+		log.Critical("failed to initialize secret provider", logger.ErrAttr(err))
+
+		return
+	}
+
+	if secretProvider != nil {
+		defer secretProvider.Close()
+
+		log.Info("secret provider initialized", slog.String("provider", secretProvider.Name()))
+	}
+
 	h := handlerData{
 		appConfig:      c,
 		appVersion:     Version,
@@ -238,6 +231,7 @@ func main() {
 		dockerCli:      dockerCli,
 		dockerClient:   dockerClient,
 		log:            log,
+		secretProvider: &secretProvider,
 	}
 
 	// Register HTTP endpoints
