@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -188,6 +189,8 @@ func addComposeServiceLabels(project *types.Project, deployConfig config.DeployC
 			DocoCDLabels.Deployment.CommitSHA:           latestCommit,
 			DocoCDLabels.Deployment.TargetRef:           deployConfig.Reference,
 			DocoCDLabels.Deployment.ExternalSecretsHash: secretHash,
+			DocoCDLabels.Deployment.AutoDiscover:        strconv.FormatBool(deployConfig.AutoDiscover),
+			DocoCDLabels.Deployment.AutoDiscoverDelete:  strconv.FormatBool(deployConfig.AutoDiscoverOpts.Delete),
 			DocoCDLabels.Repository.Name:                payload.FullName,
 			DocoCDLabels.Repository.URL:                 payload.WebURL,
 			api.ProjectLabel:                            project.Name,
@@ -223,14 +226,23 @@ func addComposeVolumeLabels(project *types.Project, deployConfig config.DeployCo
 }
 
 // LoadCompose parses and loads Compose files as specified by the Docker Compose specification.
-func LoadCompose(ctx context.Context, workingDir, projectName string, composeFiles, profiles []string, resolvedSecrets secrettypes.ResolvedSecrets) (*types.Project, error) {
+func LoadCompose(ctx context.Context, workingDir, projectName string, composeFiles, envFiles, profiles []string, environment map[string]string) (*types.Project, error) {
+	// if envFiles only contains ".env", we check if the file exists in the working directory
+	if len(envFiles) == 1 && envFiles[0] == ".env" {
+		envFilePath := path.Join(workingDir, ".env")
+
+		if _, err := os.Stat(envFilePath); errors.Is(err, os.ErrNotExist) {
+			envFiles = []string{}
+		}
+	}
+
 	options, err := cli.NewProjectOptions(
 		composeFiles,
 		cli.WithName(projectName),
 		cli.WithWorkingDirectory(workingDir),
 		cli.WithInterpolation(true),
 		cli.WithResolvedPaths(true),
-		cli.WithEnvFiles(),
+		cli.WithEnvFiles(envFiles...), // env files for variable interpolation
 		cli.WithProfiles(profiles),
 	)
 	if err != nil {
@@ -238,7 +250,7 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 	}
 
 	// Inject external secrets into the environment for variable interpolation
-	for k, v := range resolvedSecrets {
+	for k, v := range environment {
 		options.Environment[k] = v
 	}
 
@@ -429,7 +441,7 @@ func DeployStack(
 	}
 
 	// Check if files in the working directory are SOPS encrypted and decrypt them if necessary
-	f, err := encryption.DecryptFilesInDirectory(internalWorkingDir)
+	f, err := encryption.DecryptFilesInDirectory(internalRepoPath, internalWorkingDir)
 	if err != nil {
 		return fmt.Errorf("file decryption failed: %w", err)
 	}
@@ -440,7 +452,24 @@ func DeployStack(
 
 	secretHash := secretprovider.Hash(resolvedSecrets)
 
-	project, err := LoadCompose(*ctx, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles, deployConfig.Profiles, resolvedSecrets)
+	// Create a temporary env file if environment variables are specified in the deployment config
+	if deployConfig.Internal.Environment != nil {
+		tmpEnvFile, err := config.CreateTmpDotEnvFile(deployConfig)
+		if err != nil {
+			errMsg := "failed to create temporary env file"
+			return fmt.Errorf("%s: %w", errMsg, err)
+		}
+
+		// Delete the temp file after deployment
+		defer func(name string) {
+			err = os.Remove(name)
+			if err != nil {
+				stackLog.Warn("failed to delete temporary env file", logger.ErrAttr(err), slog.String("file", name))
+			}
+		}(tmpEnvFile)
+	}
+
+	project, err := LoadCompose(*ctx, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles, deployConfig.EnvFiles, deployConfig.Profiles, resolvedSecrets)
 	if err != nil {
 		errMsg := "failed to load compose config"
 		return fmt.Errorf("%s: %w", errMsg, err)
@@ -465,19 +494,6 @@ func DeployStack(
 
 	// When SwarmModeEnabled is true, we deploy the stack using Docker Swarm.
 	if swarm.ModeEnabled {
-		// Check if the project has bind mounts with swarm mode and fail if it does.
-		for _, service := range project.Services {
-			for _, volume := range service.Volumes {
-				if volume.Type == "bind" {
-					prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
-
-					errMsg := "swarm mode does not support bind mounts, please use volumes, configs or secrets instead"
-
-					return fmt.Errorf("%s: service: %s", errMsg, service.Name)
-				}
-			}
-		}
-
 		stackLog.Info("deploying swarm stack")
 
 		err = DeploySwarmStack(*ctx, *dockerCli, project, deployConfig, *payload, externalWorkingDir, latestCommit, appVersion, secretHash, resolvedSecrets)

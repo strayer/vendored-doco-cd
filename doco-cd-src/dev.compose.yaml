@@ -13,6 +13,7 @@ services:
       dockerfile: Dockerfile
       args:
         - APP_VERSION=dev
+    pull_policy: build
     restart: unless-stopped
     depends_on:
       - proxy

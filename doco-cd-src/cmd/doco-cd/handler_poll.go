@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,7 +22,6 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/google/uuid"
-	"golang.org/x/net/context"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -46,7 +46,7 @@ func getRepoLock(repoName string) *sync.Mutex {
 
 // StartPoll initializes PollJob with the provided configuration and starts the PollHandler goroutine.
 func StartPoll(h *handlerData, pollConfig config.PollConfig, wg *sync.WaitGroup) error {
-	if pollConfig.Interval == 0 {
+	if pollConfig.Interval == 0 && !pollConfig.RunOnce {
 		h.log.Info("polling job disabled by config", "config", pollConfig)
 
 		return nil
@@ -112,6 +112,12 @@ func (h *handlerData) PollHandler(pollJob *config.PollJob) {
 			pollJob.NextRun = time.Now().Unix() + int64(pollJob.Config.Interval)
 		} else {
 			logger.Debug("Skipping poll, waiting for next run")
+		}
+
+		// If run_once is set, perform a single run and exit after the initial run.
+		if pollJob.Config.RunOnce {
+			logger.Info("RunOnce configured: single initial poll completed, stopped polling", slog.Any("config", pollJob.Config))
+			return
 		}
 
 		pollJob.LastRun = time.Now().Unix()
@@ -204,12 +210,21 @@ func RunPoll(ctx context.Context, pollConfig config.PollConfig, appConfig *confi
 	// shortName is the last part of repoName, which is just the name of the repository
 	shortName := filepath.Base(repoName)
 
-	// Get the deployment configs from the repository
-	deployConfigs, err := config.GetDeployConfigs(internalRepoPath, shortName, pollConfig.CustomTarget, pollConfig.Reference)
+	// Resolve deployment configs (prefer inline in poll config when present)
+	configDir := filepath.Join(internalRepoPath, appConfig.DeployConfigBaseDir)
+
+	deployConfigs, err := config.ResolveDeployConfigs(pollConfig, configDir, shortName)
 	if err != nil {
 		jobLog.Error("failed to get deploy configuration", log.ErrAttr(err))
 
 		return metadata, fmt.Errorf("failed to get deploy configuration: %w", err)
+	}
+
+	err = cleanupObsoleteAutoDiscoveredContainers(ctx, jobLog, dockerClient, dockerCli, string(pollConfig.CloneUrl), deployConfigs)
+	if err != nil {
+		jobLog.Error("failed to cleanup obsolete auto-discovered containers", log.ErrAttr(err))
+
+		return metadata, fmt.Errorf("failed to cleanup obsolete auto-discovered containers: %w", err)
 	}
 
 	for _, deployConfig := range deployConfigs {
@@ -218,6 +233,14 @@ func RunPoll(ctx context.Context, pollConfig config.PollConfig, appConfig *confi
 		repoName = getRepoName(string(pollConfig.CloneUrl))
 		if deployConfig.RepositoryUrl != "" {
 			repoName = getRepoName(string(deployConfig.RepositoryUrl))
+
+			// Load all local deployConfig.EnvFiles and load their variables
+			err = config.LoadLocalDotEnv(deployConfig, internalRepoPath)
+			if err != nil {
+				subJobLog.Error("failed to parse local env files", log.ErrAttr(err))
+
+				return metadata, fmt.Errorf("failed to parse local env files: %w", err)
+			}
 		}
 
 		metadata.Repository = repoName

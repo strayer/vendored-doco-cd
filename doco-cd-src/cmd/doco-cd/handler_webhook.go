@@ -192,11 +192,18 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 	jobLog.Debug("retrieving deployment configuration")
 
 	// Get the deployment configs from the repository
-	deployConfigs, err := config.GetDeployConfigs(internalRepoPath, payload.Name, customTarget, payload.Ref)
+	configDir := filepath.Join(internalRepoPath, appConfig.DeployConfigBaseDir)
+
+	deployConfigs, err := config.GetDeployConfigs(configDir, payload.Name, customTarget, payload.Ref)
 	if err != nil {
 		onError(w, jobLog.With(logger.ErrAttr(err)), "failed to get deploy configuration", err.Error(), http.StatusInternalServerError, metadata)
 
 		return
+	}
+
+	err = cleanupObsoleteAutoDiscoveredContainers(ctx, jobLog, dockerClient, dockerCli, payload.CloneURL, deployConfigs)
+	if err != nil {
+		onError(w, jobLog.With(logger.ErrAttr(err)), "failed to clean up obsolete auto-discovered containers", err.Error(), http.StatusInternalServerError, metadata)
 	}
 
 	for _, deployConfig := range deployConfigs {
@@ -216,6 +223,13 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 		repoName = getRepoName(payload.CloneURL)
 		if deployConfig.RepositoryUrl != "" {
 			repoName = getRepoName(string(deployConfig.RepositoryUrl))
+
+			err = config.LoadLocalDotEnv(deployConfig, internalRepoPath)
+			if err != nil {
+				onError(w, subJobLog.With(logger.ErrAttr(err)), "failed to parse local env files", err.Error(), http.StatusInternalServerError, metadata)
+
+				return
+			}
 		}
 
 		metadata.Repository = repoName
