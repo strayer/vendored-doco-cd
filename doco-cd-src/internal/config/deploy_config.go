@@ -8,6 +8,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/creasty/defaults"
@@ -35,6 +36,7 @@ type DeployConfig struct {
 	Reference          string   `yaml:"reference" default:""`                                                                                         // Reference is the Git reference to the deployment, e.g., refs/heads/main, main, refs/tags/v1.0.0 or v1.0.0
 	WorkingDirectory   string   `yaml:"working_dir" default:"."`                                                                                      // WorkingDirectory is the working directory for the deployment
 	ComposeFiles       []string `yaml:"compose_files" default:"[\"compose.yaml\", \"compose.yml\", \"docker-compose.yml\", \"docker-compose.yaml\"]"` // ComposeFiles is the list of docker-compose files to use
+	EnvFiles           []string `yaml:"env_files" default:"[\".env\"]"`                                                                               // EnvFiles is the list of dotenv files to use for variable interpolation
 	RemoveOrphans      bool     `yaml:"remove_orphans" default:"true"`                                                                                // RemoveOrphans removes containers for services not defined in the Compose file
 	ForceRecreate      bool     `yaml:"force_recreate" default:"false"`                                                                               // ForceRecreate forces the recreation/redeployment of containers even if the configuration has not changed
 	ForceImagePull     bool     `yaml:"force_image_pull" default:"false"`                                                                             // ForceImagePull always pulls the latest version of the image tags you've specified if a newer version is available
@@ -51,8 +53,16 @@ type DeployConfig struct {
 		RemoveImages  bool `yaml:"remove_images" default:"true"`  // RemoveImages removes the images used by the deployment (currently not supported in docker swarm mode)
 		RemoveRepoDir bool `yaml:"remove_dir" default:"true"`     // RemoveRepoDir removes the repository directory after the deployment is destroyed
 	} `yaml:"destroy_opts"` // DestroyOpts is the destroy options for the deployment
-	Profiles        []string          `yaml:"profiles" default:"[]"` // Profiles is a list of profiles to use for the deployment, e.g., ["dev", "prod"]. See https://docs.docker.com/compose/how-tos/profiles/
-	ExternalSecrets map[string]string `yaml:"external_secrets"`      // ExternalSecrets maps env vars to secret IDs/keys for injecting secrets from external providers like Bitwarden SM at deployment, e.g. {"DB_PASSWORD": "138e3697-ed58-431c-b866-b3550066343a"}
+	Profiles         []string          `yaml:"profiles" default:"[]"`         // Profiles is a list of profiles to use for the deployment, e.g., ["dev", "prod"]. See https://docs.docker.com/compose/how-tos/profiles/
+	ExternalSecrets  map[string]string `yaml:"external_secrets"`              // ExternalSecrets maps env vars to secret IDs/keys for injecting secrets from external providers like Bitwarden SM at deployment, e.g. {"DB_PASSWORD": "138e3697-ed58-431c-b866-b3550066343a"}
+	AutoDiscover     bool              `yaml:"auto_discover" default:"false"` // AutoDiscover enables autodiscovery of services to deploy in the working directory by checking for subdirectories with docker-compose files
+	AutoDiscoverOpts struct {
+		ScanDepth int  `yaml:"depth" default:"0"`     // ScanDepth is the maximum depth of subdirectories to scan for docker-compose files
+		Delete    bool `yaml:"delete" default:"true"` // Delete removes obsolete auto-discovered deployments that are no longer present in the repository
+	} `yaml:"auto_discover_opts"` // AutoDiscoverOpts are options for the autodiscovery feature
+	Internal struct {
+		Environment map[string]string // Environment stores environment variables from local env_files entries (if RepositoryUrl to set) for the deployment for interpolating variables in the compose files
+	} // Internal holds internal configuration values that are not set by the user
 }
 
 // DefaultDeployConfig creates a DeployConfig with default values.
@@ -66,7 +76,7 @@ func DefaultDeployConfig(name, reference string) *DeployConfig {
 }
 
 func (c *DeployConfig) validateConfig() error {
-	if c.Name == "" {
+	if c.Name == "" && !c.AutoDiscover {
 		return fmt.Errorf("%w: name", ErrKeyNotFound)
 	}
 
@@ -150,8 +160,8 @@ func GetDeployConfigFromYAML(f string) ([]*DeployConfig, error) {
 }
 
 // GetDeployConfigs returns either the deployment configuration from the repository or the default configuration.
-func GetDeployConfigs(repoDir, name, customTarget, reference string) ([]*DeployConfig, error) {
-	files, err := os.ReadDir(repoDir)
+func GetDeployConfigs(configDir, name, customTarget, reference string) ([]*DeployConfig, error) {
+	files, err := os.ReadDir(configDir)
 	if err != nil {
 		return nil, err
 	}
@@ -172,13 +182,28 @@ func GetDeployConfigs(repoDir, name, customTarget, reference string) ([]*DeployC
 
 	var configs []*DeployConfig
 	for _, configFile := range DeploymentConfigFileNames {
-		configs, err = getDeployConfigsFromFile(repoDir, files, configFile)
+		configs, err = getDeployConfigsFromFile(configDir, files, configFile)
 		if err != nil {
 			if errors.Is(err, ErrConfigFileNotFound) {
 				continue
 			}
 
 			return nil, err
+		}
+
+		// Handle autodiscover deployment configs
+		for i, c := range configs {
+			// Check for deployConfigs with AutoDiscover enabled, if true then remove this config and add new configs based on discovered compose files
+			if c.AutoDiscover {
+				discoveredConfigs, err := autoDiscoverDeployments(configDir, c)
+				if err != nil {
+					return nil, fmt.Errorf("failed to auto-discover deployment configurations: %w", err)
+				}
+
+				// Replace the current config with the discovered configs
+				configs = append(configs[:i], configs[i+1:]...)
+				configs = append(configs, discoveredConfigs...)
+			}
 		}
 
 		if configs != nil {
@@ -252,4 +277,113 @@ func validateUniqueProjectNames(configs []*DeployConfig) error {
 	}
 
 	return nil
+}
+
+// ResolveDeployConfigs returns deployment configs for a poll run, preferring inline
+// deployments defined on the PollConfig when provided. Falls back to repository
+// configuration files or default values when no inline deployments are present.
+func ResolveDeployConfigs(poll PollConfig, configDir, name string) ([]*DeployConfig, error) {
+	// Prefer inline deployments when present
+	if len(poll.Deployments) > 0 {
+		return poll.Deployments, nil
+	}
+
+	// No inline deployments, use repository config discovery from configDir
+	return GetDeployConfigs(configDir, name, poll.CustomTarget, poll.Reference)
+}
+
+// autoDiscoverDeployments scans the base directory for subdirectories
+// containing docker-compose files and generates DeployConfig entries for each.
+func autoDiscoverDeployments(baseDir string, baseDeployConfig *DeployConfig) ([]*DeployConfig, error) {
+	var configs []*DeployConfig
+
+	searchPath := path.Join(baseDir, baseDeployConfig.WorkingDirectory)
+
+	err := filepath.WalkDir(searchPath, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Calculate the depth of the current path relative to the search path
+		rel, err := filepath.Rel(searchPath, p)
+		if err != nil {
+			return err
+		}
+
+		depth := 0
+		if rel != "." {
+			depth = len(strings.Split(rel, string(os.PathSeparator)))
+		}
+
+		// Skip directories that exceed the maximum depth if ScanDepth is set greater than 0
+		if d.IsDir() && depth > baseDeployConfig.AutoDiscoverOpts.ScanDepth && baseDeployConfig.AutoDiscoverOpts.ScanDepth > 0 {
+			return filepath.SkipDir
+		}
+
+		if !d.IsDir() {
+			return nil
+		}
+
+		// Check if the directory contains any docker-compose files
+		for _, composeFile := range baseDeployConfig.ComposeFiles {
+			composeFilePath := filepath.Join(p, composeFile)
+			if _, err = os.Stat(composeFilePath); err == nil {
+				c := &DeployConfig{}
+				deepCopy(baseDeployConfig, c)
+
+				c.Name = filepath.Base(p)
+
+				c.WorkingDirectory, err = filepath.Rel(baseDir, p)
+				if err != nil {
+					return err
+				}
+
+				configs = append(configs, c)
+
+				break
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return configs, nil
+}
+
+// deepCopy creates a deep copy of a DeployConfig struct.
+func deepCopy(src, dst *DeployConfig) {
+	*dst = *src
+
+	// Deep copy maps and slices
+	if src.ComposeFiles != nil {
+		dst.ComposeFiles = make([]string, len(src.ComposeFiles))
+		copy(dst.ComposeFiles, src.ComposeFiles)
+	}
+
+	if src.EnvFiles != nil {
+		dst.EnvFiles = make([]string, len(src.EnvFiles))
+		copy(dst.EnvFiles, src.EnvFiles)
+	}
+
+	if src.BuildOpts.Args != nil {
+		dst.BuildOpts.Args = make(map[string]string)
+		for k, v := range src.BuildOpts.Args {
+			dst.BuildOpts.Args[k] = v
+		}
+	}
+
+	if src.Profiles != nil {
+		dst.Profiles = make([]string, len(src.Profiles))
+		copy(dst.Profiles, src.Profiles)
+	}
+
+	if src.ExternalSecrets != nil {
+		dst.ExternalSecrets = make(map[string]string)
+		for k, v := range src.ExternalSecrets {
+			dst.ExternalSecrets[k] = v
+		}
+	}
 }
