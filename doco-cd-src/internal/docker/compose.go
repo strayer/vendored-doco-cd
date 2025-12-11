@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types/image"
+
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
@@ -45,7 +47,7 @@ import (
 )
 
 const (
-	socketPath = "/var/run/docker.sock"
+	SocketPath = "/var/run/docker.sock"
 )
 
 var (
@@ -57,7 +59,7 @@ var (
 
 // ConnectToSocket connects to the docker socket.
 func ConnectToSocket() (net.Conn, error) {
-	c, err := net.Dial("unix", socketPath)
+	c, err := net.Dial("unix", SocketPath)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +71,7 @@ func NewHttpClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", socketPath)
+				return net.Dial("unix", SocketPath)
 			},
 		},
 	}
@@ -107,7 +109,7 @@ func VerifySocketRead(httpClient *http.Client) error {
 // VerifySocketConnection verifies whether the application can connect to the docker socket.
 func VerifySocketConnection() error {
 	// Check if the docker socket file exists
-	if _, err := os.Stat(socketPath); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(SocketPath); errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
@@ -275,9 +277,14 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 // deployCompose deploys a project as specified by the Docker Compose specification (LoadCompose).
 func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Project,
 	deployConfig *config.DeployConfig, payload webhook.ParsedPayload,
-	repoDir, latestCommit, appVersion, secretHash string, forceDeploy bool,
+	repoDir, latestCommit, appVersion, secretHash string,
 ) error {
-	var err error
+	var (
+		err            error
+		beforeImages   map[string]api.ImageSummary // Images used by stack before deployment
+		afterImages    map[string]api.ImageSummary // Images used by stack after deployment
+		unusedImageIDs []string                    // Image IDs no longer used by stack after deployment
+	)
 
 	service := compose.NewComposeService(dockerCli)
 
@@ -292,6 +299,13 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 			} else {
 				return fmt.Errorf("failed to get module version: %w", err)
 			}
+		}
+	}
+
+	if deployConfig.PruneImages {
+		beforeImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get existing images: %w", err)
 		}
 	}
 
@@ -313,7 +327,7 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	}
 
 	recreateType := api.RecreateDiverged
-	if deployConfig.ForceRecreate || forceDeploy {
+	if deployConfig.ForceRecreate {
 		recreateType = api.RecreateForce
 	}
 
@@ -361,6 +375,28 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 			}
 		} else {
 			return err
+		}
+	}
+
+	if deployConfig.PruneImages {
+		afterImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get images after deployment: %w", err)
+		}
+
+		// Determine unused images by comparing image SHAs used by services before and after the deployment
+		unusedImageIDs = make([]string, 0)
+
+		for svc, beforeImg := range beforeImages {
+			afterImg, exists := afterImages[svc]
+			if !exists || beforeImg.ID != afterImg.ID {
+				unusedImageIDs = append(unusedImageIDs, beforeImg.ID)
+			}
+		}
+
+		_, err = pruneImages(ctx, dockerCli, unusedImageIDs)
+		if err != nil {
+			return fmt.Errorf("failed to prune images: %w", err)
 		}
 	}
 
@@ -522,6 +558,19 @@ func DeployStack(
 
 			return fmt.Errorf("%s: %w", errMsg, err)
 		}
+
+		if deployConfig.PruneImages {
+			stackLog.Info("prune images on swarm nodes")
+
+			err = RunImagePruneJob(*ctx, *dockerCli)
+			if err != nil {
+				prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
+
+				errMsg := "failed to run image prune job"
+
+				return fmt.Errorf("%s: %w", errMsg, err)
+			}
+		}
 	} else {
 		hasChangedFiles, err := ProjectFilesHaveChanges(changedFiles, project)
 		if err != nil {
@@ -536,6 +585,10 @@ func DeployStack(
 		}
 
 		switch {
+		case forceDeploy:
+			deployConfig.ForceRecreate = true
+
+			stackLog.Debug("force deploy enabled, forcing recreate of all services")
 		case secretsChanged:
 			deployConfig.ForceRecreate = true
 
@@ -550,7 +603,7 @@ func DeployStack(
 
 		stackLog.Info("deploying stack", slog.Bool("forced", deployConfig.ForceRecreate))
 
-		err = deployCompose(*ctx, *dockerCli, project, deployConfig, *payload, externalWorkingDir, latestCommit, appVersion, secretHash, forceDeploy)
+		err = deployCompose(*ctx, *dockerCli, project, deployConfig, *payload, externalWorkingDir, latestCommit, appVersion, secretHash)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
 
@@ -565,9 +618,9 @@ func DeployStack(
 
 	msg := "successfully deployed stack " + deployConfig.Name
 
-	err = notification.Send(notification.Success, "Deployment Successful", msg, metadata)
+	err = notification.Send(notification.Success, "Stack deployed", msg, metadata)
 	if err != nil {
-		return err
+		jobLog.Error("failed to send notification", logger.ErrAttr(err))
 	}
 
 	return nil
@@ -576,7 +629,7 @@ func DeployStack(
 // DestroyStack destroys the stack using the provided deployment configuration.
 func DestroyStack(
 	jobLog *slog.Logger, ctx *context.Context,
-	dockerCli *command.Cli, deployConfig *config.DeployConfig,
+	dockerCli *command.Cli, deployConfig *config.DeployConfig, metadata notification.Metadata,
 ) error {
 	stackLog := jobLog.
 		With(slog.String("stack", deployConfig.Name))
@@ -610,11 +663,18 @@ func DestroyStack(
 		return fmt.Errorf("%s: %w", errMsg, err)
 	}
 
+	err = notification.Send(notification.Success, "Stack destroyed", "successfully destroyed stack "+deployConfig.Name, metadata)
+	if err != nil {
+		stackLog.Error("failed to send notification", logger.ErrAttr(err))
+	}
+
 	return nil
 }
 
 func getAbsolutePaths(changedFiles []gitInternal.ChangedFile, workingDir string) []string {
 	var absPaths []string
+
+	w := filepath.Clean(workingDir)
 
 	for _, f := range changedFiles {
 		checkPaths := []diff.File{f.From, f.To}
@@ -627,15 +687,11 @@ func getAbsolutePaths(changedFiles []gitInternal.ChangedFile, workingDir string)
 			p := filepath.Clean(checkPath.Path())
 
 			if !filepath.IsAbs(p) {
-				w := filepath.Clean(workingDir)
-
-				for {
-					if strings.HasPrefix(p, filepath.Base(w)) {
-						w = filepath.Dir(w)
-					} else {
-						p = filepath.Join(w, p)
-						break
-					}
+				// Check if base of working directory ends with directory path of changed file
+				if strings.HasSuffix(filepath.Dir(p), filepath.Base(w)) {
+					p = filepath.Join(w, filepath.Base(p))
+				} else {
+					p = filepath.Join(workingDir, p)
 				}
 			}
 
@@ -865,4 +921,35 @@ func GetProjects(ctx context.Context, dockerCli command.Cli, showDisabled bool) 
 	return service.List(ctx, api.ListOptions{
 		All: showDisabled,
 	})
+}
+
+// pruneImages tries to remove the specified image IDs from the Docker host and returns a list of pruned image IDs.
+// If an image is still in use by a running container, the image won't be removed.
+func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([]string, error) {
+	var prunedImages []string
+
+	for _, img := range images {
+		response, err := dockerCli.Client().ImageRemove(ctx, img, image.RemoveOptions{
+			Force:         true,
+			PruneChildren: true,
+		})
+		if err != nil {
+			if strings.Contains(err.Error(), "image is being used by running container") {
+				// Ignore error if image is being used by a running container
+				continue
+			}
+
+			return nil, fmt.Errorf("failed to remove image %s: %w", img, err)
+		}
+
+		for _, r := range response {
+			if r.Deleted != "" {
+				prunedImages = append(prunedImages, r.Deleted)
+			} else if r.Untagged != "" {
+				prunedImages = append(prunedImages, r.Untagged)
+			}
+		}
+	}
+
+	return prunedImages, nil
 }
