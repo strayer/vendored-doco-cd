@@ -22,7 +22,6 @@ import (
 	"github.com/docker/docker/api/types/image"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
-	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
@@ -408,7 +407,7 @@ func DeployStack(
 	jobLog *slog.Logger, internalRepoPath, externalRepoPath string, ctx *context.Context,
 	dockerCli *command.Cli, dockerClient *client.Client, payload *webhook.ParsedPayload, deployConfig *config.DeployConfig,
 	changedFiles []gitInternal.ChangedFile, latestCommit, appVersion, triggerEvent string, forceDeploy bool,
-	metadata notification.Metadata, resolvedSecrets secrettypes.ResolvedSecrets, secretsChanged bool,
+	resolvedSecrets secrettypes.ResolvedSecrets, secretsChanged bool,
 ) error {
 	startTime := time.Now()
 
@@ -616,20 +615,13 @@ func DeployStack(
 	prometheus.DeploymentsTotal.WithLabelValues(deployConfig.Name).Inc()
 	prometheus.DeploymentDuration.WithLabelValues(deployConfig.Name).Observe(time.Since(startTime).Seconds())
 
-	msg := "successfully deployed stack " + deployConfig.Name
-
-	err = notification.Send(notification.Success, "Stack deployed", msg, metadata)
-	if err != nil {
-		jobLog.Error("failed to send notification", logger.ErrAttr(err))
-	}
-
 	return nil
 }
 
 // DestroyStack destroys the stack using the provided deployment configuration.
 func DestroyStack(
 	jobLog *slog.Logger, ctx *context.Context,
-	dockerCli *command.Cli, deployConfig *config.DeployConfig, metadata notification.Metadata,
+	dockerCli *command.Cli, deployConfig *config.DeployConfig,
 ) error {
 	stackLog := jobLog.
 		With(slog.String("stack", deployConfig.Name))
@@ -661,11 +653,6 @@ func DestroyStack(
 	if err != nil {
 		errMsg := "failed to destroy stack"
 		return fmt.Errorf("%s: %w", errMsg, err)
-	}
-
-	err = notification.Send(notification.Success, "Stack destroyed", "successfully destroyed stack "+deployConfig.Name, metadata)
-	if err != nil {
-		stackLog.Error("failed to send notification", logger.ErrAttr(err))
 	}
 
 	return nil
@@ -905,21 +892,21 @@ func RemoveProject(ctx context.Context, dockerCli command.Cli, projectName strin
 	})
 }
 
-// GetProject returns the status of all services in the specified project.
-func GetProject(ctx context.Context, dockerCli command.Cli, projectName string) ([]api.ContainerSummary, error) {
-	service := compose.NewComposeService(dockerCli)
-
-	return service.Ps(ctx, projectName, api.PsOptions{
-		All: true,
-	})
-}
-
 // GetProjects returns a list of all projects.
 func GetProjects(ctx context.Context, dockerCli command.Cli, showDisabled bool) ([]api.Stack, error) {
 	service := compose.NewComposeService(dockerCli)
 
 	return service.List(ctx, api.ListOptions{
 		All: showDisabled,
+	})
+}
+
+// GetProjectContainers returns the status of all services in the specified project.
+func GetProjectContainers(ctx context.Context, dockerCli command.Cli, projectName string) ([]api.ContainerSummary, error) {
+	service := compose.NewComposeService(dockerCli)
+
+	return service.Ps(ctx, projectName, api.PsOptions{
+		All: true,
 	})
 }
 
@@ -952,4 +939,45 @@ func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([
 	}
 
 	return prunedImages, nil
+}
+
+// PullImages pulls all images defined in the compose project.
+func PullImages(ctx context.Context, dockerCli command.Cli, projectName string) error {
+	service := compose.NewComposeService(dockerCli)
+
+	containers, err := GetProjectContainers(ctx, dockerCli, projectName)
+	if err != nil {
+		return fmt.Errorf("failed to get project containers: %w", err)
+	}
+
+	containerNames := make([]string, 0, len(containers))
+	for _, c := range containers {
+		containerNames = append(containerNames, c.Name)
+	}
+
+	project, err := service.Generate(ctx, api.GenerateOptions{ProjectName: projectName, Containers: containerNames})
+	if err != nil {
+		return fmt.Errorf("failed to generate project: %w", err)
+	}
+
+	return service.Pull(ctx, project, api.PullOptions{
+		Quiet: true,
+	})
+}
+
+// GetImages retrieves all image IDs used by the services in the compose project.
+func GetImages(ctx context.Context, dockerCli command.Cli, projectName string) (map[string]struct{}, error) {
+	service := compose.NewComposeService(dockerCli)
+
+	imageSummaries, err := service.Images(ctx, projectName, api.ImagesOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to get images: %w", err)
+	}
+
+	images := make(map[string]struct{})
+	for _, img := range imageSummaries {
+		images[img.ID] = struct{}{}
+	}
+
+	return images, nil
 }
