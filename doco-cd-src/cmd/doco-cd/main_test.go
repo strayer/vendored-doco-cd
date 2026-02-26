@@ -18,11 +18,10 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/google/uuid"
 
-	"github.com/kimdre/doco-cd/internal/stages"
-
-	"github.com/kimdre/doco-cd/internal/secretprovider"
+	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
+	"github.com/kimdre/doco-cd/internal/secretprovider"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -33,10 +32,8 @@ import (
 )
 
 const (
-	validCommitSHA   = "26263c2b44133367927cd1423d8c8457b5befce5"
-	invalidCommitSHA = "1111111111111111111111111111111111111111"
-	projectName      = "test-deploy"
-	invalidBranch    = "refs/heads/invalid"
+	validCommitSHA = "26263c2b44133367927cd1423d8c8457b5befce5"
+	invalidBranch  = "refs/heads/invalid"
 )
 
 var WorkingDir string
@@ -104,7 +101,7 @@ func TestHandleEvent(t *testing.T) {
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
 				CommitSHA: validCommitSHA,
-				Name:      projectName,
+				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
 				Private:   false,
@@ -120,7 +117,7 @@ func TestHandleEvent(t *testing.T) {
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
 				CommitSHA: "f291bfca73b06814293c1f9c9f3c7f95e4932564",
-				Name:      projectName,
+				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
 				Private:   false,
@@ -136,13 +133,13 @@ func TestHandleEvent(t *testing.T) {
 			payload: webhook.ParsedPayload{
 				Ref:       invalidBranch,
 				CommitSHA: validCommitSHA,
-				Name:      projectName,
+				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
 				Private:   false,
 			},
 			expectedStatusCode:   http.StatusInternalServerError,
-			expectedResponseBody: `{"error":"failed to clone repository","content":"couldn't find remote ref \"` + invalidBranch + `\"","job_id":"%[1]s"}`,
+			expectedResponseBody: `{"error":"failed to clone repository","content":"failed to checkout repository: failed to get reference set: invalid reference, should be a tag or a branch: ` + invalidBranch + `","job_id":"%[1]s"}`,
 			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            false,
@@ -152,7 +149,7 @@ func TestHandleEvent(t *testing.T) {
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
 				CommitSHA: validCommitSHA,
-				Name:      projectName,
+				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
 				Private:   true,
@@ -168,13 +165,13 @@ func TestHandleEvent(t *testing.T) {
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
 				CommitSHA: "efefb4111f3c363692a2526f9be9b24560e6511f",
-				Name:      projectName,
+				Name:      "kimdre",
 				FullName:  "kimdre/kimdre",
 				CloneURL:  "https://github.com/kimdre/kimdre",
 				Private:   false,
 			},
 			expectedStatusCode:   http.StatusInternalServerError,
-			expectedResponseBody: `{"error":"deployment failed","content":"failed to deploy stack test-deploy: no compose files found: stat %[2]s/docker-compose.yaml: no such file or directory","job_id":"%[1]s"}`,
+			expectedResponseBody: `{"error":"deployment failed","content":"failed to deploy stack %[3]s: no compose files found: stat %[2]s/docker-compose.yaml: no such file or directory","job_id":"%[1]s"}`,
 			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            false,
@@ -183,11 +180,11 @@ func TestHandleEvent(t *testing.T) {
 			name: "With Remote Repository",
 			payload: webhook.ParsedPayload{
 				Ref:       "remote",
-				CommitSHA: validCommitSHA,
-				Name:      projectName,
+				CommitSHA: "d02f87d2a886d6bae4673409f6b5108b45156f5c",
+				Name:      "doco-cd_tests",
 				FullName:  "kimdre/doco-cd_tests",
 				CloneURL:  "https://github.com/kimdre/doco-cd_tests",
-				Private:   true,
+				Private:   false,
 			},
 			expectedStatusCode:   http.StatusCreated,
 			expectedResponseBody: `{"content":"job completed successfully","job_id":"%[1]s"}`,
@@ -196,14 +193,14 @@ func TestHandleEvent(t *testing.T) {
 			swarmMode:            false,
 		},
 		{
-			name: "With Remote Repository and Swarm Mode",
+			name: "With Swarm Mode",
 			payload: webhook.ParsedPayload{
 				Ref:       git.SwarmModeBranch,
 				CommitSHA: "01435dad4e7ff8f7da70202ca1ca77bccca9eb62",
-				Name:      projectName,
+				Name:      "doco-cd_tests",
 				FullName:  "kimdre/doco-cd_tests",
 				CloneURL:  "https://github.com/kimdre/doco-cd_tests",
-				Private:   true,
+				Private:   false,
 			},
 			expectedStatusCode:   http.StatusCreated,
 			expectedResponseBody: `{"content":"job completed successfully","job_id":"%[1]s"}`,
@@ -213,19 +210,12 @@ func TestHandleEvent(t *testing.T) {
 		},
 	}
 
-	// Restore environment variables after the test
-	for _, k := range []string{"LOG_LEVEL", "HTTP_PORT", "WEBHOOK_SECRET", "GIT_ACCESS_TOKEN", "AUTH_TYPE", "SKIP_TLS_VERIFICATION"} {
-		if v, ok := os.LookupEnv(k); ok {
-			t.Cleanup(func() {
-				err := os.Setenv(k, v)
-				if err != nil {
-					t.Fatalf("failed to restore environment variable %s: %v", k, err)
-				}
-			})
-		}
+	appConfig, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatalf("failed to get app config: %s", err.Error())
 	}
 
-	dockerCli, err := docker.CreateDockerCli(false, false)
+	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
 	if err != nil {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
@@ -235,67 +225,45 @@ func TestHandleEvent(t *testing.T) {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
 
+	dockerClient, _ := client.NewClientWithOpts(
+		client.FromEnv,
+		client.WithAPIVersionNegotiation(),
+	)
+
 	encryption.SetupAgeKeyEnvVar(t)
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			if swarm.ModeEnabled && !tc.swarmMode {
-				t.Skipf("Skipping test %s because it requires Swarm mode to be disabled", tc.name)
-			}
-
-			if !swarm.ModeEnabled && tc.swarmMode {
-				t.Skipf("Skipping test %s because it requires Swarm mode to be enabled", tc.name)
+			if swarm.ModeEnabled != tc.swarmMode {
+				t.Skipf("Skipping test because it requires swarm mode %v, but current mode is %v", tc.swarmMode, swarm.ModeEnabled)
 			}
 
 			tmpDir := t.TempDir()
 
-			for k, v := range defaultEnvVars {
-				err := os.Setenv(k, v)
-				if err != nil {
-					t.Fatalf("Failed to set environment variable: %v", err)
-				}
+			stackName := test.ConvertTestName(t.Name())
+			if len(stackName) > 40 {
+				stackName = stackName[:40]
+			}
 
-				t.Cleanup(func() {
-					err = os.Unsetenv(k)
-					if err != nil {
-						t.Fatalf("Failed to unset environment variable: %v", err)
-					}
-				})
+			for k, v := range defaultEnvVars {
+				t.Setenv(k, v)
 			}
 
 			if tc.overrideEnv != nil {
 				for k, v := range tc.overrideEnv {
-					err := os.Setenv(k, v)
-					if err != nil {
-						t.Fatalf("Failed to set environment variable: %v", err)
-					}
+					t.Setenv(k, v)
 				}
 			}
 
-			appConfig, err := config.GetAppConfig()
-			if err != nil {
-				t.Fatalf("failed to get app config: %s", err.Error())
+			if tc.payload.Private && appConfig.GitAccessToken == "" {
+				t.Skip("Skipping test for private repository because GIT_ACCESS_TOKEN is not set")
 			}
-
-			dockerClient, _ := client.NewClientWithOpts(
-				client.FromEnv,
-				client.WithAPIVersionNegotiation(),
-			)
 
 			log := logger.New(12)
 			jobID := uuid.Must(uuid.NewV7()).String()
 			jobLog := log.With(slog.String("job_id", jobID))
 
 			ctx := context.Background()
-
-			dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
-			if err != nil {
-				if tc.expectedStatusCode == http.StatusInternalServerError {
-					return
-				}
-
-				t.Fatalf("Failed to create docker client: %v", err)
-			}
 
 			t.Cleanup(func() {
 				err = dockerCli.Client().Close()
@@ -333,12 +301,10 @@ func TestHandleEvent(t *testing.T) {
 					Volumes:       true,
 				}
 
-				t.Log("Remove test container")
-
 				if swarm.ModeEnabled {
-					err = docker.RemoveSwarmStack(ctx, dockerCli, tc.payload.Name)
+					err = docker.RemoveSwarmStack(ctx, dockerCli, stackName)
 				} else if service != nil {
-					err = service.Down(ctx, tc.payload.Name, downOpts)
+					err = service.Down(ctx, stackName, downOpts)
 				}
 
 				if err != nil {
@@ -365,6 +331,7 @@ func TestHandleEvent(t *testing.T) {
 				dockerCli,
 				dockerClient,
 				&secretProvider,
+				stackName,
 			)
 
 			if status := rr.Code; status != tc.expectedStatusCode {
@@ -372,7 +339,7 @@ func TestHandleEvent(t *testing.T) {
 					status, tc.expectedStatusCode)
 			}
 
-			expectedReturnMessage := fmt.Sprintf(tc.expectedResponseBody, jobID, filepath.Join(tmpDir, stages.GetRepoName(tc.payload.CloneURL))) + "\n"
+			expectedReturnMessage := fmt.Sprintf(tc.expectedResponseBody, jobID, filepath.Join(tmpDir, git.GetRepoName(tc.payload.CloneURL)), stackName) + "\n"
 			if rr.Body.String() != expectedReturnMessage {
 				t.Errorf("handler returned unexpected body: got '%v' want '%v'",
 					rr.Body.String(), expectedReturnMessage)
@@ -390,12 +357,12 @@ func TestGetProxyUrlRedacted(t *testing.T) {
 	}{
 		{
 			name:     "Valid HTTP Proxy",
-			proxyURL: "http://user:password@proxy:8080",
+			proxyURL: "http://user:password@proxy:8080", // #nosec G101
 			expected: "http://user:***@proxy:8080",
 		},
 		{
 			name:     "Valid HTTPS Proxy",
-			proxyURL: "https://user:password@proxy:8443",
+			proxyURL: "https://user:password@proxy:8443", // #nosec G101
 			expected: "https://user:***@proxy:8443",
 		},
 		{

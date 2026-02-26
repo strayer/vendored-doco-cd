@@ -38,7 +38,10 @@ const (
 	dataPath    = "/data"
 )
 
-var errMsg string
+var (
+	errMsg          string
+	deployerLimiter *DeployerLimiter // deployerLimiter controls the concurrency of deployments across webhook and poll handlers.
+)
 
 // GetProxyUrlRedacted takes a proxy URL string and redacts the password if it exists.
 func GetProxyUrlRedacted(proxyUrl string) string {
@@ -156,11 +159,15 @@ func main() {
 		return
 	}
 
-	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(ctx, dockerCli)
-	if err != nil {
-		log.Critical("failed to check if docker daemon is a swarm manager", logger.ErrAttr(err))
+	if c.DockerSwarmFeatures {
+		swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(ctx, dockerCli)
+		if err != nil {
+			log.Critical("failed to check if docker daemon is a swarm manager", logger.ErrAttr(err))
 
-		return
+			return
+		}
+	} else {
+		log.Debug("swarm features disabled by configuration")
 	}
 
 	log.Debug("negotiated docker versions to use",
@@ -284,6 +291,9 @@ func main() {
 		secretProvider: &secretProvider,
 	}
 
+	// Initialize the deployer limiter according to configuration
+	deployerLimiter = NewDeployerLimiter(c.MaxConcurrentDeployments)
+
 	// Register HTTP endpoints
 	enabledEndpoints := registerHttpEndpoints(c, &h, log)
 
@@ -296,7 +306,10 @@ func main() {
 	var wg sync.WaitGroup
 
 	if len(c.PollConfig) > 0 {
-		log.Info("poll configuration found, scheduling polling jobs", slog.Any("poll_config", c.PollConfig))
+		log.Info(
+			"poll configuration found, scheduling polling jobs",
+			slog.Any("poll_config", logger.BuildSliceLogValue(c.PollConfig, "Deployments.Internal")),
+		)
 
 		for _, pollConfig := range c.PollConfig {
 			err = StartPoll(&h, pollConfig, &wg)

@@ -8,13 +8,15 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/google/uuid"
+
+	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/notification"
@@ -39,6 +41,7 @@ type handlerData struct {
 	dockerClient   *client.Client       // Docker client
 	log            *logger.Logger       // Logger for logging messages
 	secretProvider *secretprovider.SecretProvider
+	testName       string // Overwrites the deployConfig.Name to make test deployments unique and prevent conflicts between tests when running in parallel. Not used in production.
 }
 
 // onError handles errors by logging them, sending a JSON error response, and sending a notification.
@@ -71,11 +74,12 @@ func onError(w http.ResponseWriter, log *slog.Logger, errMsg string, details any
 func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter, appConfig *config.AppConfig,
 	dataMountPoint container.MountPoint, payload webhook.ParsedPayload, customTarget, jobID string,
 	dockerCli command.Cli, dockerClient *client.Client, secretProvider *secretprovider.SecretProvider,
+	testName string,
 ) {
 	var err error
 
 	startTime := time.Now()
-	repoName := stages.GetRepoName(payload.CloneURL)
+	repoName := git.GetRepoName(payload.CloneURL)
 
 	jobLog = jobLog.With(slog.String("repository", repoName))
 
@@ -96,7 +100,9 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 	}
 
 	if payload.Ref == "" {
-		onError(w, jobLog, "no reference provided in webhook payload, skipping event", "", http.StatusBadRequest, metadata)
+		msg := "no reference provided in webhook payload, skipping event"
+		jobLog.Warn(msg)
+		JSONError(w, msg, msg, jobID, http.StatusBadRequest)
 
 		return
 	}
@@ -109,6 +115,8 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 
 			return
 		}
+	} else {
+		swarm.ModeEnabled = false
 	}
 
 	cloneUrl := payload.CloneURL
@@ -121,25 +129,15 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 		"get repository",
 		slog.String("url", cloneUrl))
 
-	// Determine the authenticated clone URL if needed
-	auth := transport.AuthMethod(nil)
-	if git.IsSSH(cloneUrl) {
-		// SSH authentication
-		auth, err = git.SSHAuth(appConfig.SSHPrivateKey, appConfig.SSHPrivateKeyPassphrase)
-		if err != nil {
-			onError(w, jobLog.With(logger.ErrAttr(err)), "failed to set up SSH authentication", err.Error(), http.StatusInternalServerError, metadata)
+	auth, err := git.GetAuthMethod(cloneUrl, appConfig.SSHPrivateKey, appConfig.SSHPrivateKeyPassphrase, appConfig.GitAccessToken)
+	if err != nil {
+		onError(w, jobLog.With(logger.ErrAttr(err)), "failed to set up authentication", err.Error(), http.StatusInternalServerError, metadata)
+		return
+	}
 
-			return
-		}
-	} else {
-		// HTTPS authentication
-		if appConfig.GitAccessToken != "" {
-			auth = git.HttpTokenAuth(appConfig.GitAccessToken)
-		} else if payload.Private {
-			onError(w, jobLog, "missing access token for private repository", "", http.StatusInternalServerError, metadata)
-
-			return
-		}
+	if auth == nil && payload.Private {
+		onError(w, jobLog, "missing access token for private repository", "", http.StatusInternalServerError, metadata)
+		return
 	}
 
 	// Validate payload.FullName to prevent directory traversal
@@ -188,9 +186,7 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 	jobLog.Debug("retrieving deployment configuration")
 
 	// Get the deployment configs from the repository
-	configDir := filepath.Join(internalRepoPath, appConfig.DeployConfigBaseDir)
-
-	deployConfigs, err := config.GetDeployConfigs(configDir, payload.Name, customTarget, payload.Ref)
+	deployConfigs, err := config.GetDeployConfigs(internalRepoPath, appConfig.DeployConfigBaseDir, payload.Name, customTarget, payload.Ref)
 	if err != nil {
 		onError(w, jobLog.With(logger.ErrAttr(err)), "failed to get deploy configuration", err.Error(), http.StatusInternalServerError, metadata)
 
@@ -202,39 +198,96 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 		onError(w, jobLog.With(logger.ErrAttr(err)), "failed to clean up obsolete auto-discovered containers", err.Error(), http.StatusInternalServerError, metadata)
 	}
 
+	var wg sync.WaitGroup
+
+	resultCh := make(chan error, len(deployConfigs))
+
 	for _, deployConfig := range deployConfigs {
-		deployLog := jobLog.WithGroup("deploy")
+		deployLog := jobLog.
+			WithGroup("deploy").
+			With(
+				slog.String("stack", deployConfig.Name),
+				slog.String("reference", deployConfig.Reference))
 
-		failNotifyFunc := func(err error, metadata notification.Metadata) {
-			onError(w, deployLog.With(logger.ErrAttr(err)), "deployment failed", err.Error(), http.StatusInternalServerError, metadata)
+		// Used to make test deployments unique and prevent conflicts between tests when running in parallel.
+		// It is not used in production.
+		if testName != "" {
+			deployConfig.Name = test.ConvertTestName(testName)
 		}
 
-		stageMgr := stages.NewStageManager(
-			metadata.JobID,
-			stages.JobTriggerWebhook,
-			deployLog,
-			failNotifyFunc,
-			&stages.RepositoryData{
-				CloneURL:     config.HttpUrl(cloneUrl),
-				Name:         repoName,
-				PathInternal: internalRepoPath,
-				PathExternal: externalRepoPath,
-			},
-			&stages.Docker{
-				Cmd:            dockerCli,
-				Client:         dockerClient,
-				DataMountPoint: dataMountPoint,
-			},
-			&payload,
-			appConfig,
-			deployConfig,
-			secretProvider,
-		)
+		wg.Add(1)
 
-		err = stageMgr.RunStages(ctx)
-		if err != nil {
-			return
+		go func(dc *config.DeployConfig) {
+			defer wg.Done()
+
+			if deployerLimiter != nil {
+				deployLog.Debug("queuing deployment")
+
+				unlock, lErr := deployerLimiter.acquire(ctx, repoName, NormalizeReference(dc.Reference))
+				if lErr != nil {
+					resultCh <- lErr
+					return
+				}
+				defer unlock()
+			}
+
+			failNotifyFunc := func(err error, metadata notification.Metadata) {
+				// Don't write to HTTP from goroutines — just send notification and log
+				go func() {
+					notifyErr := notification.Send(notification.Failure, "Deployment Failed", err.Error(), metadata)
+					if notifyErr != nil {
+						deployLog.Error("failed to send notification", logger.ErrAttr(notifyErr))
+					}
+				}()
+
+				deployLog.Error("deployment failed", logger.ErrAttr(err))
+			}
+
+			stageMgr := stages.NewStageManager(
+				metadata.JobID,
+				stages.JobTriggerWebhook,
+				deployLog,
+				failNotifyFunc,
+				&stages.RepositoryData{
+					CloneURL:     config.HttpUrl(cloneUrl),
+					Name:         repoName,
+					PathInternal: internalRepoPath,
+					PathExternal: externalRepoPath,
+				},
+				&stages.Docker{
+					Cmd:            dockerCli,
+					Client:         dockerClient,
+					DataMountPoint: dataMountPoint,
+				},
+				&payload,
+				appConfig,
+				dc,
+				secretProvider,
+			)
+
+			err := stageMgr.RunStages(ctx)
+			resultCh <- err
+		}(deployConfig)
+	}
+
+	// Wait for all deployments to complete
+	wg.Wait()
+	close(resultCh)
+
+	var deployErr error
+
+	for e := range resultCh {
+		if e != nil {
+			deployErr = e
+			// keep looping to drain channel
 		}
+	}
+
+	if deployErr != nil {
+		// In synchronous mode we should return an error to the caller
+		// For async mode, w is noopResponseWriter and JSONError is a no-op
+		onError(w, jobLog.With(logger.ErrAttr(deployErr)), "deployment failed", deployErr.Error(), http.StatusInternalServerError, metadata)
+		return
 	}
 
 	msg := "job completed successfully"
@@ -259,19 +312,25 @@ func (h *handlerData) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	jobLog.Debug("received webhook event")
 
+	// If wait=false (default), return immediately and run the deployment in the background.
+	// If wait=true, run the deployment synchronously and return when it's completed.
+	wait := false
+	if v := r.URL.Query().Get("wait"); v != "" {
+		// Only treat explicit "true" as synchronous. Everything else (including invalid) is async.
+		wait = strings.EqualFold(v, "true") || v == "1"
+	}
+
 	metadata := notification.Metadata{
 		JobID:      jobID,
-		Repository: "",
+		Repository: "unknown", // Will be updated later if we can parse the payload
 		Stack:      "",
 		Revision:   "",
 	}
 
-	repoName := "unknown"
-
 	// Limit the request body size
 	r.Body = http.MaxBytesReader(w, r.Body, h.appConfig.MaxPayloadSize)
 
-	payload, err := webhook.Parse(r, h.appConfig.WebhookSecret)
+	provider, payload, err := webhook.Parse(r, h.appConfig.WebhookSecret)
 	if err != nil {
 		var statusCode int
 
@@ -297,8 +356,7 @@ func (h *handlerData) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if payload.CloneURL != "" {
-			repoName = stages.GetRepoName(payload.CloneURL)
-			metadata.Repository = repoName
+			metadata.Repository = git.GetRepoName(payload.CloneURL)
 			metadata.Revision = notification.GetRevision(payload.Ref, payload.CommitSHA)
 		}
 
@@ -307,31 +365,42 @@ func (h *handlerData) WebhookHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if metadata.Repository == "" {
-		repoName = stages.GetRepoName(payload.CloneURL)
-		metadata.Repository = repoName
-		metadata.Revision = notification.GetRevision(payload.Ref, payload.CommitSHA)
-	}
+	if deletionEvent, eErr := webhook.IsBranchOrTagDeletionEvent(r, payload, provider); eErr == nil && deletionEvent {
+		errMsg = "branch or tag deletion event received, skipping webhook event"
+		jobLog.Info(errMsg)
+		JSONResponse(w, errMsg, jobID, http.StatusAccepted)
 
-	lock := GetRepoLock(repoName)
-	locked := lock.TryLock(jobID)
-
-	if !locked {
-		errMsg = "another job is still in progress for this repository"
-		h.log.Warn(errMsg,
-			slog.String("repository", repoName),
-			slog.String("locked_by_job", lock.Holder()),
-		)
-		JSONError(w,
-			errMsg,
-			fmt.Sprintf("repsoitory '%s' is currently locked by job '%s'", repoName, lock.Holder()),
-			jobID,
-			http.StatusTooManyRequests)
+		return
+	} else if eErr != nil {
+		errMsg = "failed to check if event is branch or tag deletion"
+		jobLog.Error(errMsg, logger.ErrAttr(eErr))
+		JSONError(w, errMsg, eErr.Error(), jobID, http.StatusInternalServerError)
 
 		return
 	}
 
-	defer lock.Unlock()
+	if metadata.Repository == "" {
+		metadata.Repository = git.GetRepoName(payload.CloneURL)
+		metadata.Revision = notification.GetRevision(payload.Ref, payload.CommitSHA)
+	}
 
-	HandleEvent(ctx, jobLog, w, h.appConfig, h.dataMountPoint, payload, customTarget, jobID, h.dockerCli, h.dockerClient, h.secretProvider)
+	if wait {
+		HandleEvent(ctx, jobLog, w, h.appConfig, h.dataMountPoint, payload, customTarget, jobID, h.dockerCli, h.dockerClient, h.secretProvider, h.testName)
+		return
+	}
+
+	// Async mode: respond immediately and run the deployment in the background.
+	JSONResponse(w, "job accepted", jobID, http.StatusAccepted)
+
+	go func() {
+		HandleEvent(ctx, jobLog, noopResponseWriter{}, h.appConfig, h.dataMountPoint, payload, customTarget, jobID, h.dockerCli, h.dockerClient, h.secretProvider, h.testName)
+	}()
 }
+
+// noopResponseWriter is used when we run HandleEvent asynchronously.
+// It prevents writes to the original HTTP connection after we've already responded.
+type noopResponseWriter struct{}
+
+func (noopResponseWriter) Header() http.Header       { return http.Header{} }
+func (noopResponseWriter) Write([]byte) (int, error) { return 0, nil }
+func (noopResponseWriter) WriteHeader(_ int)         {}

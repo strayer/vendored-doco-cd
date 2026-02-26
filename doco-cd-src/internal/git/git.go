@@ -3,9 +3,10 @@ package git
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 
@@ -14,9 +15,8 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/diff"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/transport"
-	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
-	gitssh "github.com/go-git/go-git/v5/plumbing/transport/ssh"
 
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/filesystem"
@@ -24,7 +24,8 @@ import (
 )
 
 const (
-	DefaultShortSHALength = 7 // Default length for shortened commit SHAs
+	ZeroSHA               = "0000000000000000000000000000000000000000" // ZeroSHA represents a non-existent commit
+	DefaultShortSHALength = 7                                          // Default length for shortened commit SHAs
 	RemoteName            = "origin"
 	TagPrefix             = "refs/tags/"
 	BranchPrefix          = "refs/heads/"
@@ -44,6 +45,8 @@ var (
 	ErrInvalidReference           = git.ErrInvalidReference
 	ErrSSHKeyRequired             = errors.New("ssh URL requires SSH_PRIVATE_KEY to be set")
 	ErrPossibleAuthMethodMismatch = errors.New("there might be a mismatch between the authentication method and the repository or submodule remote URL")
+	ErrRemoteURLMismatch          = errors.New("remote URL does not match expected URL")
+	ErrGetHeadFailed              = errors.New("failed to get HEAD reference")
 )
 
 // ChangedFile represents a file that has changed between two commits.
@@ -55,123 +58,91 @@ type ChangedFile struct {
 }
 
 type RefSet struct {
-	localRef  plumbing.ReferenceName
-	remoteRef plumbing.ReferenceName
+	LocalRef   plumbing.ReferenceName
+	RemoteRef  plumbing.ReferenceName
+	RemoteHash plumbing.Hash
 }
 
 // GetReferenceSet retrieves a RefSet of local and remote references for a given reference name.
+// It also resolves the remote reference to a commit hash (when available) and fills RemoteHash.
 func GetReferenceSet(repo *git.Repository, ref string) (RefSet, error) {
-	var refCandidates []RefSet
+	if plumbing.IsHash(ref) {
+		return RefSet{LocalRef: plumbing.ReferenceName(ref)}, nil
+	}
 
-	// Check if the reference is a branch or tag
-	switch {
-	case strings.HasPrefix(ref, BranchPrefix):
-		name := strings.TrimPrefix(ref, BranchPrefix)
+	type candidate struct {
+		local  plumbing.ReferenceName
+		remote plumbing.ReferenceName
+	}
 
-		refCandidates = append(refCandidates, RefSet{
-			localRef:  plumbing.NewBranchReferenceName(name),
-			remoteRef: plumbing.NewRemoteReferenceName(RemoteName, name),
-		})
-	case strings.HasPrefix(ref, TagPrefix):
-		name := strings.TrimPrefix(ref, TagPrefix)
+	var candidates []candidate
 
-		refCandidates = append(refCandidates, RefSet{
-			localRef:  plumbing.NewTagReferenceName(name),
-			remoteRef: plumbing.NewTagReferenceName(name),
-		})
-	default:
-		// Create ref candidate for branch and tag
-		refCandidates = append(refCandidates,
-			RefSet{
-				// Create ref candidate for branch
-				localRef:  plumbing.NewBranchReferenceName(ref),
-				remoteRef: plumbing.NewRemoteReferenceName(RemoteName, ref),
-			},
-			// Create ref candidate for tag
-			RefSet{
-				localRef:  plumbing.NewTagReferenceName(ref),
-				remoteRef: plumbing.NewTagReferenceName(ref),
-			},
+	if strings.HasPrefix(ref, "refs/") {
+		fullRef := plumbing.ReferenceName(ref)
+
+		remoteRef := fullRef
+		if strings.HasPrefix(ref, BranchPrefix) {
+			remoteRef = plumbing.NewRemoteReferenceName(RemoteName, strings.TrimPrefix(ref, BranchPrefix))
+		}
+
+		candidates = append(candidates,
+			candidate{fullRef, remoteRef},
+			candidate{remoteRef, remoteRef},
+		)
+	} else {
+		remoteRef := plumbing.NewRemoteReferenceName(RemoteName, ref)
+		candidates = append(candidates,
+			candidate{plumbing.NewBranchReferenceName(ref), remoteRef},
+			candidate{remoteRef, remoteRef},
+			candidate{plumbing.NewTagReferenceName(ref), plumbing.NewTagReferenceName(ref)},
+			candidate{plumbing.ReferenceName(ref), plumbing.ReferenceName(ref)},
 		)
 	}
 
-	for _, candidate := range refCandidates {
-		if candidate.localRef.IsBranch() {
-			newRef := plumbing.NewSymbolicReference(candidate.localRef, candidate.remoteRef)
+	var lastErr error
 
-			err := repo.Storer.SetReference(newRef)
-			if err != nil {
-				return RefSet{}, err
-			}
-		}
-		// Check if localRef exists remotely
-		_, err := repo.Reference(candidate.remoteRef, true)
-		if err != nil {
-			if errors.Is(err, plumbing.ErrReferenceNotFound) {
-				// If the reference does not exist, continue To the next candidate
-				continue
+	for _, c := range candidates {
+		if _, err := repo.Reference(c.local, true); err == nil {
+			// try to resolve remote hash if remote ref exists
+			remoteHash := plumbing.ZeroHash
+
+			if c.remote != "" {
+				if rRef, rErr := repo.Reference(c.remote, true); rErr == nil {
+					remoteHash = rRef.Hash()
+				}
 			}
 
-			return RefSet{}, fmt.Errorf("%w: %s", err, candidate.localRef)
+			return RefSet{LocalRef: c.local, RemoteRef: c.remote, RemoteHash: remoteHash}, nil
+		} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+			lastErr = err
+		}
+	}
+
+	// If no local candidate found, but a remote exists, return the remote reference and resolved hash
+	for _, c := range candidates {
+		if c.remote == "" {
+			continue
 		}
 
-		return candidate, nil
+		if rRef, err := repo.Reference(c.remote, true); err == nil {
+			remoteHash := rRef.Hash()
+			// keep LocalRef equal to remote for now; CheckoutRepository will map remote/* -> refs/heads/*
+			return RefSet{LocalRef: c.remote, RemoteRef: c.remote, RemoteHash: remoteHash}, nil
+		} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+			lastErr = err
+		}
+	}
+
+	if lastErr != nil {
+		return RefSet{}, fmt.Errorf("failed to get reference %s: %w", ref, lastErr)
 	}
 
 	return RefSet{}, fmt.Errorf("%w: %s", ErrInvalidReference, ref)
 }
 
-// IsSSH checks if a given URL is an SSH URL.
-func IsSSH(url string) bool {
-	return strings.HasPrefix(url, "git@") || strings.HasPrefix(url, "ssh://")
-}
-
-// SSHAuth creates an SSH authentication method using the provided private key.
-func SSHAuth(privateKey, keyPassphrase string) (transport.AuthMethod, error) {
-	if strings.TrimSpace(privateKey) == "" {
-		return nil, ErrSSHKeyRequired
-	}
-
-	auth, err := gitssh.NewPublicKeys(ssh.DefaultGitSSHUser, []byte(privateKey), keyPassphrase)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create SSH public keys: %w", err)
-	}
-
-	// auth.HostKeyCallback = ssh2.InsecureIgnoreHostKey()
-
-	return auth, nil
-}
-
-// HttpTokenAuth returns an AuthMethod for HTTP Basic Auth using a token.
-func HttpTokenAuth(token string) transport.AuthMethod {
-	if token == "" {
-		return nil
-	}
-
-	return &githttp.BasicAuth{
-		Username: "oauth2", // can be anything except an empty string
-		Password: token,
-	}
-}
-
-// addToKnownHosts adds the host from the SSH URL to the known_hosts file.
-func addToKnownHosts(url string) error {
-	err := ssh.CreateKnownHostsFile()
-	if err != nil {
-		return fmt.Errorf("failed to create known_hosts file: %w", err)
-	}
-
-	host, err := ssh.ExtractHostFromSSHUrl(url)
-	if err != nil {
-		return fmt.Errorf("failed to extract host from SSH URL: %w", err)
-	}
-
-	return ssh.AddHostToKnownHosts(host)
-}
-
-// convertSSHUrl converts SSH URLs to the ssh:// format.
+// ConvertSSHUrl converts SSH URLs to the ssh:// format.
 // e.g. convert git@github.com:user/repo.git to ssh://git@github.com/user/repo.git
-func convertSSHUrl(url string) string {
+func ConvertSSHUrl(url string) string {
 	// Check if url starts with git@ and convert to ssh:// format
 	if strings.HasPrefix(url, "git@") {
 		// Replace the first ':' with '/' after the host
@@ -190,14 +161,27 @@ func updateRemoteURL(repo *git.Repository, url string) error {
 	// Update remote URL in case it has changed
 	remote, err := repo.Remote(RemoteName)
 	if err != nil {
-		return fmt.Errorf("failed to get remote %s: %w", RemoteName, err)
+		// If remote does not exist, create it with the provided URL
+		c := &config.RemoteConfig{Name: RemoteName}
+		if IsSSH(url) {
+			c.URLs = []string{ConvertSSHUrl(url)}
+		} else {
+			c.URLs = []string{url}
+		}
+
+		_, createErr := repo.CreateRemote(c)
+		if createErr != nil {
+			return fmt.Errorf("failed to create remote %s: %w", RemoteName, createErr)
+		}
+
+		return nil
 	}
 
 	c := remote.Config()
 
 	var newUrl []string
 	if IsSSH(url) {
-		newUrl = []string{convertSSHUrl(url)}
+		newUrl = []string{ConvertSSHUrl(url)}
 	} else {
 		newUrl = []string{url}
 	}
@@ -222,23 +206,14 @@ func updateRemoteURL(repo *git.Repository, url string) error {
 	return nil
 }
 
-// UpdateRepository fetches and checks out the requested ref.
-func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts transport.ProxyOptions, auth transport.AuthMethod, cloneSubmodules bool) (*git.Repository, error) {
-	repo, err := git.PlainOpen(path)
-	if err != nil {
-		return nil, err
-	}
+// OpenRepository opens an existing git repository at the specified path.
+// This is a lightweight operation that doesn't fetch or update the repository.
+func OpenRepository(path string) (*git.Repository, error) {
+	return git.PlainOpen(path)
+}
 
-	worktree, err := repo.Worktree()
-	if err != nil {
-		return nil, err
-	}
-
-	err = updateRemoteURL(repo, url)
-	if err != nil {
-		return nil, err
-	}
-
+// fetchRepository fetches updates from the remote repository, including all branches and tags, and prunes deleted references.
+func fetchRepository(repo *git.Repository, url string, skipTLSVerify bool, proxyOpts transport.ProxyOptions, auth transport.AuthMethod) error {
 	opts := &git.FetchOptions{
 		RemoteName: RemoteName,
 		RemoteURL:  url,
@@ -249,12 +224,12 @@ func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts trans
 
 	// SSH auth when key is provided
 	if IsSSH(url) {
-		err = addToKnownHosts(url)
+		err := ssh.AddToKnownHosts(url)
 		if err != nil {
-			return nil, fmt.Errorf("failed to add host to known_hosts: %w", err)
+			return fmt.Errorf("failed to add host to known_hosts: %w", err)
 		}
 
-		opts.RemoteURL = convertSSHUrl(url)
+		opts.RemoteURL = ConvertSSHUrl(url)
 	} else {
 		opts.InsecureSkipTLS = skipTLSVerify
 
@@ -263,29 +238,42 @@ func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts trans
 		}
 	}
 
-	if err = repo.Fetch(opts); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
-		return nil, fmt.Errorf("%w: %w", ErrFetchFailed, err)
+	err := repo.Fetch(opts)
+	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+		return err
 	}
 
-	refSet, err := GetReferenceSet(repo, ref)
+	return nil
+}
+
+// UpdateRepository fetches and checks out the requested ref.
+func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts transport.ProxyOptions, auth transport.AuthMethod, cloneSubmodules bool) (*git.Repository, error) {
+	// Serialize operations on the same path
+	unlock := AcquirePathLock(path)
+	defer unlock()
+
+	repo, err := git.PlainOpen(path)
 	if err != nil {
 		return nil, err
 	}
 
-	if refSet.localRef == "" {
-		return nil, fmt.Errorf("%w: %s", ErrInvalidReference, ref)
+	err = updateRemoteURL(repo, url)
+	if err != nil {
+		return nil, err
 	}
 
-	if err = worktree.Checkout(&git.CheckoutOptions{Branch: refSet.localRef, Keep: true}); err != nil {
-		return nil, fmt.Errorf("%w: %w: %s", ErrCheckoutFailed, err, refSet.localRef)
+	err = fetchRepository(repo, url, skipTLSVerify, proxyOpts, auth)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrFetchFailed, err)
 	}
 
-	if err = ResetTrackedFiles(repo); err != nil {
-		return nil, fmt.Errorf("failed to reset tracked files: %w", err)
+	err = CheckoutRepository(repo, ref)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCheckoutFailed, err)
 	}
 
 	if cloneSubmodules {
-		if err = updateSubmodules(repo, opts.Auth); err != nil {
+		if err = updateSubmodules(repo, auth); err != nil {
 			return nil, fmt.Errorf("failed to update submodules: %w", err)
 		}
 	}
@@ -293,20 +281,107 @@ func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts trans
 	return repo, nil
 }
 
+// CheckoutRepository checks out the specified reference in the repository, keeping untracked files intact.
+func CheckoutRepository(repo *git.Repository, ref string) error {
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	refSet, err := GetReferenceSet(repo, ref)
+	if err != nil {
+		return fmt.Errorf("failed to get reference set: %w", err)
+	}
+
+	if refSet.LocalRef == "" {
+		return fmt.Errorf("%w: %s", ErrInvalidReference, ref)
+	}
+
+	// If RemoteRef is empty -> LocalRef is a commit SHA
+	if refSet.RemoteRef == "" {
+		hash := plumbing.NewHash(string(refSet.LocalRef))
+		if err = worktree.Checkout(&git.CheckoutOptions{Hash: hash, Keep: true}); err != nil {
+			return fmt.Errorf("failed to checkout commit: %w: %s", err, refSet.LocalRef)
+		}
+	} else {
+		// Determine desired local branch reference (handle remote-only refs like refs/remotes/origin/<name>)
+		desiredLocal := refSet.LocalRef
+		if desiredLocal == refSet.RemoteRef && strings.HasPrefix(string(refSet.RemoteRef), "refs/remotes/"+RemoteName+"/") {
+			branchName := strings.TrimPrefix(string(refSet.RemoteRef), "refs/remotes/"+RemoteName+"/")
+			desiredLocal = plumbing.NewBranchReferenceName(branchName)
+		}
+
+		// Check existence of local ref
+		_, localErr := repo.Reference(desiredLocal, true)
+		if localErr != nil && !errors.Is(localErr, plumbing.ErrReferenceNotFound) {
+			return fmt.Errorf("failed to resolve local reference %s: %w", desiredLocal, localErr)
+		}
+
+		// Use resolved remote hash; should be set by GetReferenceSet
+		remoteHash := refSet.RemoteHash
+		if remoteHash == plumbing.ZeroHash {
+			// fallback attempt to resolve remote ref now
+			if rRef, rErr := repo.Reference(refSet.RemoteRef, true); rErr == nil {
+				remoteHash = rRef.Hash()
+			}
+		}
+
+		// Branch behavior
+		if strings.HasPrefix(string(desiredLocal), BranchPrefix) {
+			if localErr == nil {
+				// update existing local branch to point at remote hash (if available) so worktree ends up on fetched commit
+				if remoteHash != plumbing.ZeroHash {
+					newRef := plumbing.NewHashReference(desiredLocal, remoteHash)
+					if err := repo.Storer.SetReference(newRef); err != nil {
+						return fmt.Errorf("failed to update local branch %s to remote hash: %w", desiredLocal, err)
+					}
+				}
+
+				if err = worktree.Checkout(&git.CheckoutOptions{Branch: desiredLocal, Keep: true}); err != nil {
+					return fmt.Errorf("failed to checkout worktree: %w: %s", err, desiredLocal)
+				}
+			} else {
+				// create local branch at remote hash and checkout it
+				if err = worktree.Checkout(&git.CheckoutOptions{
+					Branch: desiredLocal,
+					Hash:   remoteHash,
+					Create: true,
+					Keep:   true,
+				}); err != nil {
+					return fmt.Errorf("failed to create and checkout branch %s: %w", desiredLocal, err)
+				}
+			}
+		} else {
+			// Fallback: detached checkout at remote hash (e.g. tags or remote-only refs that are not branches)
+			if err = worktree.Checkout(&git.CheckoutOptions{Hash: remoteHash, Keep: true}); err != nil {
+				return fmt.Errorf("failed to checkout commit for remote ref %s: %w", refSet.RemoteRef, err)
+			}
+		}
+	}
+
+	if err = ResetTrackedFiles(repo); err != nil {
+		return fmt.Errorf("failed to reset tracked files: %w", err)
+	}
+
+	return nil
+}
+
 // CloneRepository clones a repository with HTTP or SSH auth.
 func CloneRepository(path, url, ref string, skipTLSVerify bool, proxyOpts transport.ProxyOptions, auth transport.AuthMethod, cloneSubmodules bool) (*git.Repository, error) {
+	// Serialize operations on the same path to avoid concurrent partial clones
+	unlock := AcquirePathLock(path)
+	defer unlock()
+
 	err := os.MkdirAll(path, filesystem.PermDir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create directory %s: %w", path, err)
 	}
 
 	opts := &git.CloneOptions{
-		RemoteName:    RemoteName,
-		URL:           url,
-		SingleBranch:  true,
-		ReferenceName: plumbing.ReferenceName(ref),
-		Tags:          git.NoTags,
-		Auth:          auth,
+		RemoteName: RemoteName,
+		URL:        url,
+		Tags:       git.AllTags,
+		Auth:       auth,
 	}
 
 	if cloneSubmodules {
@@ -314,12 +389,12 @@ func CloneRepository(path, url, ref string, skipTLSVerify bool, proxyOpts transp
 	}
 
 	if IsSSH(url) {
-		err = addToKnownHosts(url)
+		err = ssh.AddToKnownHosts(url)
 		if err != nil {
 			return nil, fmt.Errorf("failed to add host to known_hosts: %w", err)
 		}
 
-		opts.URL = convertSSHUrl(url)
+		opts.URL = ConvertSSHUrl(url)
 	} else {
 		opts.InsecureSkipTLS = skipTLSVerify
 
@@ -328,9 +403,43 @@ func CloneRepository(path, url, ref string, skipTLSVerify bool, proxyOpts transp
 		}
 	}
 
+	// Required for cloning from Azure DevOps repositories with go-git v5, should be fixed in v6
+	// https://github.com/go-git/go-git/pull/613
+	transport.UnsupportedCapabilities = []capability.Capability{
+		capability.ThinPack,
+	}
+
 	repo, err := git.PlainClone(path, false, opts)
-	if errors.Is(err, transport.ErrInvalidAuthMethod) && cloneSubmodules {
-		return nil, fmt.Errorf("%w: %w", err, ErrPossibleAuthMethodMismatch)
+	if err != nil {
+		if errors.Is(err, transport.ErrInvalidAuthMethod) && cloneSubmodules {
+			return nil, fmt.Errorf("%w: %w", err, ErrPossibleAuthMethodMismatch)
+		}
+
+		// Handle partial state: if remote already exists (race/previous attempt), try to recover
+		if errors.Is(err, git.ErrRemoteExists) {
+			// If the directory contains a repository, try UpdateRepository
+			if _, openErr := git.PlainOpen(path); openErr == nil {
+				if upd, uErr := UpdateRepository(path, url, ref, skipTLSVerify, proxyOpts, auth, cloneSubmodules); uErr == nil {
+					return upd, nil
+				}
+			}
+
+			// Remove path and retry clone once
+			_ = os.RemoveAll(path)
+
+			repo, err = git.PlainClone(path, false, opts)
+			if err != nil {
+				return nil, fmt.Errorf("clone failed: %w", err)
+			}
+		} else {
+			return nil, fmt.Errorf("clone failed: %w", err)
+		}
+	}
+
+	// At this point repo should be a valid repository from either the initial clone or the retried clone
+	err = CheckoutRepository(repo, ref)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrCheckoutFailed, err)
 	}
 
 	return repo, err
@@ -403,14 +512,6 @@ func updateSubmodules(repo *git.Repository, auth transport.AuthMethod) error {
 	return nil
 }
 
-// GetAuthUrl returns a clone URL with an access token for private repositories.
-func GetAuthUrl(url, authType, token string) string {
-	// Retrieve the protocol From the clone URL (e.g. https://, http://, git://
-	protocol := regexp.MustCompile("^(https?|git)://").FindString(url)
-
-	return protocol + authType + ":" + token + "@" + url[len(protocol):]
-}
-
 // GetLatestCommit retrieves the last commit hash for a given reference in a repository.
 func GetLatestCommit(repo *git.Repository, ref string) (string, error) {
 	// Get the reference for the specified ref
@@ -419,7 +520,12 @@ func GetLatestCommit(repo *git.Repository, ref string) (string, error) {
 		return plumbing.ZeroHash.String(), err
 	}
 
-	r, err := repo.Reference(refSet.remoteRef, true)
+	// If RemoteRef is empty, it's a commit SHA - return it directly
+	if refSet.RemoteRef == "" {
+		return string(refSet.LocalRef), nil
+	}
+
+	r, err := repo.Reference(refSet.RemoteRef, true)
 	if err != nil {
 		return plumbing.ZeroHash.String(), fmt.Errorf("failed to get reference %s: %w", ref, err)
 	}
@@ -607,6 +713,10 @@ func shouldResetDecryptedFile(repo *git.Repository, repoRoot, file string) bool 
 // GetShortestUniqueCommitSHA returns the shortest unique prefix of a commit SHA in the repository.
 // Similar to the git command `git rev-parse --short=<length> <commitSHA>`.
 func GetShortestUniqueCommitSHA(repo *git.Repository, commitSHA string, minLength int) (string, error) {
+	if repo == nil {
+		return "", errors.New("repository not found")
+	}
+
 	iter, err := repo.CommitObjects()
 	if err != nil {
 		return "", err
@@ -641,4 +751,110 @@ func GetShortestUniqueCommitSHA(repo *git.Repository, commitSHA string, minLengt
 	}
 
 	return "", fmt.Errorf("no unique prefix found for commit SHA %s", commitSHA)
+}
+
+// GetRepoName returns the repository name in the form "<host>/<owner>/<repo>" from the given clone URL.
+// Supports:
+//   - https://github.com/owner/repo(.git)
+//   - http://github.com/owner/repo(.git)
+//   - ssh://github.com/owner/repo(.git)
+//   - git@github.com:owner/repo(.git)
+//   - token-injected https like https://oauth2:TOKEN@github.com/owner/repo(.git)
+func GetRepoName(cloneURL string) string {
+	u := strings.TrimSpace(cloneURL)
+	if u == "" {
+		return ""
+	}
+
+	// Handle classic SCP-like SSH: git@host:owner/repo(.git)
+	if strings.Contains(u, "@") && strings.Contains(u, ":") && !strings.Contains(u, "://") {
+		parts := strings.SplitN(u, "@", 2)
+		if len(parts) == 2 {
+			hostAndPath := parts[1]
+
+			hostParts := strings.SplitN(hostAndPath, ":", 2)
+			if len(hostParts) == 2 {
+				host := hostParts[0]
+				repoPath := strings.TrimPrefix(hostParts[1], "/")
+				ownerRepo := normalizeOwnerRepo(repoPath)
+
+				return host + "/" + ownerRepo
+			}
+		}
+	}
+
+	// For URLs with a scheme use net/url
+	parsed, err := url.Parse(u)
+	if err == nil && parsed.Host != "" {
+		p := strings.TrimPrefix(parsed.Path, "/")
+		ownerRepo := normalizeOwnerRepo(p)
+
+		return parsed.Host + "/" + ownerRepo
+	}
+
+	// Fallback: attempt to normalize directly
+	return normalizeOwnerRepo(u)
+}
+
+// MatchesHead inspects an existing repository at path and determines if HEAD is at the specified reference (branch, tag, or commit SHA).
+func MatchesHead(path, ref string) (bool, error) {
+	repo, err := OpenRepository(path)
+	if err != nil {
+		if errors.Is(err, git.ErrRepositoryNotExists) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("failed to open repository at %s: %w", path, err)
+	}
+
+	head, err := repo.Head()
+	if err != nil {
+		return false, fmt.Errorf("%w for repository '%s': %w", ErrGetHeadFailed, path, err)
+	}
+
+	refSet, err := GetReferenceSet(repo, ref)
+	if err != nil {
+		return false, fmt.Errorf("failed to get reference set for %s: %w", ref, err)
+	}
+
+	// If RemoteRef is empty, LocalRef is a commit SHA
+	if refSet.RemoteRef == "" {
+		return head.Hash().String() == string(refSet.LocalRef), nil
+	}
+
+	r, err := repo.Reference(refSet.RemoteRef, true)
+	if err != nil {
+		if errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return false, nil
+		}
+
+		return false, fmt.Errorf("failed to get reference %s: %w", refSet.RemoteRef, err)
+	}
+
+	return head.Hash() == r.Hash(), nil
+}
+
+// normalizeOwnerRepo cleans a path and returns "owner/repo" or empty string when not possible.
+func normalizeOwnerRepo(p string) string {
+	// Remove query or fragment if present in raw strings
+	if idx := strings.IndexAny(p, "?#"); idx >= 0 {
+		p = p[:idx]
+	}
+
+	// Trim trailing '.git'
+	p = strings.TrimSuffix(p, ".git")
+
+	// Clean path and split
+	clean := path.Clean(p)
+
+	parts := strings.Split(clean, "/")
+	if len(parts) < 2 {
+		// Not enough segments to form owner/repo
+		return clean // safest fallback; avoids panic
+	}
+
+	owner := parts[len(parts)-2]
+	repo := parts[len(parts)-1]
+
+	return owner + "/" + repo
 }

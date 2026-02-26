@@ -109,6 +109,7 @@ func addComposeServiceLabels(project *types.Project, deployConfig config.DeployC
 			DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
 			DocoCDLabels.Deployment.CommitSHA:           latestCommit,
 			DocoCDLabels.Deployment.TargetRef:           deployConfig.Reference,
+			DocoCDLabels.Deployment.ConfigHash:          deployConfig.Internal.Hash,
 			DocoCDLabels.Deployment.ExternalSecretsHash: secretHash,
 			DocoCDLabels.Deployment.AutoDiscover:        strconv.FormatBool(deployConfig.AutoDiscover),
 			DocoCDLabels.Deployment.AutoDiscoverDelete:  strconv.FormatBool(deployConfig.AutoDiscoverOpts.Delete),
@@ -149,6 +150,7 @@ func addComposeVolumeLabels(project *types.Project, deployConfig config.DeployCo
 // LoadCompose parses and loads Compose files as specified by the Docker Compose specification.
 func LoadCompose(ctx context.Context, workingDir, projectName string, composeFiles, envFiles, profiles []string, environment map[string]string) (*types.Project, error) {
 	// if envFiles only contains ".env", we check if the file exists in the working directory
+	// #nosec G602 -- length is checked before access
 	if len(envFiles) == 1 && envFiles[0] == ".env" {
 		envFilePath := path.Join(workingDir, ".env")
 

@@ -18,15 +18,17 @@ import (
 	"github.com/docker/compose/v2/pkg/api"
 	"github.com/docker/compose/v2/pkg/compose"
 	"github.com/docker/docker/api/types/container"
-	swarmTypes "github.com/docker/docker/api/types/swarm"
 	"github.com/docker/docker/client"
 
-	"github.com/kimdre/doco-cd/internal/stages"
+	"github.com/kimdre/doco-cd/internal/git"
+
+	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
@@ -43,14 +45,15 @@ const (
 )
 
 func TestHandlerData_WebhookHandler(t *testing.T) {
+	encryption.SetupAgeKeyEnvVar(t)
+
 	expectedResponse := `{"content":"job completed successfully","job_id":"[a-f0-9-]{36}"}`
 	expectedStatusCode := http.StatusCreated
 	tmpDir := t.TempDir()
 
-	const (
-		containerName = "test"
-		stackName     = "test-deploy"
-	)
+	const containerName = "test"
+
+	stackName := test.ConvertTestName(t.Name())
 
 	payloadFile := githubPayloadFile
 	cloneUrl := "https://github.com/kimdre/doco-cd.git"
@@ -62,7 +65,7 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		indexPath = path.Join("html", "index.html")
 	}
 
-	indexPath = path.Join(tmpDir, stages.GetRepoName(cloneUrl), indexPath)
+	indexPath = path.Join(tmpDir, git.GetRepoName(cloneUrl), indexPath)
 
 	payload, err := os.ReadFile(filepath.Join(WorkingDir, payloadFile))
 	if err != nil {
@@ -111,15 +114,17 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 			Destination: tmpDir,
 			Mode:        "rw",
 		},
-		log: log,
+		log:      log,
+		testName: stackName,
 	}
 
-	req, err := http.NewRequest("POST", webhookPath, bytes.NewReader(payload))
+	req, err := http.NewRequest("POST", webhookPath+"?wait=true", bytes.NewReader(payload))
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	req.Header.Set(webhook.ScmProviderSecurityHeaders[webhook.Github], "sha256="+webhook.GenerateHMAC(payload, appConfig.WebhookSecret))
+	req.Header.Set(webhook.ScmProviderEventHeaders[webhook.Github], "push")
 
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.WebhookHandler)
@@ -135,7 +140,7 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	}
 
 	if !regex.MatchString(rr.Body.String()) {
-		t.Errorf("handler returned unexpected body: got %v want %v", rr.Body.String(), expectedResponse)
+		t.Fatalf("handler returned unexpected body: got %v want %v", rr.Body.String(), expectedResponse)
 	}
 
 	ctx := context.Background()
@@ -149,8 +154,6 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	}
 
 	t.Cleanup(func() {
-		t.Log("Remove " + stackName)
-
 		if service != nil {
 			err = service.Down(ctx, stackName, downOpts)
 			if err != nil {
@@ -172,15 +175,13 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 
 		inspectName := stackName + "_" + containerName
 
-		svc, _, err := dockerCli.Client().ServiceInspectWithRaw(ctx, inspectName, swarmTypes.ServiceInspectOptions{
-			InsertDefaults: true,
-		})
+		svc, err := docker.WaitForSwarmService(ctx, t, dockerClient, inspectName, 30*time.Second)
 		if err != nil {
-			t.Fatalf("Failed to inspect test container: %v", err)
+			t.Fatalf("Failed to find swarm service for test container: %v", err)
 		}
 
 		if len(svc.Endpoint.Ports) == 0 {
-			t.Fatal("Test container has no published ports")
+			t.Fatal("Test service has no published ports")
 		}
 
 		testContainerPort = strconv.FormatUint(uint64(svc.Endpoint.Ports[0].PublishedPort), 10)
@@ -263,5 +264,61 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 
 	if bodyString != string(fileContent) {
 		t.Fatalf("Test container returned unexpected body: got '%v' but want '%v'", bodyString, string(fileContent))
+	}
+}
+
+func TestWebhookHandler_WaitQueryParam(t *testing.T) {
+	encryption.SetupAgeKeyEnvVar(t)
+
+	appConfig, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	log := logger.New(12)
+
+	h := handlerData{
+		appConfig:  appConfig,
+		appVersion: config.AppVersion,
+		dataMountPoint: container.MountPoint{
+			Type:        "bind",
+			Source:      t.TempDir(),
+			Destination: t.TempDir(),
+			Mode:        "rw",
+		},
+		log: log,
+	}
+
+	testCases := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "Default async when wait not set",
+			url:  webhookPath,
+		},
+		{
+			name: "Synchronous when wait=true",
+			url:  webhookPath + "?wait=true",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Provide a payload that fails parsing; wait should not affect parse errors.
+			req, err := http.NewRequest("POST", tc.url, bytes.NewReader([]byte("{}")))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			h.testName = test.ConvertTestName(t.Name())
+
+			rr := httptest.NewRecorder()
+			h.WebhookHandler(rr, req)
+
+			if rr.Code == 0 {
+				t.Fatalf("expected recorder to have a status code")
+			}
+		})
 	}
 }
