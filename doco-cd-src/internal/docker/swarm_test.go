@@ -6,7 +6,8 @@ import (
 	"testing"
 
 	"github.com/docker/docker/client"
-	"github.com/go-git/go-git/v5/plumbing/transport"
+
+	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 
@@ -31,6 +32,8 @@ func TestDeploySwarmStack(t *testing.T) {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
+	stackName := test.ConvertTestName(t.Name())
+
 	tmpDir := t.TempDir()
 
 	c, err := config.GetAppConfig()
@@ -41,22 +44,23 @@ func TestDeploySwarmStack(t *testing.T) {
 	p := webhook.ParsedPayload{
 		Ref:       git.SwarmModeBranch,
 		CommitSHA: "244b6f9a5b3dc546ab3822d9c0744846f539c6ef",
-		Name:      "test",
+		Name:      stackName,
 		FullName:  "kimdre/doco-cd_tests",
-		CloneURL:  git.GetAuthUrl(cloneUrlTest, c.AuthType, c.GitAccessToken),
+		CloneURL:  cloneUrlTest,
 		Private:   true,
 	}
 
 	t.Chdir(tmpDir)
 
-	auth := transport.AuthMethod(nil)
-	if git.IsSSH(p.CloneURL) {
-		auth, err = git.SSHAuth(c.SSHPrivateKey, c.SSHPrivateKeyPassphrase)
-		if err != nil {
-			t.Fatalf("Failed to get SSH auth: %v", err)
-		}
-	} else if c.GitAccessToken != "" {
-		auth = git.HttpTokenAuth(c.GitAccessToken)
+	auth, err := git.GetAuthMethod(p.CloneURL, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken)
+	if err != nil {
+		t.Fatalf("Failed to get auth method: %v", err)
+	}
+
+	if auth != nil {
+		t.Logf("Using auth method: %s", auth.Name())
+	} else {
+		t.Log("No auth method configured, using anonymous access")
 	}
 
 	repo, err := git.CloneRepository(tmpDir, p.CloneURL, git.SwarmModeBranch, c.SkipTLSVerification, c.HttpProxy, auth, c.GitCloneSubmodules)
@@ -72,12 +76,12 @@ func TestDeploySwarmStack(t *testing.T) {
 	repoPath := worktree.Filesystem.Root()
 	filePath := filepath.Join(repoPath, "docker-compose.yml")
 
-	project, err := LoadCompose(t.Context(), tmpDir, projectName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(t.Context(), tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	deployConfigs, err := config.GetDeployConfigs(tmpDir, projectName, customTarget, p.Ref)
+	deployConfigs, err := config.GetDeployConfigs(tmpDir, c.DeployConfigBaseDir, stackName, customTarget, p.Ref)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,14 +105,14 @@ func TestDeploySwarmStack(t *testing.T) {
 		}
 	})
 
-	err = PruneStackConfigs(t.Context(), dockerClient, projectName)
+	err = PruneStackConfigs(t.Context(), dockerClient, stackName)
 	if err != nil {
 		t.Fatalf("Failed to prune stack configs: %v", err)
 	} else {
 		t.Logf("Stack configs pruned successfully")
 	}
 
-	err = PruneStackSecrets(t.Context(), dockerClient, projectName)
+	err = PruneStackSecrets(t.Context(), dockerClient, stackName)
 	if err != nil {
 		t.Fatalf("Failed to prune stack secrets: %v", err)
 	} else {

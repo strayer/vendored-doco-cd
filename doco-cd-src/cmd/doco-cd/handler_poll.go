@@ -13,7 +13,6 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
-	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/google/uuid"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
@@ -63,7 +62,7 @@ func StartPoll(h *handlerData, pollConfig config.PollConfig, wg *sync.WaitGroup)
 
 // PollHandler is a function that handles polling for changes in a repository.
 func (h *handlerData) PollHandler(pollJob *config.PollJob) {
-	repoName := stages.GetRepoName(string(pollJob.Config.CloneUrl))
+	repoName := git.GetRepoName(string(pollJob.Config.CloneUrl))
 
 	logger := h.log.With(slog.String("repository", repoName))
 	logger.Debug("Start poll handler")
@@ -139,7 +138,7 @@ func RunPoll(ctx context.Context, pollConfig config.PollConfig, appConfig *confi
 
 	startTime := time.Now()
 	cloneUrl := string(pollConfig.CloneUrl)
-	repoName := stages.GetRepoName(cloneUrl)
+	repoName := git.GetRepoName(cloneUrl)
 	jobLog := logger.With(slog.String("job_id", metadata.JobID))
 
 	if appConfig.DockerSwarmFeatures {
@@ -150,6 +149,8 @@ func RunPoll(ctx context.Context, pollConfig config.PollConfig, appConfig *confi
 
 			return append(results, pollResult{Metadata: metadata, Err: err})
 		}
+	} else {
+		swarm.ModeEnabled = false
 	}
 
 	if strings.Contains(repoName, "..") {
@@ -185,19 +186,14 @@ func RunPoll(ctx context.Context, pollConfig config.PollConfig, appConfig *confi
 	}
 
 	jobLog.Debug("cloning repository",
+		slog.String("reference", pollConfig.Reference),
 		slog.String("container_path", internalRepoPath),
 		slog.String("host_path", externalRepoPath))
 
-	auth := transport.AuthMethod(nil)
-	if git.IsSSH(cloneUrl) {
-		auth, err = git.SSHAuth(appConfig.SSHPrivateKey, appConfig.SSHPrivateKeyPassphrase)
-		if err != nil {
-			pollError(jobLog, metadata, fmt.Errorf("failed to setup ssh auth: %w", err))
-
-			return append(results, pollResult{Metadata: metadata, Err: err})
-		}
-	} else if appConfig.GitAccessToken != "" {
-		auth = git.HttpTokenAuth(appConfig.GitAccessToken)
+	auth, err := git.GetAuthMethod(cloneUrl, appConfig.SSHPrivateKey, appConfig.SSHPrivateKeyPassphrase, appConfig.GitAccessToken)
+	if err != nil {
+		pollError(jobLog, metadata, fmt.Errorf("failed to get auth method: %w", err))
+		return append(results, pollResult{Metadata: metadata, Err: err})
 	}
 
 	_, err = git.CloneRepository(internalRepoPath, cloneUrl, pollConfig.Reference, appConfig.SkipTLSVerification, appConfig.HttpProxy, auth, appConfig.GitCloneSubmodules)
@@ -227,9 +223,7 @@ func RunPoll(ctx context.Context, pollConfig config.PollConfig, appConfig *confi
 	shortName := filepath.Base(repoName)
 
 	// Resolve deployment configs (prefer inline in poll config when present)
-	configDir := filepath.Join(internalRepoPath, appConfig.DeployConfigBaseDir)
-
-	deployConfigs, err := config.ResolveDeployConfigs(pollConfig, configDir, shortName)
+	deployConfigs, err := config.ResolveDeployConfigs(pollConfig, internalRepoPath, appConfig.DeployConfigBaseDir, shortName)
 	if err != nil {
 		pollError(jobLog, metadata, fmt.Errorf("failed to get deploy configuration: %w", err))
 
@@ -243,43 +237,76 @@ func RunPoll(ctx context.Context, pollConfig config.PollConfig, appConfig *confi
 		return append(results, pollResult{Metadata: metadata, Err: err})
 	}
 
+	// We'll run each deployment concurrently but grouped by repo+reference and limited by the global deployerLimiter
+	var deployWg sync.WaitGroup
+
+	resultCh := make(chan pollResult, len(deployConfigs))
+
 	for _, deployConfig := range deployConfigs {
-		deployLog := jobLog.WithGroup("deploy")
+		deployLog := jobLog.
+			WithGroup("deploy").
+			With(
+				slog.String("stack", deployConfig.Name),
+				slog.String("reference", deployConfig.Reference))
 
 		failNotifyFunc := func(err error, metadata notification.Metadata) {
 			pollError(deployLog, metadata, err)
 		}
 
-		stageMgr := stages.NewStageManager(
-			metadata.JobID,
-			stages.JobTriggerPoll,
-			deployLog,
-			failNotifyFunc,
-			&stages.RepositoryData{
-				CloneURL:     pollConfig.CloneUrl,
-				Name:         repoName,
-				PathInternal: internalRepoPath,
-				PathExternal: externalRepoPath,
-			},
-			&stages.Docker{
-				Cmd:            dockerCli,
-				Client:         dockerClient,
-				DataMountPoint: dataMountPoint,
-			},
-			&webhook.ParsedPayload{},
-			appConfig,
-			deployConfig,
-			secretProvider,
-		)
+		deployWg.Add(1)
 
-		err = stageMgr.RunStages(ctx)
-		if err != nil {
-			results = append(results, pollResult{Metadata: metadata, Err: err})
+		go func(dc *config.DeployConfig) {
+			defer deployWg.Done()
 
-			continue
-		}
+			if deployerLimiter != nil {
+				deployLog.Debug("queuing deployment")
 
-		results = append(results, pollResult{Metadata: metadata, Err: nil})
+				unlock, lErr := deployerLimiter.acquire(ctx, repoName, NormalizeReference(dc.Reference))
+				if lErr != nil {
+					resultCh <- pollResult{Metadata: metadata, Err: lErr}
+					return
+				}
+				defer unlock()
+			}
+
+			stageMgr := stages.NewStageManager(
+				metadata.JobID,
+				stages.JobTriggerPoll,
+				deployLog,
+				failNotifyFunc,
+				&stages.RepositoryData{
+					CloneURL:     pollConfig.CloneUrl,
+					Name:         repoName,
+					PathInternal: internalRepoPath,
+					PathExternal: externalRepoPath,
+				},
+				&stages.Docker{
+					Cmd:            dockerCli,
+					Client:         dockerClient,
+					DataMountPoint: dataMountPoint,
+				},
+				&webhook.ParsedPayload{},
+				appConfig,
+				dc,
+				secretProvider,
+			)
+
+			err := stageMgr.RunStages(ctx)
+			if err != nil {
+				resultCh <- pollResult{Metadata: metadata, Err: err}
+				return
+			}
+
+			resultCh <- pollResult{Metadata: metadata, Err: nil}
+		}(deployConfig)
+	}
+
+	// Wait for all deployments to finish
+	deployWg.Wait()
+	close(resultCh)
+
+	for r := range resultCh {
+		results = append(results, r)
 	}
 
 	nextRun := time.Now().Add(time.Duration(pollConfig.Interval) * time.Second).Format(time.RFC3339)

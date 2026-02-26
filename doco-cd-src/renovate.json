@@ -25,6 +25,19 @@
       "matchDatasources": ["docker"],
       "matchFileNames": ["docker-compose.yml"],
       "pinDigests": false
+    },
+    {
+      "description": "Disable built-in Go version updates from gomod manager",
+      "matchManagers": ["gomod"],
+      "matchDepTypes": ["golang"],
+      "enabled": false
+    },
+    {
+      "description": "Group Go version updates from go.mod and Dockerfile",
+      "groupName": "golang",
+      "matchPackageNames": ["golang"],
+      "matchDatasources": ["docker", "golang-version"],
+      "internalChecksFilter": "none"
     }
   ],
   "customManagers": [
