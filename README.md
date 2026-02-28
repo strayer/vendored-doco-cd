@@ -2,6 +2,12 @@
 
 This repository is used to build a trusted Docker image for the `doco-cd` GitOps software using vendored source code.
 
+## Why I Vendor and How I Review
+
+I'm vendoring doco-cd because it requires full system access through the Docker socket and thus poses a significant security risk if it is ever compromised. While I feel the maintainer(s) of doco-cd are trustworthy and responsible, I prefer a more cautious approach. To be fully transparent, I need to clarify that the vendoring workflow in this repository does _NOT_ include a state-of-the-art security review process! My strategy relies on avoiding direct updates from upstream Docker images, as these could potentially be modified outside of the publicly visible code and GitHub Actions workflows. Additionally, I avoid updating immediately when a new doco-cd version is released. This delay gives the community a chance to flag any security issues before I update my instances.
+
+Since I can't do a full security review of the code, I use a variety of AI agents and LLMs to do at least some kind of security review before updating the doco-cd code in this repository. See [AI_REVIEW_PROMPT.md](AI_REVIEW_PROMPT.md) for the prompt I'm using for that. This is far from a foolproof security review, but it adds one more layer of defence that could possibly save me from compromised systems.
+
 ## Docker Images
 
 Tagged images are built and published to GitHub Container Registry:
@@ -41,4 +47,3 @@ The `doco-cd` project is licensed under the Apache 2.0 License. In accordance wi
 ## AI Usage Notice
 
 To ensure the responsible use of AI, this project adheres to a strict policy of human oversight. While a Large Language Model (LLM) is used as an assistive tool, its role is limited to implementation based on human-led design. Every line of AI-generated code is then manually reviewed and validated for correctness, security, and quality before being accepted into the codebase. The final authority and accountability for the code rests with the human developer.
-
