@@ -42,13 +42,17 @@ import (
 )
 
 func createComposeFile(t *testing.T, filePath, content string) {
+	t.Helper()
+
 	err := os.WriteFile(filePath, []byte(content), filesystem.PermOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-func createTestFile(fileName string, content string) error {
+func createTestFile(t *testing.T, fileName string, content string) error {
+	t.Helper()
+
 	err := os.WriteFile(fileName, []byte(content), filesystem.PermOwner)
 	if err != nil {
 		return err
@@ -82,6 +86,8 @@ func generateComposeContents() string {
 }
 
 func TestVerifySocketConnection(t *testing.T) {
+	t.Parallel()
+
 	err := VerifySocketConnection()
 	if err != nil {
 		t.Fatal(err)
@@ -89,9 +95,12 @@ func TestVerifySocketConnection(t *testing.T) {
 }
 
 func TestLoadCompose(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	tmpDir := t.TempDir()
+
 	filePath := filepath.Join(tmpDir, "test.compose.yaml")
 
 	composeYAML := generateComposeContents()
@@ -117,9 +126,9 @@ func TestLoadCompose(t *testing.T) {
 }
 
 func TestDeployCompose(t *testing.T) {
-	ctx := context.Background()
-
 	encryption.SetupAgeKeyEnvVar(t)
+
+	ctx := context.Background()
 
 	c, err := config.GetAppConfig()
 	if err != nil {
@@ -232,7 +241,7 @@ compose_files:
   - %s
 `, stackName, reference, workingDirectory, composeFiles[0])
 
-	err = createTestFile(filePath, deployConfig)
+	err = createTestFile(t, filePath, deployConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -358,6 +367,8 @@ compose_files:
 }
 
 func TestHasChangedConfigs(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name            string
 		oldCommit       string
@@ -403,35 +414,39 @@ func TestHasChangedConfigs(t *testing.T) {
 		t.Fatalf("Failed to clone repository: %v", err)
 	}
 
-	t.Chdir(tmpDir)
-
 	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
 
 	for _, tc := range testCases {
-		changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-		if err != nil {
-			t.Fatalf("Failed to get changed files: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		if tc.ExpectedChanges && len(changedFiles) == 0 {
-			t.Fatalf("Expectec changed files, but found none found")
-		}
+			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
+			if err != nil {
+				t.Fatalf("Failed to get changed files: %v", err)
+			}
 
-		hasChanged, err := HasChangedConfigs(changedFiles, project)
-		if err != nil {
-			t.Fatalf("Failed to check for changed configs: %v", err)
-		}
+			if tc.ExpectedChanges && len(changedFiles) == 0 {
+				t.Fatalf("Expectec changed files, but found none found")
+			}
 
-		if !hasChanged && tc.ExpectedChanges {
-			t.Error("Expected changed configs, but found none")
-		}
+			hasChanged, err := HasChangedConfigs(changedFiles, project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed configs: %v", err)
+			}
+
+			if !hasChanged && tc.ExpectedChanges {
+				t.Error("Expected changed configs, but found none")
+			}
+		})
 	}
 }
 
 func TestHasChangedSecrets(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name            string
 		oldCommit       string
@@ -477,35 +492,39 @@ func TestHasChangedSecrets(t *testing.T) {
 		t.Fatalf("Failed to clone repository: %v", err)
 	}
 
-	t.Chdir(tmpDir)
-
 	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
 
 	for _, tc := range testCases {
-		changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-		if err != nil {
-			t.Fatalf("Failed to get changed files: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		if tc.ExpectedChanges && len(changedFiles) == 0 {
-			t.Fatalf("Expectec changed files, but found none found")
-		}
+			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
+			if err != nil {
+				t.Fatalf("Failed to get changed files: %v", err)
+			}
 
-		hasChanged, err := HasChangedSecrets(changedFiles, project)
-		if err != nil {
-			t.Fatalf("Failed to check for changed secrets: %v", err)
-		}
+			if tc.ExpectedChanges && len(changedFiles) == 0 {
+				t.Fatalf("Expectec changed files, but found none found")
+			}
 
-		if !hasChanged && tc.ExpectedChanges {
-			t.Error("Expected changed secrets, but found none")
-		}
+			hasChanged, err := HasChangedSecrets(changedFiles, project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed secrets: %v", err)
+			}
+
+			if !hasChanged && tc.ExpectedChanges {
+				t.Error("Expected changed secrets, but found none")
+			}
+		})
 	}
 }
 
 func TestHasChangedBindMounts(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name            string
 		oldCommit       string
@@ -551,36 +570,37 @@ func TestHasChangedBindMounts(t *testing.T) {
 		t.Fatalf("Failed to clone repository: %v", err)
 	}
 
-	t.Chdir(tmpDir)
-
 	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
 
 	for _, tc := range testCases {
-		changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-		if err != nil {
-			t.Fatalf("Failed to get changed files: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		if tc.ExpectedChanges && len(changedFiles) == 0 {
-			t.Fatalf("Expectec changed files, but found none found")
-		}
+			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
+			if err != nil {
+				t.Fatalf("Failed to get changed files: %v", err)
+			}
 
-		hasChanged, err := HasChangedBindMounts(changedFiles, project)
-		if err != nil {
-			t.Fatalf("Failed to check for changed bind mounts: %v", err)
-		}
+			if tc.ExpectedChanges && len(changedFiles) == 0 {
+				t.Fatalf("Expectec changed files, but found none found")
+			}
 
-		if !hasChanged && tc.ExpectedChanges {
-			t.Error("Expected changed bind mounts, but found none")
-		}
+			hasChanged, err := HasChangedBindMounts(changedFiles, project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed bind mounts: %v", err)
+			}
+
+			if !hasChanged && tc.ExpectedChanges {
+				t.Error("Expected changed bind mounts, but found none")
+			}
+		})
 	}
 }
 
 func startTestContainer(ctx context.Context, t *testing.T) (*testCompose.DockerCompose, error) {
-	t.Chdir(t.TempDir())
 	stackName := test.ConvertTestName(t.Name())
 
 	composeYAML := generateComposeContents()
@@ -813,6 +833,8 @@ func TestGetProjects(t *testing.T) {
 
 // TestInjectSecretsToProject tests resolving and injecting secrets from external secret managers into a Docker Compose project.
 func TestInjectSecretsToProject(t *testing.T) {
+	t.Parallel()
+
 	const (
 		varName         = "TEST_PASSWORD"
 		composeContents = `services:
@@ -887,7 +909,6 @@ func TestInjectSecretsToProject(t *testing.T) {
 	ctx := t.Context()
 
 	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
 
 	filePath := filepath.Join(tmpDir, "test.compose.yaml")
 	createComposeFile(t, filePath, composeContents)
@@ -899,6 +920,8 @@ func TestInjectSecretsToProject(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if c.SecretProvider != tc.secretProvider {
 				t.Skip("Skipping test because secret provider is not configured in app config")
 			}

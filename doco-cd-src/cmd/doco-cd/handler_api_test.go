@@ -25,6 +25,8 @@ import (
 
 // Make http call to HealthCheckHandler.
 func TestHandlerData_HealthCheckHandler(t *testing.T) {
+	t.Parallel()
+
 	expectedResponse := `{"content":"healthy","job_id":"[a-f0-9-]{36}"}`
 	expectedStatusCode := http.StatusOK
 
@@ -147,11 +149,11 @@ func TestHandlerData_ProjectApiHandler(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if swarm.ModeEnabled {
 				t.Skip("Skipping Project API tests in Swarm mode")
 			}
-
-			t.Chdir(tmpDir)
 
 			ctx := context.Background()
 
