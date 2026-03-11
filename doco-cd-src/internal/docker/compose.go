@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types/image"
+	"go.yaml.in/yaml/v3"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
@@ -25,7 +25,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing/format/diff"
 
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 
@@ -33,8 +33,8 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/encryption"
@@ -149,27 +149,60 @@ func addComposeVolumeLabels(project *types.Project, deployConfig config.DeployCo
 
 // LoadCompose parses and loads Compose files as specified by the Docker Compose specification.
 func LoadCompose(ctx context.Context, workingDir, projectName string, composeFiles, envFiles, profiles []string, environment map[string]string) (*types.Project, error) {
-	// if envFiles only contains ".env", we check if the file exists in the working directory
-	// #nosec G602 -- length is checked before access
-	if len(envFiles) == 1 && envFiles[0] == ".env" {
-		envFilePath := path.Join(workingDir, ".env")
+	// Resolve compose file paths to absolute paths relative to workingDir.
+	// This is necessary because the compose-go library's LoadConfigFiles internally
+	// uses filepath.Abs which resolves relative paths against os.Getwd(), not against
+	// the specified working directory. Without this, concurrent deployments with
+	// different working directories would fail since they share the same process
+	// working directory.
+	c, err := config.GetAppConfig()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get app config: %w", err)
+	}
 
-		if _, err := os.Stat(envFilePath); errors.Is(err, os.ErrNotExist) {
+	absoluteComposeFiles := make([]string, len(composeFiles))
+	for i, f := range composeFiles {
+		if filepath.IsAbs(f) {
+			absoluteComposeFiles[i] = f
+		} else {
+			absoluteComposeFiles[i] = filepath.Join(workingDir, f)
+		}
+	}
+
+	// if envFiles only contains ".env", we check if the file exists in the working directory
+	if len(envFiles) == 1 && envFiles[0] == ".env" {
+		if _, err := os.Stat(path.Join(workingDir, ".env")); errors.Is(err, os.ErrNotExist) {
 			envFiles = []string{}
 		}
 	}
 
+	absoluteEnvFiles := make([]string, 0, len(envFiles))
+	for _, f := range envFiles {
+		if filepath.IsAbs(f) {
+			absoluteEnvFiles = append(absoluteEnvFiles, f)
+		} else {
+			absoluteEnvFiles = append(absoluteEnvFiles, filepath.Join(workingDir, f))
+		}
+	}
+
 	options, err := cli.NewProjectOptions(
-		composeFiles,
+		absoluteComposeFiles,
 		cli.WithName(projectName),
 		cli.WithWorkingDirectory(workingDir),
 		cli.WithInterpolation(true),
 		cli.WithResolvedPaths(true),
-		cli.WithEnvFiles(envFiles...), // env files for variable interpolation
+		cli.WithEnvFiles(absoluteEnvFiles...), // env files for variable interpolation
 		cli.WithProfiles(profiles),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project options: %w", err)
+	}
+
+	if c.PassEnv {
+		err = cli.WithOsEnv(options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get OS environment variables for interpolation: %w", err)
+		}
 	}
 
 	// Inject external secrets into the environment for variable interpolation
@@ -206,12 +239,15 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 		afterImages  map[string]api.ImageSummary // Images used by stack after deployment
 	)
 
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
 
 	timestamp := time.Now().UTC().Format(time.RFC3339)
 
 	if ComposeVersion == "" {
-		ComposeVersion, err = GetModuleVersion("github.com/docker/compose/v2")
+		ComposeVersion, err = GetModuleVersion("github.com/docker/compose/v5")
 		if err != nil {
 			if errors.Is(err, ErrModuleNotFound) {
 				// Placeholder for when the module is not found
@@ -366,14 +402,6 @@ func DeployStack(
 		return fmt.Errorf("%s", errMsg)
 	}
 
-	err = os.Chdir(internalWorkingDir)
-	if err != nil {
-		errMsg := "failed to change internal working directory"
-		jobLog.Error(errMsg, logger.ErrAttr(err), slog.String("path", internalWorkingDir))
-
-		return fmt.Errorf("%s: %w", errMsg, err)
-	}
-
 	// Check if the default compose files are used
 	if reflect.DeepEqual(deployConfig.ComposeFiles, cli.DefaultFileNames) {
 		var tmpComposeFiles []string
@@ -493,7 +521,7 @@ func DeployStack(
 			}
 		}
 	} else {
-		hasChangedFiles, err := ProjectFilesHaveChanges(changedFiles, project)
+		detectedChanges, err := ProjectFilesHaveChanges(changedFiles, project)
 		if err != nil {
 			errMsg := "failed to check for changed project files"
 			return fmt.Errorf("%s: %w", errMsg, err)
@@ -514,10 +542,10 @@ func DeployStack(
 			deployConfig.ForceRecreate = true
 
 			stackLog.Debug("changed external secrets detected, forcing recreate of all services")
-		case hasChangedFiles || (hasChangedCompose && triggerEvent == "poll"):
+		case len(detectedChanges) > 0 || (hasChangedCompose && triggerEvent == "poll"):
 			deployConfig.ForceRecreate = true
 
-			stackLog.Debug("changed mounted files detected, forcing recreate of all services")
+			stackLog.Debug("changed project files detected, forcing recreate of all services", slog.Any("changed_files", detectedChanges))
 		case hasChangedCompose:
 			stackLog.Debug("changed compose files detected, continue normal deployment")
 		}
@@ -560,7 +588,10 @@ func DestroyStack(
 		return nil
 	}
 
-	service := compose.NewComposeService(*dockerCli)
+	service, err := compose.NewComposeService(*dockerCli)
+	if err != nil {
+		return err
+	}
 
 	downOpts := api.DownOptions{
 		RemoveOrphans: deployConfig.RemoveOrphans,
@@ -571,7 +602,7 @@ func DestroyStack(
 		downOpts.Images = "all"
 	}
 
-	err := service.Down(*ctx, deployConfig.Name, downOpts)
+	err = service.Down(*ctx, deployConfig.Name, downOpts)
 	if err != nil {
 		errMsg := "failed to destroy stack"
 		return fmt.Errorf("%s: %w", errMsg, err)
@@ -580,10 +611,10 @@ func DestroyStack(
 	return nil
 }
 
-func getAbsolutePaths(changedFiles []gitInternal.ChangedFile, workingDir string) []string {
+func getAbsolutePaths(changedFiles []gitInternal.ChangedFile, repoRoot string) []string {
 	var absPaths []string
 
-	w := filepath.Clean(workingDir)
+	repoRoot = filepath.Clean(repoRoot)
 
 	for _, f := range changedFiles {
 		checkPaths := []diff.File{f.From, f.To}
@@ -596,12 +627,7 @@ func getAbsolutePaths(changedFiles []gitInternal.ChangedFile, workingDir string)
 			p := filepath.Clean(checkPath.Path())
 
 			if !filepath.IsAbs(p) {
-				// Check if base of working directory ends with directory path of changed file
-				if strings.HasSuffix(filepath.Dir(p), filepath.Base(w)) {
-					p = filepath.Join(w, filepath.Base(p))
-				} else {
-					p = filepath.Join(workingDir, p)
-				}
+				p = filepath.Join(repoRoot, p)
 			}
 
 			if !slices.Contains(absPaths, p) {
@@ -720,47 +746,15 @@ func HasChangedEnvFiles(changedFiles []gitInternal.ChangedFile, project *types.P
 // HasChangedComposeFiles checks if any of the compose files have changed using the Git status.
 func HasChangedComposeFiles(changedFiles []gitInternal.ChangedFile, project *types.Project) (bool, error) {
 	// Get absolute paths of changed files
-	paths := getAbsolutePaths(changedFiles, project.WorkingDir)
+	changedPaths := getAbsolutePaths(changedFiles, project.WorkingDir)
 
-	for _, composeFile := range project.ComposeFiles {
-		if !path.IsAbs(composeFile) {
-			composeFile = filepath.Join(project.WorkingDir, composeFile)
-		}
-
-		// Get the last 4 parts of the composeFile path
-		composeFileParts := strings.Split(composeFile, string(os.PathSeparator))
-
-		pathSuffix := path.Join(composeFileParts...)
-		if len(composeFileParts) > 4 {
-			pathSuffix = path.Join(composeFileParts[len(composeFileParts)-4:]...)
-		}
-
-		for _, p := range paths {
-			if strings.HasSuffix(p, pathSuffix) {
-				return true, nil
-			}
-		}
-	}
-
-	return false, nil
-}
-
-// ProjectFilesHaveChanges checks if any files related to the compose project have changed.
-func ProjectFilesHaveChanges(changedFiles []gitInternal.ChangedFile, project *types.Project) (bool, error) {
-	checks := map[string]func([]gitInternal.ChangedFile, *types.Project) (bool, error){
-		"configs":    HasChangedConfigs,
-		"secrets":    HasChangedSecrets,
-		"bindMounts": HasChangedBindMounts,
-		"envFiles":   HasChangedEnvFiles,
-	}
-
-	for name, check := range checks {
-		hasChanges, err := check(changedFiles, project)
+	for _, file := range project.ComposeFiles {
+		changed, err := checkFilePath(file, changedPaths, project.WorkingDir)
 		if err != nil {
-			return false, fmt.Errorf("failed to check %s for changes: %w", name, err)
+			return false, err
 		}
 
-		if hasChanges {
+		if changed {
 			return true, nil
 		}
 	}
@@ -768,9 +762,368 @@ func ProjectFilesHaveChanges(changedFiles []gitInternal.ChangedFile, project *ty
 	return false, nil
 }
 
+/*
+getExtendsFilesFromYaml parses the compose files as YAML and extracts the file paths used in `extends:` definitions.
+These files can also trigger a redeployment if they are changed,
+but they are not included in the compose project configuration and therefore need to be extracted manually.
+
+Recursively follows nested `extends:` references to collect all extended files.
+
+https://docs.docker.com/compose/how-tos/multiple-compose-files/extends/
+*/
+func getExtendsFilesFromYaml(composeFiles []string, workingDir string) ([]string, error) {
+	type composeFile struct {
+		Services map[string]struct {
+			Extends struct {
+				File    string `yaml:"file"`
+				Service string `yaml:"service"`
+			} `yaml:"extends"`
+		} `yaml:"services"`
+	}
+
+	out := set.New[string]()
+	visited := set.New[string]()
+
+	var processFile func(string) error
+
+	processFile = func(f string) error {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(workingDir, f)
+		}
+
+		f = filepath.Clean(f)
+
+		// Avoid infinite loops and reprocessing
+		if visited.Contains(f) {
+			return nil
+		}
+
+		visited.Add(f)
+
+		b, err := os.ReadFile(f)
+		if err != nil {
+			// The file list may contain candidate names that don't exist
+			// on disk (e.g., docker-compose.yml instead of compose.yml).
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+
+			return err
+		}
+
+		var cfg composeFile
+		if err = yaml.Unmarshal(b, &cfg); err != nil {
+			return err
+		}
+
+		for _, svc := range cfg.Services {
+			if svc.Extends.File == "" {
+				continue
+			}
+
+			ext := svc.Extends.File
+			if !filepath.IsAbs(ext) {
+				ext = filepath.Join(filepath.Dir(f), ext)
+			}
+
+			ext = filepath.Clean(ext)
+			out.Add(ext)
+
+			// Recursively process nested extends
+			if err = processFile(ext); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+
+	for _, f := range composeFiles {
+		if err := processFile(f); err != nil {
+			return nil, err
+		}
+	}
+
+	return out.ToSlice(), nil
+}
+
+// HasChangedExtendsFiles checks if any files referenced in docker compose `extends:` definitions have changed using the Git status.
+func HasChangedExtendsFiles(changedFiles []gitInternal.ChangedFile, composeFiles []string, workingDir string, repoRoot string) (bool, error) {
+	changedPaths := getAbsolutePaths(changedFiles, repoRoot)
+
+	// Convert compose files to absolute paths
+	absoluteComposeFiles := make([]string, 0, len(composeFiles))
+	for _, composeFile := range composeFiles {
+		if !filepath.IsAbs(composeFile) {
+			composeFile = filepath.Join(workingDir, composeFile)
+		}
+
+		composeFile = filepath.Clean(composeFile)
+		absoluteComposeFiles = append(absoluteComposeFiles, composeFile)
+	}
+
+	extends, err := getExtendsFilesFromYaml(absoluteComposeFiles, workingDir)
+	if err != nil {
+		return false, fmt.Errorf("failed to get extends files from compose yaml: %w", err)
+	}
+
+	for _, file := range extends {
+		changed, err := checkFilePath(file, changedPaths, workingDir)
+		if err != nil {
+			return false, err
+		}
+
+		if changed {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+/*
+getIncludeFilesFromYaml parses the compose files as YAML and extracts the file paths used in `include:` definitions.
+These files can also trigger a redeployment if they are changed,
+but they are already resolved by the compose-go library and therefore need to be extracted manually.
+
+Recursively follows nested `include:` references to collect all included files.
+
+Handles both simple string form and object form with a `path` key.
+
+https://docs.docker.com/compose/how-tos/multiple-compose-files/include
+*/
+func getIncludeFilesFromYaml(composeFiles []string, workingDir string) ([]string, error) {
+	// extractPaths recursively extracts include file paths from supported compose include forms.
+	// Supported forms:
+	// - include: file.yml
+	// - include: [file.yml, other.yml]
+	// - include:
+	//   - path: file.yml
+	//   - path: [a.yml, b.yml]
+	var extractPaths func(node *yaml.Node) []string
+
+	extractPaths = func(node *yaml.Node) []string {
+		if node == nil {
+			return nil
+		}
+
+		switch node.Kind {
+		case yaml.ScalarNode:
+			v := strings.TrimSpace(node.Value)
+			if v == "" {
+				return nil
+			}
+
+			return []string{v}
+		case yaml.SequenceNode:
+			out := make([]string, 0, len(node.Content))
+			for _, child := range node.Content {
+				out = append(out, extractPaths(child)...)
+			}
+
+			return out
+		case yaml.MappingNode:
+			out := make([]string, 0)
+
+			for i := 0; i+1 < len(node.Content); i += 2 {
+				key := node.Content[i]
+				val := node.Content[i+1]
+
+				if key.Value != "path" {
+					continue
+				}
+
+				out = append(out, extractPaths(val)...)
+			}
+
+			return out
+		default:
+			return nil
+		}
+	}
+
+	out := set.New[string]()
+	visited := set.New[string]()
+
+	var processFile func(string) error
+
+	processFile = func(f string) error {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(workingDir, f)
+		}
+
+		f = filepath.Clean(f)
+
+		// Avoid infinite loops and reprocessing
+		if visited.Contains(f) {
+			return nil
+		}
+
+		visited.Add(f)
+
+		b, err := os.ReadFile(f)
+		if err != nil {
+			// The file list may contain candidate names that don't exist
+			// on disk (e.g., docker-compose.yml instead of compose.yml).
+			if errors.Is(err, os.ErrNotExist) {
+				return nil
+			}
+
+			return err
+		}
+
+		var root yaml.Node
+		if err = yaml.Unmarshal(b, &root); err != nil {
+			return err
+		}
+
+		if len(root.Content) == 0 {
+			return nil
+		}
+
+		doc := root.Content[0]
+		if doc.Kind != yaml.MappingNode {
+			return nil
+		}
+
+		for i := 0; i+1 < len(doc.Content); i += 2 {
+			key := doc.Content[i]
+			val := doc.Content[i+1]
+
+			if key.Value != "include" {
+				continue
+			}
+
+			for _, inc := range extractPaths(val) {
+				// Exclude OCI artifacts which are referenced in the compose file but not present on the filesystem
+				// These are not supported as triggers for redeployment since they are not part of the Git repository and cannot be monitored for changes
+				// https://docs.docker.com/compose/how-tos/multiple-compose-files/include
+				if strings.HasPrefix(inc, "oci://") {
+					continue
+				}
+
+				incPath := inc
+				if !filepath.IsAbs(inc) {
+					incPath = filepath.Join(filepath.Dir(f), inc)
+				}
+
+				incPath = filepath.Clean(incPath)
+				out.Add(incPath)
+
+				// Recursively process nested includes
+				if err = processFile(incPath); err != nil {
+					return err
+				}
+			}
+		}
+
+		return nil
+	}
+
+	for _, f := range composeFiles {
+		if err := processFile(f); err != nil {
+			return nil, err
+		}
+	}
+
+	return out.ToSlice(), nil
+}
+
+// HasChangedIncludeFiles checks if any files referenced in docker compose `include:` definitions have changed using the Git status.
+func HasChangedIncludeFiles(changedFiles []gitInternal.ChangedFile, composeFiles []string, workingDir string, repoRoot string) (bool, error) {
+	changedPaths := getAbsolutePaths(changedFiles, repoRoot)
+
+	// Convert compose files to absolute paths
+	absoluteComposeFiles := make([]string, 0, len(composeFiles))
+	for _, composeFile := range composeFiles {
+		if !filepath.IsAbs(composeFile) {
+			composeFile = filepath.Join(workingDir, composeFile)
+		}
+
+		composeFile = filepath.Clean(composeFile)
+		absoluteComposeFiles = append(absoluteComposeFiles, composeFile)
+	}
+
+	includeFiles, err := getIncludeFilesFromYaml(absoluteComposeFiles, workingDir)
+	if err != nil {
+		return false, fmt.Errorf("failed to get include files from compose yaml: %w", err)
+	}
+
+	for _, file := range includeFiles {
+		changed, err := checkFilePath(file, changedPaths, workingDir)
+		if err != nil {
+			return false, err
+		}
+
+		if changed {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// checkFilePath checks if the given file path matches any of the paths in the list,
+// considering both absolute and relative paths and allowing for matching based on the last 4 parts of the path.
+func checkFilePath(file string, paths []string, workingDir string) (bool, error) {
+	if !path.IsAbs(file) {
+		file = filepath.Join(workingDir, file)
+	}
+
+	file = filepath.Clean(file)
+
+	// Get the last 4 parts of the file path
+	fileParts := strings.Split(file, string(os.PathSeparator))
+
+	pathSuffix := path.Join(fileParts...)
+	if len(fileParts) > 4 {
+		pathSuffix = path.Join(fileParts[len(fileParts)-4:]...)
+	}
+
+	for _, p := range paths {
+		pClean := filepath.Clean(p)
+		if pClean == file || pClean == pathSuffix || strings.HasSuffix(pClean, pathSuffix) {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// ProjectFilesHaveChanges checks if any files related to the compose project have changed.
+func ProjectFilesHaveChanges(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]string, error) {
+	checks := []struct {
+		name string
+		fn   func([]gitInternal.ChangedFile, *types.Project) (bool, error)
+	}{
+		{"configs", HasChangedConfigs},
+		{"secrets", HasChangedSecrets},
+		{"bindMounts", HasChangedBindMounts},
+		{"envFiles", HasChangedEnvFiles},
+	}
+
+	var changeReasons []string
+
+	for _, check := range checks {
+		changed, err := check.fn(changedFiles, project)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check '%s' for changes: %w", check.name, err)
+		}
+
+		if changed {
+			changeReasons = append(changeReasons, check.name)
+		}
+	}
+
+	return changeReasons, nil
+}
+
 // RestartProject restarts all services in the specified project.
 func RestartProject(ctx context.Context, dockerCli command.Cli, projectName string, timeout time.Duration) error {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
 
 	return service.Restart(ctx, projectName, api.RestartOptions{
 		Timeout: &timeout,
@@ -779,7 +1132,10 @@ func RestartProject(ctx context.Context, dockerCli command.Cli, projectName stri
 
 // StopProject stops all services in the specified project.
 func StopProject(ctx context.Context, dockerCli command.Cli, projectName string, timeout time.Duration) error {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
 
 	return service.Stop(ctx, projectName, api.StopOptions{
 		Timeout: &timeout,
@@ -788,7 +1144,10 @@ func StopProject(ctx context.Context, dockerCli command.Cli, projectName string,
 
 // StartProject starts all services in the specified project.
 func StartProject(ctx context.Context, dockerCli command.Cli, projectName string, timeout time.Duration) error {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
 
 	return service.Start(ctx, projectName, api.StartOptions{
 		Wait:        true,
@@ -798,7 +1157,10 @@ func StartProject(ctx context.Context, dockerCli command.Cli, projectName string
 
 // RemoveProject removes the entire project including containers, networks, volumes and images.
 func RemoveProject(ctx context.Context, dockerCli command.Cli, projectName string, timeout time.Duration, removeVolumes, removeImages bool) error {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
 
 	return service.Down(ctx, projectName, api.DownOptions{
 		RemoveOrphans: true,
@@ -816,7 +1178,10 @@ func RemoveProject(ctx context.Context, dockerCli command.Cli, projectName strin
 
 // GetProjects returns a list of all projects.
 func GetProjects(ctx context.Context, dockerCli command.Cli, showDisabled bool) ([]api.Stack, error) {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return nil, err
+	}
 
 	return service.List(ctx, api.ListOptions{
 		All: showDisabled,
@@ -825,7 +1190,10 @@ func GetProjects(ctx context.Context, dockerCli command.Cli, showDisabled bool) 
 
 // GetProjectContainers returns the status of all services in the specified project.
 func GetProjectContainers(ctx context.Context, dockerCli command.Cli, projectName string) ([]api.ContainerSummary, error) {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return nil, err
+	}
 
 	return service.Ps(ctx, projectName, api.PsOptions{
 		All: true,
@@ -838,7 +1206,7 @@ func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([
 	var prunedImages []string
 
 	for _, img := range images {
-		response, err := dockerCli.Client().ImageRemove(ctx, img, image.RemoveOptions{
+		result, err := dockerCli.Client().ImageRemove(ctx, img, client.ImageRemoveOptions{
 			Force:         true,
 			PruneChildren: true,
 		})
@@ -848,7 +1216,7 @@ func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([
 				continue
 			}
 
-			if strings.Contains(err.Error(), "no such image") {
+			if strings.Contains(err.Error(), "no such image") || strings.Contains(err.Error(), "not found") {
 				// Ignore error if image does not exist
 				continue
 			}
@@ -856,7 +1224,7 @@ func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([
 			return nil, fmt.Errorf("failed to remove image %s: %w", img, err)
 		}
 
-		for _, r := range response {
+		for _, r := range result.Items {
 			if r.Deleted != "" {
 				prunedImages = append(prunedImages, r.Deleted)
 			} else if r.Untagged != "" {
@@ -870,7 +1238,10 @@ func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([
 
 // PullImages pulls all images defined in the compose project.
 func PullImages(ctx context.Context, dockerCli command.Cli, projectName string) error {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
 
 	containers, err := GetProjectContainers(ctx, dockerCli, projectName)
 	if err != nil {
@@ -894,7 +1265,10 @@ func PullImages(ctx context.Context, dockerCli command.Cli, projectName string) 
 
 // GetImages retrieves all image IDs used by the services in the compose project.
 func GetImages(ctx context.Context, dockerCli command.Cli, projectName string) (set.Set[string], error) {
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return nil, err
+	}
 
 	imageSummaries, err := service.Images(ctx, projectName, api.ImagesOptions{})
 	if err != nil {
