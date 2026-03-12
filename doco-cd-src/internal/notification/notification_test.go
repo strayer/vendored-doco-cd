@@ -6,11 +6,13 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/kimdre/doco-cd/internal/test"
 )
 
 func TestSend(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name          string
 		appriseUrl    string
@@ -24,7 +26,7 @@ func TestSend(t *testing.T) {
 		{
 			name:          "Invalid Service URL",
 			appriseUrl:    "pover://wrong@test",
-			expectedError: "failed to send notification: apprise request failed with status: 424 Failed Dependency",
+			expectedError: "failed to send notification: " + ErrNotifyFailed.Error(),
 		},
 	}
 
@@ -36,44 +38,28 @@ func TestSend(t *testing.T) {
 		JobID:      uuid.Must(uuid.NewV7()).String(),
 	}
 
-	ctr, err := testcontainers.Run(
-		ctx,
-		"caronc/apprise:latest",
-		testcontainers.WithExposedPorts("8000/tcp"),
-		testcontainers.WithWaitStrategy(wait.ForHTTP("/").WithPort("8000/tcp")),
-		testcontainers.WithEnv(map[string]string{
-			"APPRISE_WORKER_COUNT": "1",
-		}),
-	)
-	if err != nil {
-		t.Fatalf("failed to start apprise container: %v", err)
-	}
-
-	t.Cleanup(func() {
-		if err = ctr.Terminate(ctx); err != nil {
-			t.Errorf("failed to terminate apprise container: %v", err)
-		}
-	})
-
-	state, err := ctr.State(ctx)
-	if err != nil {
-		t.Fatalf("failed to get container state: %v", err)
-	}
-
-	if !state.Running {
-		t.Fatalf("expected container to be running, got %s", state.Status)
-	}
-
-	endpoint, err := ctr.Endpoint(ctx, "")
-	if err != nil {
-		t.Fatalf("failed to get endpoint: %v", err)
-	}
+	appriseComposeYAML := `services:
+  apprise:
+    image: caronc/apprise:latest
+    ports:
+      - "8000"
+    environment:
+      APPRISE_WORKER_COUNT: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/status >/dev/null || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+`
+	stack := test.ComposeUp(ctx, t, test.WithYAML(appriseComposeYAML))
+	endpoint := stack.Endpoint(ctx, t, "apprise", "8000")
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Cannot run tests in parallel because SetAppriseConfig modifies global variables
 			SetAppriseConfig("http://"+endpoint+"/notify", fmt.Sprint(tc.appriseUrl, endpoint), "info")
 
-			err = Send(Info, "Test Notification", "This is a test message", metadata)
+			err := Send(Info, "Test Notification", "This is a test message", metadata)
 			if err != nil {
 				if tc.expectedError == "" {
 					t.Errorf("unexpected error: %v", err)
@@ -86,6 +72,8 @@ func TestSend(t *testing.T) {
 }
 
 func TestGetRevision(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name      string
 		reference string
@@ -120,6 +108,8 @@ func TestGetRevision(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			result := GetRevision(tc.reference, tc.commitSha)
 			if result != tc.expected {
 				t.Errorf("expected %s, got %s", tc.expected, result)

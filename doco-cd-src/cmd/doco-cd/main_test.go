@@ -12,11 +12,11 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
@@ -82,17 +82,11 @@ func TestMain(m *testing.M) {
 }
 
 func TestHandleEvent(t *testing.T) {
-	defaultEnvVars := map[string]string{
-		"GIT_ACCESS_TOKEN": os.Getenv("GIT_ACCESS_TOKEN"),
-		"WEBHOOK_SECRET":   os.Getenv("WEBHOOK_SECRET"),
-	}
-
 	testCases := []struct {
 		name                 string
 		payload              webhook.ParsedPayload
 		expectedStatusCode   int
 		expectedResponseBody string
-		overrideEnv          map[string]string
 		customTarget         string
 		swarmMode            bool
 	}{
@@ -108,7 +102,6 @@ func TestHandleEvent(t *testing.T) {
 			},
 			expectedStatusCode:   http.StatusCreated,
 			expectedResponseBody: `{"content":"job completed successfully","job_id":"%[1]s"}`,
-			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            false,
 		},
@@ -124,7 +117,6 @@ func TestHandleEvent(t *testing.T) {
 			},
 			expectedStatusCode:   http.StatusCreated,
 			expectedResponseBody: `{"content":"job completed successfully","job_id":"%[1]s"}`,
-			overrideEnv:          nil,
 			customTarget:         "test",
 			swarmMode:            false,
 		},
@@ -140,7 +132,6 @@ func TestHandleEvent(t *testing.T) {
 			},
 			expectedStatusCode:   http.StatusInternalServerError,
 			expectedResponseBody: `{"error":"failed to clone repository","content":"failed to checkout repository: failed to get reference set: invalid reference, should be a tag or a branch: ` + invalidBranch + `","job_id":"%[1]s"}`,
-			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            false,
 		},
@@ -156,7 +147,6 @@ func TestHandleEvent(t *testing.T) {
 			},
 			expectedStatusCode:   http.StatusCreated,
 			expectedResponseBody: `{"content":"job completed successfully","job_id":"%[1]s"}`,
-			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            false,
 		},
@@ -172,7 +162,6 @@ func TestHandleEvent(t *testing.T) {
 			},
 			expectedStatusCode:   http.StatusInternalServerError,
 			expectedResponseBody: `{"error":"deployment failed","content":"failed to deploy stack %[3]s: no compose files found: stat %[2]s/docker-compose.yaml: no such file or directory","job_id":"%[1]s"}`,
-			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            false,
 		},
@@ -188,7 +177,6 @@ func TestHandleEvent(t *testing.T) {
 			},
 			expectedStatusCode:   http.StatusCreated,
 			expectedResponseBody: `{"content":"job completed successfully","job_id":"%[1]s"}`,
-			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            false,
 		},
@@ -204,7 +192,6 @@ func TestHandleEvent(t *testing.T) {
 			},
 			expectedStatusCode:   http.StatusCreated,
 			expectedResponseBody: `{"content":"job completed successfully","job_id":"%[1]s"}`,
-			overrideEnv:          nil,
 			customTarget:         "",
 			swarmMode:            true,
 		},
@@ -225,15 +212,25 @@ func TestHandleEvent(t *testing.T) {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
 
-	dockerClient, _ := client.NewClientWithOpts(
+	dockerClient, _ := client.New(
 		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
 	)
 
 	encryption.SetupAgeKeyEnvVar(t)
 
+	defaultEnvVars := map[string]string{
+		"GIT_ACCESS_TOKEN": os.Getenv("GIT_ACCESS_TOKEN"),
+		"WEBHOOK_SECRET":   os.Getenv("WEBHOOK_SECRET"),
+	}
+
+	for k, v := range defaultEnvVars {
+		t.Setenv(k, v)
+	}
+
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if swarm.ModeEnabled != tc.swarmMode {
 				t.Skipf("Skipping test because it requires swarm mode %v, but current mode is %v", tc.swarmMode, swarm.ModeEnabled)
 			}
@@ -245,23 +242,12 @@ func TestHandleEvent(t *testing.T) {
 				stackName = stackName[:40]
 			}
 
-			for k, v := range defaultEnvVars {
-				t.Setenv(k, v)
-			}
-
-			if tc.overrideEnv != nil {
-				for k, v := range tc.overrideEnv {
-					t.Setenv(k, v)
-				}
-			}
-
 			if tc.payload.Private && appConfig.GitAccessToken == "" {
 				t.Skip("Skipping test for private repository because GIT_ACCESS_TOKEN is not set")
 			}
 
-			log := logger.New(12)
 			jobID := uuid.Must(uuid.NewV7()).String()
-			jobLog := log.With(slog.String("job_id", jobID))
+			jobLog := logger.New(logger.LevelCritical).With(slog.String("job_id", jobID))
 
 			ctx := context.Background()
 
@@ -293,7 +279,7 @@ func TestHandleEvent(t *testing.T) {
 			rr := httptest.NewRecorder()
 
 			t.Cleanup(func() {
-				service := compose.NewComposeService(dockerCli)
+				service, svcErr := compose.NewComposeService(dockerCli)
 
 				downOpts := api.DownOptions{
 					RemoveOrphans: true,
@@ -303,7 +289,7 @@ func TestHandleEvent(t *testing.T) {
 
 				if swarm.ModeEnabled {
 					err = docker.RemoveSwarmStack(ctx, dockerCli, stackName)
-				} else if service != nil {
+				} else if svcErr == nil && service != nil {
 					err = service.Down(ctx, stackName, downOpts)
 				}
 
@@ -349,6 +335,8 @@ func TestHandleEvent(t *testing.T) {
 }
 
 func TestGetProxyUrlRedacted(t *testing.T) {
+	t.Parallel()
+
 	// Test cases with different proxy URLs
 	testCases := []struct {
 		name     string
@@ -388,6 +376,8 @@ func TestGetProxyUrlRedacted(t *testing.T) {
 	}
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			result := GetProxyUrlRedacted(tc.proxyURL)
 			if result != tc.expected {
 				t.Errorf("GetProxyUrlRedacted(%q) = %q; want %q", tc.proxyURL, result, tc.expected)
@@ -397,11 +387,14 @@ func TestGetProxyUrlRedacted(t *testing.T) {
 }
 
 func TestCreateMountpointSymlink(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
-		name        string
-		source      string
-		destination string
-		expectError error
+		name         string
+		source       string
+		destination  string
+		skipReadlink bool
+		expectError  error
 	}{
 		{
 			name:        "Valid Symlink Creation",
@@ -409,20 +402,51 @@ func TestCreateMountpointSymlink(t *testing.T) {
 			destination: "destination",
 			expectError: nil,
 		},
+		{
+			name:         "same directory",
+			source:       "same",
+			destination:  "same",
+			expectError:  nil,
+			skipReadlink: true,
+		},
+		{
+			name:        "end with slash",
+			source:      "source1/",
+			destination: "destination",
+			expectError: nil,
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			tmpDir := t.TempDir()
+
+			source := filepath.Join(tmpDir, tc.source)
+			destination := filepath.Join(tmpDir, tc.destination)
 
 			err := CreateMountpointSymlink(container.MountPoint{
 				Type:        "bind",
-				Source:      filepath.Join(tmpDir, tc.source),
-				Destination: filepath.Join(tmpDir, tc.destination),
+				Source:      source,
+				Destination: destination,
 				Mode:        "rw",
 			})
 			if !errors.Is(err, tc.expectError) {
 				t.Errorf("symlink creation error: got %v, want %v", err, tc.expectError)
+			}
+
+			if tc.skipReadlink {
+				return
+			}
+
+			link, err := os.Readlink(source)
+			if err != nil {
+				t.Errorf("failed to read symlink: %v", err)
+			}
+
+			if link != destination {
+				t.Errorf("symlink destination: got %v, want %v", link, destination)
 			}
 		})
 	}

@@ -9,12 +9,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
-
-	testCompose "github.com/testcontainers/testcontainers-go/modules/compose"
-	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
@@ -28,10 +26,10 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
-	"github.com/docker/docker/client"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/google/uuid"
+	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/encryption"
@@ -42,13 +40,17 @@ import (
 )
 
 func createComposeFile(t *testing.T, filePath, content string) {
+	t.Helper()
+
 	err := os.WriteFile(filePath, []byte(content), filesystem.PermOwner)
 	if err != nil {
 		t.Fatal(err)
 	}
 }
 
-func createTestFile(fileName string, content string) error {
+func createTestFile(t *testing.T, fileName string, content string) error {
+	t.Helper()
+
 	err := os.WriteFile(fileName, []byte(content), filesystem.PermOwner)
 	if err != nil {
 		return err
@@ -82,6 +84,8 @@ func generateComposeContents() string {
 }
 
 func TestVerifySocketConnection(t *testing.T) {
+	t.Parallel()
+
 	err := VerifySocketConnection()
 	if err != nil {
 		t.Fatal(err)
@@ -89,9 +93,12 @@ func TestVerifySocketConnection(t *testing.T) {
 }
 
 func TestLoadCompose(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	tmpDir := t.TempDir()
+
 	filePath := filepath.Join(tmpDir, "test.compose.yaml")
 
 	composeYAML := generateComposeContents()
@@ -117,9 +124,9 @@ func TestLoadCompose(t *testing.T) {
 }
 
 func TestDeployCompose(t *testing.T) {
-	ctx := context.Background()
-
 	encryption.SetupAgeKeyEnvVar(t)
+
+	ctx := context.Background()
 
 	c, err := config.GetAppConfig()
 	if err != nil {
@@ -131,9 +138,8 @@ func TestDeployCompose(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dockerClient, _ := client.NewClientWithOpts(
+	dockerClient, _ := client.New(
 		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
 	)
 
 	secretProvider, err := secretprovider.Initialize(ctx, c.SecretProvider, "v0.0.0-test")
@@ -232,7 +238,7 @@ compose_files:
   - %s
 `, stackName, reference, workingDirectory, composeFiles[0])
 
-	err = createTestFile(filePath, deployConfig)
+	err = createTestFile(t, filePath, deployConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -246,7 +252,10 @@ compose_files:
 		t.Cleanup(func() {
 			t.Log("Remove test deployment")
 
-			service := compose.NewComposeService(dockerCli)
+			service, err := compose.NewComposeService(dockerCli)
+			if err != nil {
+				t.Fatalf("failed to create compose service: %v", err)
+			}
 
 			downOpts := api.DownOptions{
 				RemoveOrphans: true,
@@ -358,6 +367,8 @@ compose_files:
 }
 
 func TestHasChangedConfigs(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name            string
 		oldCommit       string
@@ -403,35 +414,39 @@ func TestHasChangedConfigs(t *testing.T) {
 		t.Fatalf("Failed to clone repository: %v", err)
 	}
 
-	t.Chdir(tmpDir)
-
 	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
 
 	for _, tc := range testCases {
-		changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-		if err != nil {
-			t.Fatalf("Failed to get changed files: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		if tc.ExpectedChanges && len(changedFiles) == 0 {
-			t.Fatalf("Expectec changed files, but found none found")
-		}
+			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
+			if err != nil {
+				t.Fatalf("Failed to get changed files: %v", err)
+			}
 
-		hasChanged, err := HasChangedConfigs(changedFiles, project)
-		if err != nil {
-			t.Fatalf("Failed to check for changed configs: %v", err)
-		}
+			if tc.ExpectedChanges && len(changedFiles) == 0 {
+				t.Fatalf("Expectec changed files, but found none found")
+			}
 
-		if !hasChanged && tc.ExpectedChanges {
-			t.Error("Expected changed configs, but found none")
-		}
+			hasChanged, err := HasChangedConfigs(changedFiles, project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed configs: %v", err)
+			}
+
+			if !hasChanged && tc.ExpectedChanges {
+				t.Error("Expected changed configs, but found none")
+			}
+		})
 	}
 }
 
 func TestHasChangedSecrets(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name            string
 		oldCommit       string
@@ -477,35 +492,39 @@ func TestHasChangedSecrets(t *testing.T) {
 		t.Fatalf("Failed to clone repository: %v", err)
 	}
 
-	t.Chdir(tmpDir)
-
 	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
 
 	for _, tc := range testCases {
-		changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-		if err != nil {
-			t.Fatalf("Failed to get changed files: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		if tc.ExpectedChanges && len(changedFiles) == 0 {
-			t.Fatalf("Expectec changed files, but found none found")
-		}
+			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
+			if err != nil {
+				t.Fatalf("Failed to get changed files: %v", err)
+			}
 
-		hasChanged, err := HasChangedSecrets(changedFiles, project)
-		if err != nil {
-			t.Fatalf("Failed to check for changed secrets: %v", err)
-		}
+			if tc.ExpectedChanges && len(changedFiles) == 0 {
+				t.Fatalf("Expectec changed files, but found none found")
+			}
 
-		if !hasChanged && tc.ExpectedChanges {
-			t.Error("Expected changed secrets, but found none")
-		}
+			hasChanged, err := HasChangedSecrets(changedFiles, project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed secrets: %v", err)
+			}
+
+			if !hasChanged && tc.ExpectedChanges {
+				t.Error("Expected changed secrets, but found none")
+			}
+		})
 	}
 }
 
 func TestHasChangedBindMounts(t *testing.T) {
+	t.Parallel()
+
 	testCases := []struct {
 		name            string
 		oldCommit       string
@@ -551,268 +570,40 @@ func TestHasChangedBindMounts(t *testing.T) {
 		t.Fatalf("Failed to clone repository: %v", err)
 	}
 
-	t.Chdir(tmpDir)
-
 	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatalf("Failed to load compose file: %v", err)
 	}
 
 	for _, tc := range testCases {
-		changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-		if err != nil {
-			t.Fatalf("Failed to get changed files: %v", err)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-		if tc.ExpectedChanges && len(changedFiles) == 0 {
-			t.Fatalf("Expectec changed files, but found none found")
-		}
+			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
+			if err != nil {
+				t.Fatalf("Failed to get changed files: %v", err)
+			}
 
-		hasChanged, err := HasChangedBindMounts(changedFiles, project)
-		if err != nil {
-			t.Fatalf("Failed to check for changed bind mounts: %v", err)
-		}
+			if tc.ExpectedChanges && len(changedFiles) == 0 {
+				t.Fatalf("Expectec changed files, but found none found")
+			}
 
-		if !hasChanged && tc.ExpectedChanges {
-			t.Error("Expected changed bind mounts, but found none")
-		}
+			hasChanged, err := HasChangedBindMounts(changedFiles, project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed bind mounts: %v", err)
+			}
+
+			if !hasChanged && tc.ExpectedChanges {
+				t.Error("Expected changed bind mounts, but found none")
+			}
+		})
 	}
-}
-
-func startTestContainer(ctx context.Context, t *testing.T) (*testCompose.DockerCompose, error) {
-	t.Chdir(t.TempDir())
-	stackName := test.ConvertTestName(t.Name())
-
-	composeYAML := generateComposeContents()
-
-	stack, err := testCompose.NewDockerComposeWith(
-		testCompose.StackIdentifier(stackName),
-		testCompose.WithStackReaders(strings.NewReader(composeYAML)),
-	)
-	if err != nil {
-		t.Fatalf("failed to create stack: %v", err)
-	}
-
-	err = stack.
-		WaitForService("test", wait.ForListeningPort("80/tcp")).
-		Up(ctx, testCompose.Wait(true))
-	if err != nil {
-		t.Fatalf("failed to start stack: %v", err)
-	}
-
-	t.Cleanup(func() {
-		err = stack.Down(
-			ctx,
-			testCompose.RemoveOrphans(true),
-			testCompose.RemoveVolumes(true),
-		)
-		if err != nil {
-			t.Fatalf("Failed to stop stack: %v", err)
-		}
-	})
-
-	return stack, err
-}
-
-func TestRestartProject(t *testing.T) {
-	ctx := context.Background()
-
-	_, err := startTestContainer(ctx, t)
-	if err != nil {
-		t.Fatalf("failed to start test container: %v", err)
-	}
-
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	timeout := time.Duration(30) * time.Second
-
-	t.Log("Restarting project")
-
-	err = RestartProject(ctx, dockerCli, test.ConvertTestName(t.Name()), timeout)
-	if err != nil {
-		t.Fatalf("failed to restart project: %v", err)
-	}
-}
-
-func TestStopProject(t *testing.T) {
-	ctx := context.Background()
-
-	_, err := startTestContainer(ctx, t)
-	if err != nil {
-		t.Fatalf("failed to start test container: %v", err)
-	}
-
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	timeout := time.Duration(30) * time.Second
-
-	t.Log("Stopping project")
-
-	err = StopProject(ctx, dockerCli, test.ConvertTestName(t.Name()), timeout)
-	if err != nil {
-		t.Fatalf("failed to stop project: %v", err)
-	}
-}
-
-func TestStartProject(t *testing.T) {
-	ctx := context.Background()
-
-	_, err := startTestContainer(ctx, t)
-	if err != nil {
-		t.Fatalf("failed to start test container: %v", err)
-	}
-
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	timeout := time.Duration(30) * time.Second
-	stackName := test.ConvertTestName(t.Name())
-
-	t.Log("Stopping project")
-
-	err = StopProject(ctx, dockerCli, stackName, timeout)
-	if err != nil {
-		t.Fatalf("failed to stop project: %v", err)
-	}
-
-	time.Sleep(3 * time.Second)
-
-	t.Log("Starting project")
-
-	err = StartProject(ctx, dockerCli, stackName, timeout)
-	if err != nil {
-		t.Fatalf("failed to start project: %v", err)
-	}
-}
-
-func TestRemoveProject(t *testing.T) {
-	ctx := context.Background()
-
-	_, err := startTestContainer(ctx, t)
-	if err != nil {
-		t.Fatalf("failed to start test container: %v", err)
-	}
-
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	timeout := time.Duration(30) * time.Second
-	stackName := test.ConvertTestName(t.Name())
-
-	t.Log("Removing project")
-
-	err = RemoveProject(ctx, dockerCli, stackName, timeout, true, true)
-	if err != nil {
-		t.Fatalf("failed to remove project: %v", err)
-	}
-
-	// Verify project is removed
-	containers, err := GetProjectContainers(ctx, dockerCli, stackName)
-	if err != nil {
-		t.Fatalf("failed to get project: %v", err)
-	}
-
-	if len(containers) != 0 {
-		t.Fatalf("expected 0 containers, got %d", len(containers))
-	}
-}
-
-func TestGetProject(t *testing.T) {
-	ctx := context.Background()
-
-	_, err := startTestContainer(ctx, t)
-	if err != nil {
-		t.Fatalf("failed to start test container: %v", err)
-	}
-
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Log("Getting project")
-
-	containers, err := GetProjectContainers(ctx, dockerCli, test.ConvertTestName(t.Name()))
-	if err != nil {
-		t.Fatalf("failed to get project: %v", err)
-	}
-
-	if len(containers) == 0 {
-		t.Fatal("expected at least 1 container, got 0")
-	}
-
-	t.Logf("Found %d containers", len(containers))
-}
-
-func TestGetProjects(t *testing.T) {
-	ctx := context.Background()
-
-	_, err := startTestContainer(ctx, t)
-	if err != nil {
-		t.Fatalf("failed to start test container: %v", err)
-	}
-
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Log("Getting projects")
-
-	projects, err := GetProjects(ctx, dockerCli, true)
-	if err != nil {
-		t.Fatalf("failed to get projects: %v", err)
-	}
-
-	if len(projects) == 0 {
-		t.Fatal("expected at least 1 project, got 0")
-	}
-
-	t.Logf("Found %d projects", len(projects))
 }
 
 // TestInjectSecretsToProject tests resolving and injecting secrets from external secret managers into a Docker Compose project.
 func TestInjectSecretsToProject(t *testing.T) {
+	t.Parallel()
+
 	const (
 		varName         = "TEST_PASSWORD"
 		composeContents = `services:
@@ -887,7 +678,6 @@ func TestInjectSecretsToProject(t *testing.T) {
 	ctx := t.Context()
 
 	tmpDir := t.TempDir()
-	t.Chdir(tmpDir)
 
 	filePath := filepath.Join(tmpDir, "test.compose.yaml")
 	createComposeFile(t, filePath, composeContents)
@@ -899,6 +689,8 @@ func TestInjectSecretsToProject(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if c.SecretProvider != tc.secretProvider {
 				t.Skip("Skipping test because secret provider is not configured in app config")
 			}
@@ -970,6 +762,446 @@ func TestInjectSecretsToProject(t *testing.T) {
 							break
 						}
 					}
+				}
+			}
+		})
+	}
+}
+
+func TestRestartProject(t *testing.T) {
+	ctx := context.Background()
+
+	test.ComposeUp(ctx, t, test.WithYAML(generateComposeContents()))
+
+	c, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timeout := time.Duration(30) * time.Second
+
+	t.Log("Restarting project")
+
+	err = RestartProject(ctx, dockerCli, test.ConvertTestName(t.Name()), timeout)
+	if err != nil {
+		t.Fatalf("failed to restart project: %v", err)
+	}
+}
+
+func TestStopProject(t *testing.T) {
+	ctx := context.Background()
+
+	test.ComposeUp(ctx, t, test.WithYAML(generateComposeContents()))
+
+	c, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timeout := time.Duration(30) * time.Second
+
+	t.Log("Stopping project")
+
+	err = StopProject(ctx, dockerCli, test.ConvertTestName(t.Name()), timeout)
+	if err != nil {
+		t.Fatalf("failed to stop project: %v", err)
+	}
+}
+
+func TestStartProject(t *testing.T) {
+	ctx := context.Background()
+
+	test.ComposeUp(ctx, t, test.WithYAML(generateComposeContents()))
+
+	c, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timeout := time.Duration(30) * time.Second
+	stackName := test.ConvertTestName(t.Name())
+
+	t.Log("Stopping project")
+
+	err = StopProject(ctx, dockerCli, stackName, timeout)
+	if err != nil {
+		t.Fatalf("failed to stop project: %v", err)
+	}
+
+	time.Sleep(3 * time.Second)
+
+	t.Log("Starting project")
+
+	err = StartProject(ctx, dockerCli, stackName, timeout)
+	if err != nil {
+		t.Fatalf("failed to start project: %v", err)
+	}
+}
+
+func TestRemoveProject(t *testing.T) {
+	ctx := context.Background()
+
+	test.ComposeUp(ctx, t, test.WithYAML(generateComposeContents()))
+
+	c, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timeout := time.Duration(30) * time.Second
+	stackName := test.ConvertTestName(t.Name())
+
+	t.Log("Removing project")
+
+	err = RemoveProject(ctx, dockerCli, stackName, timeout, true, true)
+	if err != nil {
+		t.Fatalf("failed to remove project: %v", err)
+	}
+
+	// Verify project is removed
+	containers, err := GetProjectContainers(ctx, dockerCli, stackName)
+	if err != nil {
+		t.Fatalf("failed to get project: %v", err)
+	}
+
+	if len(containers) != 0 {
+		t.Fatalf("expected 0 containers, got %d", len(containers))
+	}
+}
+
+func TestGetProject(t *testing.T) {
+	ctx := context.Background()
+
+	test.ComposeUp(ctx, t, test.WithYAML(generateComposeContents()))
+
+	c, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("Getting project")
+
+	containers, err := GetProjectContainers(ctx, dockerCli, test.ConvertTestName(t.Name()))
+	if err != nil {
+		t.Fatalf("failed to get project: %v", err)
+	}
+
+	if len(containers) == 0 {
+		t.Fatal("expected at least 1 container, got 0")
+	}
+
+	t.Logf("Found %d containers", len(containers))
+}
+
+func TestGetProjects(t *testing.T) {
+	ctx := context.Background()
+
+	test.ComposeUp(ctx, t, test.WithYAML(generateComposeContents()))
+
+	c, err := config.GetAppConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy, !c.SkipTLSVerification)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Log("Getting projects")
+
+	projects, err := GetProjects(ctx, dockerCli, true)
+	if err != nil {
+		t.Fatalf("failed to get projects: %v", err)
+	}
+
+	if len(projects) == 0 {
+		t.Fatal("expected at least 1 project, got 0")
+	}
+
+	t.Logf("Found %d projects", len(projects))
+}
+
+func TestGetIncludeFilesFromYaml(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		composeYAML   string
+		expectedFiles []string
+	}{
+		{
+			name: "Simple list of includes",
+			composeYAML: `
+include:
+  - base.compose.yml
+  - common.compose.yml
+`,
+			expectedFiles: []string{
+				"base.compose.yml",
+				"common.compose.yml",
+			},
+		},
+		{
+			name: "Complex list with path overrides",
+			composeYAML: `
+include:
+  - base.compose.yml
+  - path:
+      - third-party/compose.yaml
+      - override.yaml
+`,
+			expectedFiles: []string{
+				"base.compose.yml",
+				"third-party/compose.yaml",
+				"override.yaml",
+			},
+		},
+		{
+			name: "Mixed simple and complex includes",
+			composeYAML: `
+include:
+  - base.compose.yml
+  - path:
+      - third-party/compose.yaml
+      - override.yaml
+  - another.compose.yml
+`,
+			expectedFiles: []string{
+				"base.compose.yml",
+				"third-party/compose.yaml",
+				"override.yaml",
+				"another.compose.yml",
+			},
+		},
+		{
+			name: "Single path in object form",
+			composeYAML: `
+include:
+  - path: single.compose.yml
+`,
+			expectedFiles: []string{
+				"single.compose.yml",
+			},
+		},
+		{
+			name:          "No includes",
+			composeYAML:   `services: {}`,
+			expectedFiles: []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+
+			// Create the referenced files so paths can be resolved
+			for _, name := range tc.expectedFiles {
+				full := filepath.Join(dir, name)
+
+				err := os.MkdirAll(filepath.Dir(full), 0o755)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				err = os.WriteFile(full, []byte{}, 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			composeFile := filepath.Join(dir, "compose.yaml")
+
+			err := os.WriteFile(composeFile, []byte(tc.composeYAML), 0o600)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := getIncludeFilesFromYaml([]string{composeFile}, dir)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			want := make([]string, 0, len(tc.expectedFiles))
+			for _, f := range tc.expectedFiles {
+				want = append(want, filepath.Join(dir, f))
+			}
+
+			slices.Sort(got)
+			slices.Sort(want)
+
+			if len(got) != len(want) {
+				t.Fatalf("expected %d files, got %d: %v", len(want), len(got), got)
+			}
+
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("expected file %q, got %q", want[i], got[i])
+				}
+			}
+		})
+	}
+}
+
+func TestGetExtendsFilesFromYaml(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name          string
+		files         map[string]string
+		composeFiles  []string
+		expectedFiles []string
+	}{
+		{
+			name: "Single extends",
+			files: map[string]string{
+				"compose.yaml": `
+services:
+  app:
+    extends:
+      file: base.compose.yml
+      service: base
+`,
+			},
+			composeFiles:  []string{"compose.yaml"},
+			expectedFiles: []string{"base.compose.yml"},
+		},
+		{
+			name: "Multiple services extends",
+			files: map[string]string{
+				"compose.yaml": `
+services:
+  app:
+    extends:
+      file: base.compose.yml
+      service: base
+  worker:
+    extends:
+      file: worker.compose.yml
+      service: worker
+  plain:
+    image: alpine
+`,
+			},
+			composeFiles:  []string{"compose.yaml"},
+			expectedFiles: []string{"base.compose.yml", "worker.compose.yml"},
+		},
+		{
+			name: "Multiple compose files in subdir",
+			files: map[string]string{
+				"compose.yaml": `
+services:
+  app:
+    extends:
+      file: base.yml
+      service: base
+`,
+				"stack/compose.yaml": `
+services:
+  api:
+    extends:
+      file: third/compose.yaml
+      service: api
+`,
+			},
+			composeFiles:  []string{"compose.yaml", "stack/compose.yaml"},
+			expectedFiles: []string{"base.yml", "stack/third/compose.yaml"},
+		},
+		{
+			name: "No extends",
+			files: map[string]string{
+				"compose.yaml": `
+services:
+  app:
+    image: alpine
+`,
+			},
+			composeFiles:  []string{"compose.yaml"},
+			expectedFiles: []string{},
+		},
+		{
+			name: "Non-existent compose file is skipped",
+			files: map[string]string{
+				"compose.yaml": `
+services:
+  app:
+    extends:
+      file: base.yml
+      service: base
+`,
+			},
+			composeFiles:  []string{"nonexistent.yaml", "compose.yaml"},
+			expectedFiles: []string{"base.yml"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+
+			for rel, content := range tc.files {
+				full := filepath.Join(dir, rel)
+
+				err := os.MkdirAll(filepath.Dir(full), 0o755)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				err = os.WriteFile(full, []byte(content), 0o600)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			got, err := getExtendsFilesFromYaml(tc.composeFiles, dir)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+
+			want := make([]string, 0, len(tc.expectedFiles))
+			for _, f := range tc.expectedFiles {
+				want = append(want, filepath.Join(dir, f))
+			}
+
+			slices.Sort(got)
+			slices.Sort(want)
+
+			if len(got) != len(want) {
+				t.Fatalf("expected %d files, got %d: %v", len(want), len(got), got)
+			}
+
+			for i := range want {
+				if got[i] != want[i] {
+					t.Errorf("expected file %q, got %q", want[i], got[i])
 				}
 			}
 		})

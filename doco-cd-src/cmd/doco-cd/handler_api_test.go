@@ -9,10 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	testCompose "github.com/testcontainers/testcontainers-go/modules/compose"
-	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
@@ -25,6 +23,8 @@ import (
 
 // Make http call to HealthCheckHandler.
 func TestHandlerData_HealthCheckHandler(t *testing.T) {
+	t.Parallel()
+
 	expectedResponse := `{"content":"healthy","job_id":"[a-f0-9-]{36}"}`
 	expectedStatusCode := http.StatusOK
 
@@ -33,7 +33,7 @@ func TestHandlerData_HealthCheckHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log := logger.New(12)
+	log := logger.New(logger.LevelCritical)
 
 	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
 	if err != nil {
@@ -83,16 +83,15 @@ func TestHandlerData_ProjectApiHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log := logger.New(12)
+	log := logger.New(logger.LevelCritical)
 
 	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
 	if err != nil {
 		t.Fatalf("Failed to create docker client: %v", err)
 	}
 
-	dockerClient, _ := client.NewClientWithOpts(
+	dockerClient, _ := client.New(
 		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
 	)
 
 	t.Cleanup(func() {
@@ -147,55 +146,17 @@ func TestHandlerData_ProjectApiHandler(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			if swarm.ModeEnabled {
 				t.Skip("Skipping Project API tests in Swarm mode")
 			}
 
-			t.Chdir(tmpDir)
-
 			ctx := context.Background()
-
-			var stack *testCompose.DockerCompose
 
 			stackName := test.ConvertTestName(t.Name())
 
-			stack, err = testCompose.NewDockerComposeWith(
-				testCompose.StackIdentifier(stackName),
-				testCompose.WithStackReaders(strings.NewReader(composeContent)),
-			)
-			if err != nil {
-				t.Fatalf("failed to create stack: %v", err)
-			}
-
-			// Retry starting the stack up to 3 times
-			const maxRetries = 3
-			for i := 0; i < maxRetries; i++ {
-				err = stack.
-					WaitForService("nginx", wait.ForListeningPort("80/tcp")).
-					Up(ctx, testCompose.Wait(true))
-				if err == nil {
-					break
-				}
-
-				if i < maxRetries-1 {
-					t.Logf("failed to start stack (attempt %d/%d): %v, retrying...", i+1, maxRetries, err)
-				}
-			}
-
-			if err != nil {
-				t.Fatalf("failed to start stack after %d attempts: %v", maxRetries, err)
-			}
-
-			t.Cleanup(func() {
-				err = stack.Down(
-					context.Background(),
-					testCompose.RemoveOrphans(true),
-					testCompose.RemoveVolumes(true),
-				)
-				if err != nil {
-					t.Fatalf("Failed to stop stack: %v", err)
-				}
-			})
+			test.ComposeUp(ctx, t, test.WithYAML(composeContent), test.WithName(stackName))
 
 			endpointPath := path.Join(apiPath, strings.Replace(tc.path, "{projectName}", stackName, 1))
 			endpointPattern := path.Join(apiPath, tc.pattern)

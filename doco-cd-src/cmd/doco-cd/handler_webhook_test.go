@@ -15,10 +15,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/docker/compose/v2/pkg/api"
-	"github.com/docker/compose/v2/pkg/compose"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/git"
 
@@ -40,7 +41,7 @@ const (
   nginx:
     image: nginx:latest
     ports:
-      - "80:80"
+      - "80"
 `
 )
 
@@ -50,8 +51,6 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	expectedResponse := `{"content":"job completed successfully","job_id":"[a-f0-9-]{36}"}`
 	expectedStatusCode := http.StatusCreated
 	tmpDir := t.TempDir()
-
-	const containerName = "test"
 
 	stackName := test.ConvertTestName(t.Name())
 
@@ -84,16 +83,15 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log := logger.New(12)
+	log := logger.New(logger.LevelCritical)
 
 	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
 	if err != nil {
 		t.Fatalf("Failed to create docker client: %v", err)
 	}
 
-	dockerClient, _ := client.NewClientWithOpts(
+	dockerClient, _ := client.New(
 		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
 	)
 
 	t.Cleanup(func() {
@@ -145,7 +143,10 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 
 	ctx := context.Background()
 
-	service := compose.NewComposeService(dockerCli)
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		t.Fatalf("failed to create compose service: %v", err)
+	}
 
 	downOpts := api.DownOptions{
 		RemoveOrphans: true,
@@ -162,18 +163,15 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		}
 	})
 
-	// Check if the deployed test container is running
-	testContainerID, err := docker.GetContainerID(dockerCli.Client(), containerName)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	testContainerPort := ""
+	var (
+		testContainerID   string
+		testContainerPort string
+	)
 
 	if swarm.ModeEnabled {
-		t.Log("Testing in Swarm mode, using service inspect")
+		t.Log("Testing in Swarm mode")
 
-		inspectName := stackName + "_" + containerName
+		inspectName := stackName + "_" + "test"
 
 		svc, err := docker.WaitForSwarmService(ctx, t, dockerClient, inspectName, 30*time.Second)
 		if err != nil {
@@ -187,25 +185,56 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		testContainerPort = strconv.FormatUint(uint64(svc.Endpoint.Ports[0].PublishedPort), 10)
 
 		t.Cleanup(func() {
-			err = dockerCli.Client().ServiceRemove(ctx, inspectName)
+			_, err = dockerCli.Client().ServiceRemove(ctx, inspectName, client.ServiceRemoveOptions{})
 			if err != nil {
 				t.Fatalf("Failed to remove test container service: %v", err)
 			}
 		})
 	} else {
-		testContainer, err := dockerCli.Client().ContainerInspect(ctx, testContainerID)
+		containers, err := test.WaitForStack(ctx, t, service, stackName, 30*time.Second)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("Failed waiting for stack to be ready: %v", err)
 		}
 
-		if testContainer.State.Running != true {
-			t.Fatal("Test container is not running")
+		for _, c := range containers {
+			if c.Service == "app" {
+				testContainerID = c.ID
+				break
+			}
 		}
 
-		// Check if test container returns the expected response on its published port
-		networkPort := testContainer.NetworkSettings.Ports["80/tcp"]
+		if testContainerID == "" {
+			t.Fatal("Test container not found in stack")
+		}
 
-		testContainerPort = networkPort[0].HostPort
+		deadline := time.Now().Add(15 * time.Second)
+
+		for {
+			testContainer, err := dockerCli.Client().ContainerInspect(ctx, testContainerID, client.ContainerInspectOptions{})
+			if err != nil {
+				if time.Now().After(deadline) {
+					t.Fatalf("Failed to inspect container: %v", err)
+				}
+
+				time.Sleep(500 * time.Millisecond)
+
+				continue
+			}
+
+			portKey, _ := network.ParsePort("80/tcp")
+
+			networkPort := testContainer.Container.NetworkSettings.Ports[portKey]
+			if len(networkPort) > 0 {
+				testContainerPort = networkPort[0].HostPort
+				break
+			}
+
+			if time.Now().After(deadline) {
+				t.Fatal("Test container port not published")
+			}
+
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 
 	testURL := "http://127.0.0.1:" + testContainerPort
@@ -275,7 +304,7 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log := logger.New(12)
+	log := logger.New(logger.LevelCritical)
 
 	h := handlerData{
 		appConfig:  appConfig,
@@ -305,6 +334,8 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
 			// Provide a payload that fails parsing; wait should not affect parse errors.
 			req, err := http.NewRequest("POST", tc.url, bytes.NewReader([]byte("{}")))
 			if err != nil {

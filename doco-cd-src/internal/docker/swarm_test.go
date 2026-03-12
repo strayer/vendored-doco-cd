@@ -4,8 +4,10 @@ import (
 	"log"
 	"path/filepath"
 	"testing"
+	"time"
 
-	"github.com/docker/docker/client"
+	"github.com/avast/retry-go/v5"
+	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
@@ -18,6 +20,8 @@ import (
 )
 
 func TestDeploySwarmStack(t *testing.T) {
+	t.Parallel()
+
 	dockerCli, err := CreateDockerCli(false, false)
 	if err != nil {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
@@ -49,8 +53,6 @@ func TestDeploySwarmStack(t *testing.T) {
 		CloneURL:  cloneUrlTest,
 		Private:   true,
 	}
-
-	t.Chdir(tmpDir)
 
 	auth, err := git.GetAuthMethod(p.CloneURL, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken)
 	if err != nil {
@@ -86,16 +88,32 @@ func TestDeploySwarmStack(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = DeploySwarmStack(t.Context(), dockerCli, project, deployConfigs[0], p, tmpDir, "e8e2d31f0fa0c924400b3bac751b6c2c6930adb1", "dev", "", map[string]string{})
+	ctx := t.Context()
+
+	err = retry.New(
+		// retry.RetryIf(func(err error) bool {
+		//	if err == nil {
+		//		return false
+		//	}
+		//	errStr := err.Error()
+		//	return strings.Contains(errStr, "network") && strings.Contains(errStr, "not found")
+		// }),
+		retry.Attempts(5),
+		retry.Delay(2*time.Second),
+		retry.Context(ctx),
+	).Do(
+		func() error {
+			return DeploySwarmStack(ctx, dockerCli, project, deployConfigs[0], p, tmpDir, "e8e2d31f0fa0c924400b3bac751b6c2c6930adb1", "dev", "", map[string]string{})
+		},
+	)
 	if err != nil {
 		t.Fatalf("Failed to deploy swarm stack: %v", err)
-	} else {
-		t.Logf("Swarm stack deployed successfully")
 	}
 
-	dockerClient, _ := client.NewClientWithOpts(
+	t.Logf("Swarm stack deployed successfully")
+
+	dockerClient, _ := client.New(
 		client.FromEnv,
-		client.WithAPIVersionNegotiation(),
 	)
 
 	t.Cleanup(func() {
