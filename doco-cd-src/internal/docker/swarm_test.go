@@ -9,6 +9,9 @@ import (
 	"github.com/avast/retry-go/v5"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/encryption"
+	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
+
 	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
@@ -20,7 +23,7 @@ import (
 )
 
 func TestDeploySwarmStack(t *testing.T) {
-	t.Parallel()
+	encryption.SetupAgeKeyEnvVar(t)
 
 	dockerCli, err := CreateDockerCli(false, false)
 	if err != nil {
@@ -78,7 +81,9 @@ func TestDeploySwarmStack(t *testing.T) {
 	repoPath := worktree.Filesystem.Root()
 	filePath := filepath.Join(repoPath, "docker-compose.yml")
 
-	project, err := LoadCompose(t.Context(), tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	resolvedSecrets := secrettypes.ResolvedSecrets{}
+
+	project, err := LoadCompose(t.Context(), tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, resolvedSecrets)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,6 +94,18 @@ func TestDeploySwarmStack(t *testing.T) {
 	}
 
 	ctx := t.Context()
+
+	cfg, opts, err := LoadSwarmStack(&dockerCli, project, deployConfigs[0], resolvedSecrets, tmpDir)
+	if err != nil {
+		t.Fatalf("Failed to load swarm stack: %v", err)
+	}
+
+	commit := "e8e2d31f0fa0c924400b3bac751b6c2c6930adb1"
+
+	projectHash, err := ProjectHash(project)
+	if err != nil {
+		t.Fatalf("failed to get project hash: %v", err)
+	}
 
 	err = retry.New(
 		// retry.RetryIf(func(err error) bool {
@@ -103,7 +120,13 @@ func TestDeploySwarmStack(t *testing.T) {
 		retry.Context(ctx),
 	).Do(
 		func() error {
-			return DeploySwarmStack(ctx, dockerCli, project, deployConfigs[0], p, tmpDir, "e8e2d31f0fa0c924400b3bac751b6c2c6930adb1", "dev", "", map[string]string{})
+			timestamp := time.Now().UTC().Format(time.RFC3339)
+			addSwarmServiceLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit, projectHash)
+			addSwarmVolumeLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit)
+			addSwarmConfigLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit)
+			addSwarmSecretLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit)
+
+			return DeploySwarmStack(ctx, dockerCli, cfg, opts)
 		},
 	)
 	if err != nil {

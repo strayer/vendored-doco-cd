@@ -9,10 +9,13 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/avast/retry-go/v5"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
@@ -26,6 +29,7 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 
+	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/google/uuid"
@@ -106,7 +110,7 @@ func TestLoadCompose(t *testing.T) {
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(ctx, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(ctx, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,6 +148,10 @@ func TestDeployCompose(t *testing.T) {
 
 	secretProvider, err := secretprovider.Initialize(ctx, c.SecretProvider, "v0.0.0-test")
 	if err != nil {
+		if errors.Is(err, bitwardensecretsmanager.ErrNotSupported) {
+			t.Skip(err.Error())
+		}
+
 		t.Fatalf("failed to initialize secret provider: %s", err.Error())
 
 		return
@@ -220,7 +228,7 @@ func TestDeployCompose(t *testing.T) {
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(ctx, tmpDir, stackName, []string{filePath}, []string{}, []string{}, map[string]string{})
+	project, err := LoadCompose(ctx, tmpDir, tmpDir, stackName, []string{filePath}, []string{}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -284,8 +292,16 @@ compose_files:
 			}
 		}
 
-		err = DeployStack(jobLog, repoPath, repoPath, &ctx, &dockerCli, dockerClient, &p, deployConf,
-			[]git.ChangedFile{}, latestCommit, "dev", "poll", false, resolvedSecrets, false)
+		err = retry.New(
+			retry.Attempts(3),
+			retry.Delay(1*time.Second),
+			retry.RetryIf(func(err error) bool {
+				return strings.Contains(err.Error(), "No such image:")
+			}),
+		).Do(func() error {
+			return DeployStack(jobLog, repoPath, &ctx, &dockerCli, dockerClient, &p, deployConf,
+				[]git.ChangedFile{}, latestCommit, "dev", false, resolvedSecrets)
+		})
 		if err != nil {
 			t.Fatalf("failed to deploy stack: %v", err)
 		}
@@ -369,76 +385,155 @@ compose_files:
 func TestHasChangedConfigs(t *testing.T) {
 	t.Parallel()
 
+	const repoRoot = "/data/doco-cd/fake-repo-root"
+
 	testCases := []struct {
 		name            string
-		oldCommit       string
-		newCommit       string
-		ExpectedChanges bool
+		changePath      []string
+		project         *types.Project
+		ExpectedChanges []string
 	}{
 		{
-			name:            "Has changes",
-			oldCommit:       "182520d6b0c574c319de69d05ba79858712e335e",
-			newCommit:       "87344f0f87250cd2b5d82d2483d3a62ee1d18e93",
-			ExpectedChanges: true,
+			name: "same path in service config and changed files",
+			changePath: []string{
+				repoRoot + "/test",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Configs: []types.ServiceConfigObjConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Configs: map[string]types.ConfigObjConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1"},
 		},
 		{
-			name:            "Has no changes",
-			oldCommit:       "72f1a4e88fdeffec3241d6da2ee19757eee3a0fd",
-			newCommit:       "151642a5c4f1b16b543d06c60fa9c95e2c7704a2",
-			ExpectedChanges: false,
+			name: "parent path in service config and changed in sub files",
+			changePath: []string{
+				repoRoot + "/test/subdir/config.yaml",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Configs: []types.ServiceConfigObjConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Configs: map[string]types.ConfigObjConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1"},
 		},
-	}
 
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatalf("Failed to get app config: %v", err)
-	}
-
-	url := cloneUrlTest
-
-	auth, err := git.GetAuthMethod(url, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken)
-	if err != nil {
-		t.Fatalf("Failed to get auth method: %v", err)
-	}
-
-	if auth != nil {
-		t.Logf("Using auth method: %s", auth.Name())
-	} else {
-		t.Log("No auth method configured, using anonymous access")
-	}
-
-	tmpDir := t.TempDir()
-
-	repo, err := git.CloneRepository(tmpDir, url, git.MainBranch, c.SkipTLSVerification, c.HttpProxy, auth, c.GitCloneSubmodules)
-	if err != nil {
-		t.Fatalf("Failed to clone repository: %v", err)
-	}
-
-	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
-	if err != nil {
-		t.Fatalf("Failed to load compose file: %v", err)
+		{
+			name: "change in different path than service config",
+			changePath: []string{
+				repoRoot + "/other/subdir/config.yaml",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Configs: []types.ServiceConfigObjConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Configs: map[string]types.ConfigObjConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+		{
+			name: "change in different path than service config",
+			changePath: []string{
+				repoRoot + "/other/subdir/config.yaml",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Configs: []types.ServiceConfigObjConfig{
+							{
+								Source: "cfg",
+							},
+							{
+								Source: "cfg2",
+							},
+						},
+					},
+				},
+				Configs: map[string]types.ConfigObjConfig{
+					"cfg": {
+						File: repoRoot + "/other2/subdir/config.yaml",
+					},
+					"cfg2": {
+						File: repoRoot + "/other2/other/subdir/config.yaml",
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+		{
+			name:       "Has no changes",
+			changePath: []string{},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Configs: []types.ServiceConfigObjConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Configs: map[string]types.ConfigObjConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-			if err != nil {
-				t.Fatalf("Failed to get changed files: %v", err)
-			}
-
-			if tc.ExpectedChanges && len(changedFiles) == 0 {
-				t.Fatalf("Expectec changed files, but found none found")
-			}
-
-			hasChanged, err := HasChangedConfigs(changedFiles, project)
+			changes, err := HasChangedConfigs(tc.changePath, tc.project)
 			if err != nil {
 				t.Fatalf("Failed to check for changed configs: %v", err)
 			}
 
-			if !hasChanged && tc.ExpectedChanges {
-				t.Error("Expected changed configs, but found none")
+			slices.Sort(changes)
+			slices.Sort(tc.ExpectedChanges)
+
+			if !reflect.DeepEqual(changes, tc.ExpectedChanges) {
+				t.Errorf("Expected changes %v, but got %v", tc.ExpectedChanges, changes)
 			}
 		})
 	}
@@ -447,76 +542,155 @@ func TestHasChangedConfigs(t *testing.T) {
 func TestHasChangedSecrets(t *testing.T) {
 	t.Parallel()
 
+	const repoRoot = "/data/doco-cd/fake-repo-root"
+
 	testCases := []struct {
 		name            string
-		oldCommit       string
-		newCommit       string
-		ExpectedChanges bool
+		changePath      []string
+		project         *types.Project
+		ExpectedChanges []string
 	}{
 		{
-			name:            "Has changes",
-			oldCommit:       "e4bd98139b81fd80938687edc7f9a1a001654e92",
-			newCommit:       "d47101db6f9a07b0d36a6245b257c3690782ae69",
-			ExpectedChanges: true,
+			name: "Has changes",
+			changePath: []string{
+				repoRoot + "/test",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Secrets: []types.ServiceSecretConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Secrets: map[string]types.SecretConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1"},
 		},
 		{
-			name:            "Has no changes",
-			oldCommit:       "72f1a4e88fdeffec3241d6da2ee19757eee3a0fd",
-			newCommit:       "151642a5c4f1b16b543d06c60fa9c95e2c7704a2",
-			ExpectedChanges: false,
+			name: "parent path in service secret and changed in sub files",
+			changePath: []string{
+				repoRoot + "/test/subdir/config.yaml",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Secrets: []types.ServiceSecretConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Secrets: map[string]types.SecretConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1"},
 		},
-	}
 
-	c, err := config.GetAppConfig()
-	if err != nil {
-		t.Fatalf("Failed to get app config: %v", err)
-	}
-
-	url := cloneUrlTest
-
-	auth, err := git.GetAuthMethod(url, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken)
-	if err != nil {
-		t.Fatalf("Failed to get auth method: %v", err)
-	}
-
-	if auth != nil {
-		t.Logf("Using auth method: %s", auth.Name())
-	} else {
-		t.Log("No auth method configured, using anonymous access")
-	}
-
-	tmpDir := t.TempDir()
-
-	repo, err := git.CloneRepository(tmpDir, url, git.MainBranch, c.SkipTLSVerification, c.HttpProxy, auth, c.GitCloneSubmodules)
-	if err != nil {
-		t.Fatalf("Failed to clone repository: %v", err)
-	}
-
-	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
-	if err != nil {
-		t.Fatalf("Failed to load compose file: %v", err)
+		{
+			name: "change in different path than service secret",
+			changePath: []string{
+				repoRoot + "/other/subdir/config.yaml",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Secrets: []types.ServiceSecretConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Secrets: map[string]types.SecretConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+		{
+			name: "change in different path than service secret",
+			changePath: []string{
+				repoRoot + "/other/subdir/config.yaml",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Secrets: []types.ServiceSecretConfig{
+							{
+								Source: "secret",
+							},
+							{
+								Source: "secret2",
+							},
+						},
+					},
+				},
+				Secrets: map[string]types.SecretConfig{
+					"secret": {
+						File: repoRoot + "/other2/subdir/config.yaml",
+					},
+					"secret2": {
+						File: repoRoot + "/other2/other/subdir/config.yaml",
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+		{
+			name:       "Has no changes",
+			changePath: []string{},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Secrets: []types.ServiceSecretConfig{
+							{
+								Source: "test",
+							},
+						},
+					},
+				},
+				Secrets: map[string]types.SecretConfig{
+					"test": {
+						File: repoRoot + "/test",
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
-			if err != nil {
-				t.Fatalf("Failed to get changed files: %v", err)
-			}
-
-			if tc.ExpectedChanges && len(changedFiles) == 0 {
-				t.Fatalf("Expectec changed files, but found none found")
-			}
-
-			hasChanged, err := HasChangedSecrets(changedFiles, project)
+			changes, err := HasChangedSecrets(tc.changePath, tc.project)
 			if err != nil {
 				t.Fatalf("Failed to check for changed secrets: %v", err)
 			}
 
-			if !hasChanged && tc.ExpectedChanges {
-				t.Error("Expected changed secrets, but found none")
+			slices.Sort(changes)
+			slices.Sort(tc.ExpectedChanges)
+
+			if !reflect.DeepEqual(changes, tc.ExpectedChanges) {
+				t.Errorf("Expected changes %v, but got %v", tc.ExpectedChanges, changes)
 			}
 		})
 	}
@@ -525,23 +699,459 @@ func TestHasChangedSecrets(t *testing.T) {
 func TestHasChangedBindMounts(t *testing.T) {
 	t.Parallel()
 
+	const repoRoot = "/data/doco-cd/fake-repo-root"
+
+	testCases := []struct {
+		name            string
+		changePath      []string
+		project         *types.Project
+		ExpectedChanges []string
+	}{
+		{
+			name: "bind mount changed path are the same",
+			changePath: []string{
+				repoRoot + "/dir",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/dir",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1"},
+		},
+		{
+			name: "same name but different path are different",
+			// https://github.com/kimdre/doco-cd/issues/1132
+			changePath: []string{
+				repoRoot + "/server/cwhc-ser6pro/services-auto/gatus/config.yaml",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"mihomo": {
+						Name: "mihomo",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/server/cwhc-istoreos/services-auto/mihomo/config.yaml",
+							},
+						},
+					},
+					"gatus": {
+						Name: "gatus",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/server/cwhc-ser6pro/services-auto/gatus/config.yaml",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{"gatus"},
+		},
+		{
+			name: "bind mount parent path",
+			changePath: []string{
+				repoRoot + "/a/b/c/d/e/f.txt",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/a/b/c/d/e/f.txt",
+							},
+						},
+					},
+					"svc2": {
+						Name: "svc2",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/a/b/c",
+							},
+						},
+					},
+					"svc3": {
+						Name: "svc3",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/b/c/d/e/f.txt",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1", "svc2"},
+		},
+		{
+			name:       "Has no changes",
+			changePath: []string{},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/dir",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+		{
+			name: "different path",
+			changePath: []string{
+				repoRoot + "/dir2",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						Volumes: []types.ServiceVolumeConfig{
+							{
+								Type:   "bind",
+								Source: repoRoot + "/dir",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			changes, err := HasChangedBindMounts(tc.changePath, tc.project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed bind mounts: %v", err)
+			}
+
+			slices.Sort(changes)
+			slices.Sort(tc.ExpectedChanges)
+
+			if !reflect.DeepEqual(changes, tc.ExpectedChanges) {
+				t.Errorf("Expected changes %v, but got %v", tc.ExpectedChanges, changes)
+			}
+		})
+	}
+}
+
+func TestHasChangedEnvFiles(t *testing.T) {
+	t.Parallel()
+
+	const repoRoot = "/data/doco-cd/fake-repo-root"
+
+	testCases := []struct {
+		name            string
+		changePath      []string
+		project         *types.Project
+		ExpectedChanges []string
+	}{
+		{
+			name: "same path",
+			changePath: []string{
+				repoRoot + "/test/.env",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						EnvFiles: []types.EnvFile{
+							{
+								Path: repoRoot + "/test/.env",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1"},
+		},
+		{
+			name: "parent path",
+			changePath: []string{
+				repoRoot + "/test/.env",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						EnvFiles: []types.EnvFile{
+							{
+								Path: repoRoot + "/test",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{"svc1"},
+		},
+		{
+			name: "different path",
+			changePath: []string{
+				repoRoot + "/test2/.env",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						EnvFiles: []types.EnvFile{
+							{
+								Path: repoRoot + "/test/.env",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+		{
+			name:       "Has no changes",
+			changePath: []string{},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name: "svc1",
+						EnvFiles: []types.EnvFile{
+							{
+								Path: repoRoot + "/",
+							},
+						},
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			changes, err := HasChangedEnvFiles(tc.changePath, tc.project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed env files: %v", err)
+			}
+
+			slices.Sort(changes)
+			slices.Sort(tc.ExpectedChanges)
+
+			if !reflect.DeepEqual(changes, tc.ExpectedChanges) {
+				t.Errorf("Expected changes %v, but got %v", tc.ExpectedChanges, changes)
+			}
+		})
+	}
+}
+
+func TestHasChangedBuildFiles(t *testing.T) {
+	t.Parallel()
+
+	const repoRoot = "/data/doco-cd/fake-repo-root"
+
+	project := &types.Project{
+		Services: map[string]types.ServiceConfig{
+			"svc1": {
+				Name: "svc1",
+				Build: &types.BuildConfig{
+					Context: repoRoot + "/context",
+					AdditionalContexts: types.Mapping{
+						"dir":  repoRoot + "/additionalCtx/dir",
+						"dir2": repoRoot + "/additionalCtx/dir2",
+					},
+					Dockerfile: repoRoot + "/Dockerfile",
+					Secrets: []types.ServiceSecretConfig{
+						{
+							Source: repoRoot + "/secret",
+						},
+					},
+				},
+			},
+		},
+	}
+	testCases := []struct {
+		name            string
+		changePath      []string
+		project         *types.Project
+		ExpectedChanges []string
+	}{
+		{
+			name: "no build",
+			changePath: []string{
+				repoRoot + "/test/.env",
+			},
+			project: &types.Project{
+				Services: map[string]types.ServiceConfig{
+					"svc1": {
+						Name:  "svc1",
+						Build: nil,
+					},
+				},
+			},
+			ExpectedChanges: []string{},
+		},
+		{
+			name:            "no change",
+			changePath:      []string{},
+			project:         project,
+			ExpectedChanges: []string{},
+		},
+		{
+			name: "context changed",
+			changePath: []string{
+				repoRoot + "/context",
+			},
+			project:         project,
+			ExpectedChanges: []string{"svc1"},
+		},
+		{
+			name: "different path",
+			changePath: []string{
+				repoRoot + "/context2",
+			},
+			project:         project,
+			ExpectedChanges: []string{},
+		},
+		{
+			name: "additional context changed",
+			changePath: []string{
+				repoRoot + "/additionalCtx/dir",
+			},
+			project:         project,
+			ExpectedChanges: []string{"svc1"},
+		},
+		{
+			name: "additional context sub dir changed",
+			changePath: []string{
+				repoRoot + "/additionalCtx/dir/aaa.txt",
+			},
+			project:         project,
+			ExpectedChanges: []string{"svc1"},
+		},
+		{
+			name: "dockerfile changed",
+			changePath: []string{
+				repoRoot + "/Dockerfile",
+			},
+			project:         project,
+			ExpectedChanges: []string{"svc1"},
+		},
+		{
+			name: "build secret changed",
+			changePath: []string{
+				repoRoot + "/secret",
+			},
+			project:         project,
+			ExpectedChanges: []string{"svc1"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			changes, err := HasChangedBuildFiles(tc.changePath, tc.project)
+			if err != nil {
+				t.Fatalf("Failed to check for changed env files: %v", err)
+			}
+
+			slices.Sort(changes)
+			slices.Sort(tc.ExpectedChanges)
+
+			if !reflect.DeepEqual(changes, tc.ExpectedChanges) {
+				t.Errorf("Expected changes %v, but got %v", tc.ExpectedChanges, changes)
+			}
+		})
+	}
+}
+
+func TestProjectFilesHaveChanges(t *testing.T) {
+	encryption.SetupAgeKeyEnvVar(t)
+
 	testCases := []struct {
 		name            string
 		oldCommit       string
 		newCommit       string
-		ExpectedChanges bool
+		expectedChanges []Change
 	}{
 		{
-			name:            "Has changes",
-			oldCommit:       "72f1a4e88fdeffec3241d6da2ee19757eee3a0fd",
-			newCommit:       "151642a5c4f1b16b543d06c60fa9c95e2c7704a2",
-			ExpectedChanges: true,
+			name:      "Changed dotenv in single service",
+			oldCommit: "1a62190db8ea6f700dbc6364ea94522c21c3642f",
+			newCommit: "268aa233f1dbac17cc521883f7e3755bc37f70c1",
+			expectedChanges: []Change{
+				{Type: "envFiles", Services: []string{"test"}},
+			},
 		},
 		{
-			name:            "Has no changes",
-			oldCommit:       "e4bd98139b81fd80938687edc7f9a1a001654e92",
-			newCommit:       "d47101db6f9a07b0d36a6245b257c3690782ae69",
-			ExpectedChanges: false,
+			name:      "Changed bind mount in single service",
+			oldCommit: "49913446ea803cb9ecaa441118e0b9ef48e77cc2",
+			newCommit: "1a62190db8ea6f700dbc6364ea94522c21c3642f",
+			expectedChanges: []Change{
+				{Type: "bindMounts", Services: []string{"test"}},
+			},
+		},
+		{
+			name:      "Changed secret in single service",
+			oldCommit: "b181a3a84af166639c8789bb6be15a6a5bdfe7af",
+			newCommit: "1dbfb46f4b3479a8986f1d46fc5d9948dcac2ede",
+			expectedChanges: []Change{
+				{Type: "secrets", Services: []string{"test"}},
+			},
+		},
+		{
+			name:      "Changed config in single service",
+			oldCommit: "f0582842c7526c1815a2f4aa46a88301567809bf",
+			newCommit: "204ef121cf41686515977e7bc9d33376661252d6",
+			expectedChanges: []Change{
+				{Type: "configs", Services: []string{"test"}},
+			},
+		},
+		{
+			name:            "Changes in Compose Project",
+			oldCommit:       "1dbfb46f4b3479a8986f1d46fc5d9948dcac2ede",
+			newCommit:       "c50cc1d8cbad3b6e6f2c058cf7a4898a6ba908e6",
+			expectedChanges: nil,
+		},
+		{
+			name:      "Changes in Secret and Bind Mount in single service",
+			oldCommit: "268aa233f1dbac17cc521883f7e3755bc37f70c1",
+			newCommit: "0eb919b35ff46af6efc02425588622adf448a4d4",
+			expectedChanges: []Change{
+				{Type: "secrets", Services: []string{"test"}},
+				{Type: "bindMounts", Services: []string{"test"}},
+			},
+		},
+		{
+			name:      "Changes in Bind Mount and Compose Project in Multiple Services",
+			oldCommit: "29993e4b57ab55a687f69c1cca945b6c8966806a",
+			newCommit: "5327b541f9917213b0b2ca4549f6314c78513bc7",
+			expectedChanges: []Change{
+				{Type: "bindMounts", Services: []string{"test"}},
+			},
+		},
+		{
+			name:      "Changes in Multiple Configs for Multiple Services",
+			oldCommit: "5519af2e6ca9ee6a6d751c09290387aa8e317386",
+			newCommit: "3af5b37a662eebb0ce2b9006ea69009f726b2789",
+			expectedChanges: []Change{
+				{Type: "configs", Services: []string{"included", "test"}},
+			},
 		},
 	}
 
@@ -550,9 +1160,7 @@ func TestHasChangedBindMounts(t *testing.T) {
 		t.Fatalf("Failed to get app config: %v", err)
 	}
 
-	url := cloneUrlTest
-
-	auth, err := git.GetAuthMethod(url, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken)
+	auth, err := git.GetAuthMethod(cloneUrlTest, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken)
 	if err != nil {
 		t.Fatalf("Failed to get auth method: %v", err)
 	}
@@ -565,36 +1173,45 @@ func TestHasChangedBindMounts(t *testing.T) {
 
 	tmpDir := t.TempDir()
 
-	repo, err := git.CloneRepository(tmpDir, url, git.MainBranch, c.SkipTLSVerification, c.HttpProxy, auth, c.GitCloneSubmodules)
+	repo, err := git.CloneRepository(tmpDir, cloneUrlTest, git.MainBranch, c.SkipTLSVerification, c.HttpProxy, auth, c.GitCloneSubmodules)
 	if err != nil {
 		t.Fatalf("Failed to clone repository: %v", err)
 	}
 
-	project, err := LoadCompose(t.Context(), tmpDir, test.ConvertTestName(t.Name()), []string{"docker-compose.yml"}, []string{".env"}, []string{}, map[string]string{})
-	if err != nil {
-		t.Fatalf("Failed to load compose file: %v", err)
-	}
-
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
+			err = git.CheckoutRepository(repo, tc.newCommit, auth, c.GitCloneSubmodules)
+			if err != nil {
+				t.Fatalf("Failed to checkout old commit: %v", err)
+			}
+
+			deployConfigs, err := config.GetDeployConfigs(tmpDir, ".", t.Name(), "", "")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			d := deployConfigs[0]
+			d.Name = test.ConvertTestName(t.Name())
 
 			changedFiles, err := git.GetChangedFilesBetweenCommits(repo, plumbing.NewHash(tc.oldCommit), plumbing.NewHash(tc.newCommit))
 			if err != nil {
 				t.Fatalf("Failed to get changed files: %v", err)
 			}
 
-			if tc.ExpectedChanges && len(changedFiles) == 0 {
-				t.Fatalf("Expectec changed files, but found none found")
-			}
-
-			hasChanged, err := HasChangedBindMounts(changedFiles, project)
+			project, err := LoadCompose(t.Context(), tmpDir, tmpDir, d.Name, d.ComposeFiles, d.EnvFiles, d.Profiles, map[string]string{})
 			if err != nil {
-				t.Fatalf("Failed to check for changed bind mounts: %v", err)
+				t.Fatalf("Failed to load compose file: %v", err)
 			}
 
-			if !hasChanged && tc.ExpectedChanges {
-				t.Error("Expected changed bind mounts, but found none")
+			changes, err := ProjectFilesHaveChanges(tmpDir, changedFiles, project)
+			if err != nil {
+				t.Fatalf("Failed to get project changes: %v", err)
+			}
+
+			sortChanges(tc.expectedChanges)
+
+			if !reflect.DeepEqual(changes, tc.expectedChanges) {
+				t.Fatalf("Expected changes: %v, but got: %v", tc.expectedChanges, changes)
 			}
 		})
 	}
@@ -703,6 +1320,10 @@ func TestInjectSecretsToProject(t *testing.T) {
 					return
 				}
 
+				if errors.Is(err, bitwardensecretsmanager.ErrNotSupported) {
+					t.Skip(err.Error())
+				}
+
 				t.Fatalf("failed to initialize secret provider: %s", err.Error())
 
 				return
@@ -728,7 +1349,7 @@ func TestInjectSecretsToProject(t *testing.T) {
 
 			t.Log("Resolved secrets:", resolvedSecrets)
 
-			project, err := LoadCompose(ctx, tmpDir, test.ConvertTestName(t.Name()), []string{filePath}, []string{".env"}, []string{}, resolvedSecrets)
+			project, err := LoadCompose(ctx, tmpDir, tmpDir, test.ConvertTestName(t.Name()), []string{filePath}, []string{".env"}, []string{}, resolvedSecrets)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -947,262 +1568,118 @@ func TestGetProjects(t *testing.T) {
 	t.Logf("Found %d projects", len(projects))
 }
 
-func TestGetIncludeFilesFromYaml(t *testing.T) {
-	t.Parallel()
+func Test_checkPathAffected(t *testing.T) {
+	const repoRoot = "/data/reporoot"
 
-	testCases := []struct {
-		name          string
-		composeYAML   string
-		expectedFiles []string
+	tests := []struct {
+		name    string
+		used    string
+		changed string
+		want    bool
 	}{
 		{
-			name: "Simple list of includes",
-			composeYAML: `
-include:
-  - base.compose.yml
-  - common.compose.yml
-`,
-			expectedFiles: []string{
-				"base.compose.yml",
-				"common.compose.yml",
-			},
+			name:    "used end with /",
+			used:    repoRoot + "/a/b/",
+			changed: repoRoot + "/a/b/c.txt",
+			want:    true,
 		},
 		{
-			name: "Complex list with path overrides",
-			composeYAML: `
-include:
-  - base.compose.yml
-  - path:
-      - third-party/compose.yaml
-      - override.yaml
-`,
-			expectedFiles: []string{
-				"base.compose.yml",
-				"third-party/compose.yaml",
-				"override.yaml",
-			},
+			name:    "used not end with /",
+			used:    repoRoot + "/a/b",
+			changed: repoRoot + "/a/b/c.txt",
+			want:    true,
 		},
 		{
-			name: "Mixed simple and complex includes",
-			composeYAML: `
-include:
-  - base.compose.yml
-  - path:
-      - third-party/compose.yaml
-      - override.yaml
-  - another.compose.yml
-`,
-			expectedFiles: []string{
-				"base.compose.yml",
-				"third-party/compose.yaml",
-				"override.yaml",
-				"another.compose.yml",
-			},
+			name:    "used are prefix of changed",
+			used:    repoRoot + "/a/b",
+			changed: repoRoot + "/a/b2",
+			want:    false,
 		},
 		{
-			name: "Single path in object form",
-			composeYAML: `
-include:
-  - path: single.compose.yml
-`,
-			expectedFiles: []string{
-				"single.compose.yml",
-			},
+			name:    "used are prefix of changed and subdir",
+			used:    repoRoot + "/a/b",
+			changed: repoRoot + "/a/b2/c/d/e.txt",
+			want:    false,
 		},
 		{
-			name:          "No includes",
-			composeYAML:   `services: {}`,
-			expectedFiles: []string{},
+			name:    "used are prefix of changed but end with /",
+			used:    repoRoot + "/a/b/",
+			changed: repoRoot + "/a/b2",
+			want:    false,
+		},
+		{
+			name:    "different path /",
+			used:    repoRoot + "/a/b/",
+			changed: repoRoot + "/c/d",
+			want:    false,
+		},
+		{
+			name:    "different path but same suffix",
+			used:    repoRoot + "/a/b/e/f/g.txt",
+			changed: repoRoot + "/c/d/e/f/g.txt",
+			want:    false,
+		},
+		{
+			name:    "file same path",
+			used:    repoRoot + "/test.txt",
+			changed: repoRoot + "/test.txt",
+			want:    true,
+		},
+		{
+			name:    "directory used",
+			used:    repoRoot + "/html",
+			changed: repoRoot + "/html/index.html",
+			want:    true,
+		},
+		{
+			name:    "different path",
+			used:    repoRoot + "/html",
+			changed: repoRoot + "/configs/test.conf",
+			want:    false,
+		},
+		{
+			name:    "different path 2",
+			used:    repoRoot + "/html",
+			changed: repoRoot + "README.md",
+			want:    false,
+		},
+
+		{
+			name:    "used in subdirectory",
+			used:    repoRoot + "/app/html",
+			changed: repoRoot + "/app/html/index.html",
+			want:    true,
+		},
+		{
+			name:    "used in subdirectory 2",
+			used:    repoRoot + "/app/html",
+			changed: repoRoot + "/app/configs/test.conf",
+			want:    false,
+		},
+		{
+			name:    "no changes in directories",
+			used:    repoRoot + "/html",
+			changed: repoRoot + "/docs/guide.md",
+			want:    false,
+		},
+		{
+			name:    "no changes in directories 2",
+			used:    repoRoot + "/html",
+			changed: repoRoot + "/configs/test.conf",
+			want:    false,
+		},
+		{
+			name:    "no changes in files",
+			used:    repoRoot + "/test.txt",
+			changed: repoRoot + "/README.md",
+			want:    false,
 		},
 	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			dir := t.TempDir()
-
-			// Create the referenced files so paths can be resolved
-			for _, name := range tc.expectedFiles {
-				full := filepath.Join(dir, name)
-
-				err := os.MkdirAll(filepath.Dir(full), 0o755)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				err = os.WriteFile(full, []byte{}, 0o600)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			composeFile := filepath.Join(dir, "compose.yaml")
-
-			err := os.WriteFile(composeFile, []byte(tc.composeYAML), 0o600)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			got, err := getIncludeFilesFromYaml([]string{composeFile}, dir)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			want := make([]string, 0, len(tc.expectedFiles))
-			for _, f := range tc.expectedFiles {
-				want = append(want, filepath.Join(dir, f))
-			}
-
-			slices.Sort(got)
-			slices.Sort(want)
-
-			if len(got) != len(want) {
-				t.Fatalf("expected %d files, got %d: %v", len(want), len(got), got)
-			}
-
-			for i := range want {
-				if got[i] != want[i] {
-					t.Errorf("expected file %q, got %q", want[i], got[i])
-				}
-			}
-		})
-	}
-}
-
-func TestGetExtendsFilesFromYaml(t *testing.T) {
-	t.Parallel()
-
-	testCases := []struct {
-		name          string
-		files         map[string]string
-		composeFiles  []string
-		expectedFiles []string
-	}{
-		{
-			name: "Single extends",
-			files: map[string]string{
-				"compose.yaml": `
-services:
-  app:
-    extends:
-      file: base.compose.yml
-      service: base
-`,
-			},
-			composeFiles:  []string{"compose.yaml"},
-			expectedFiles: []string{"base.compose.yml"},
-		},
-		{
-			name: "Multiple services extends",
-			files: map[string]string{
-				"compose.yaml": `
-services:
-  app:
-    extends:
-      file: base.compose.yml
-      service: base
-  worker:
-    extends:
-      file: worker.compose.yml
-      service: worker
-  plain:
-    image: alpine
-`,
-			},
-			composeFiles:  []string{"compose.yaml"},
-			expectedFiles: []string{"base.compose.yml", "worker.compose.yml"},
-		},
-		{
-			name: "Multiple compose files in subdir",
-			files: map[string]string{
-				"compose.yaml": `
-services:
-  app:
-    extends:
-      file: base.yml
-      service: base
-`,
-				"stack/compose.yaml": `
-services:
-  api:
-    extends:
-      file: third/compose.yaml
-      service: api
-`,
-			},
-			composeFiles:  []string{"compose.yaml", "stack/compose.yaml"},
-			expectedFiles: []string{"base.yml", "stack/third/compose.yaml"},
-		},
-		{
-			name: "No extends",
-			files: map[string]string{
-				"compose.yaml": `
-services:
-  app:
-    image: alpine
-`,
-			},
-			composeFiles:  []string{"compose.yaml"},
-			expectedFiles: []string{},
-		},
-		{
-			name: "Non-existent compose file is skipped",
-			files: map[string]string{
-				"compose.yaml": `
-services:
-  app:
-    extends:
-      file: base.yml
-      service: base
-`,
-			},
-			composeFiles:  []string{"nonexistent.yaml", "compose.yaml"},
-			expectedFiles: []string{"base.yml"},
-		},
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			dir := t.TempDir()
-
-			for rel, content := range tc.files {
-				full := filepath.Join(dir, rel)
-
-				err := os.MkdirAll(filepath.Dir(full), 0o755)
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				err = os.WriteFile(full, []byte(content), 0o600)
-				if err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			got, err := getExtendsFilesFromYaml(tc.composeFiles, dir)
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			want := make([]string, 0, len(tc.expectedFiles))
-			for _, f := range tc.expectedFiles {
-				want = append(want, filepath.Join(dir, f))
-			}
-
-			slices.Sort(got)
-			slices.Sort(want)
-
-			if len(got) != len(want) {
-				t.Fatalf("expected %d files, got %d: %v", len(want), len(got), got)
-			}
-
-			for i := range want {
-				if got[i] != want[i] {
-					t.Errorf("expected file %q, got %q", want[i], got[i])
-				}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := checkPathAffected(tt.changed, tt.used)
+			if tt.want != got {
+				t.Errorf("checkPathAffected(used=%q, changed=%q) = %v, want %v", tt.used, tt.changed, got, tt.want)
 			}
 		})
 	}
