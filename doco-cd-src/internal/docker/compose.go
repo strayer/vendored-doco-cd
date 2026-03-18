@@ -15,10 +15,10 @@ import (
 	"strings"
 	"time"
 
-	"go.yaml.in/yaml/v3"
+	"github.com/kimdre/doco-cd/internal/encryption"
+	"github.com/kimdre/doco-cd/internal/utils/module"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
-	"github.com/kimdre/doco-cd/internal/secretprovider"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 	"github.com/kimdre/doco-cd/internal/utils/set"
 	"github.com/kimdre/doco-cd/internal/utils/slice"
@@ -37,7 +37,6 @@ import (
 	"github.com/docker/compose/v5/pkg/compose"
 
 	"github.com/kimdre/doco-cd/internal/config"
-	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/prometheus"
 	"github.com/kimdre/doco-cd/internal/webhook"
@@ -52,6 +51,19 @@ var (
 	ErrIsInUse            = errors.New("is in use")
 	ComposeVersion        string // Version of the docker compose module, will be set at runtime
 )
+
+func init() {
+	version, err := module.GetVersion("github.com/docker/compose/v5")
+	if err != nil {
+		if errors.Is(err, module.ErrNotFound) {
+			ComposeVersion = "unknown"
+		} else {
+			panic(fmt.Sprintf("failed to get module version: %v", err))
+		}
+	}
+
+	ComposeVersion = version
+}
 
 func CreateDockerCli(quiet, verifyTLS bool) (command.Cli, error) {
 	var (
@@ -90,7 +102,9 @@ addComposeServiceLabels adds the labels docker compose expects to exist on servi
 This is required for future compose operations to work, such as finding
 containers that are part of a service.
 */
-func addComposeServiceLabels(project *types.Project, deployConfig config.DeployConfig, payload webhook.ParsedPayload, repoDir, appVersion, timestamp, composeVersion, latestCommit, secretHash string) {
+func addComposeServiceLabels(project *types.Project, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+	workingDir, appVersion, timestamp, composeVersion, latestCommit, projectHash string,
+) {
 	for i, s := range project.Services {
 		// Extract service dependencies (depends_on)
 		dependencies := make([]string, 0, len(s.DependsOn))
@@ -101,54 +115,59 @@ func addComposeServiceLabels(project *types.Project, deployConfig config.DeployC
 		}
 
 		s.CustomLabels = map[string]string{
-			DocoCDLabels.Metadata.Manager:               config.AppName,
-			DocoCDLabels.Metadata.Version:               appVersion,
-			DocoCDLabels.Deployment.Name:                deployConfig.Name,
-			DocoCDLabels.Deployment.Timestamp:           timestamp,
-			DocoCDLabels.Deployment.WorkingDir:          repoDir,
-			DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
-			DocoCDLabels.Deployment.CommitSHA:           latestCommit,
-			DocoCDLabels.Deployment.TargetRef:           deployConfig.Reference,
-			DocoCDLabels.Deployment.ConfigHash:          deployConfig.Internal.Hash,
-			DocoCDLabels.Deployment.ExternalSecretsHash: secretHash,
-			DocoCDLabels.Deployment.AutoDiscover:        strconv.FormatBool(deployConfig.AutoDiscover),
-			DocoCDLabels.Deployment.AutoDiscoverDelete:  strconv.FormatBool(deployConfig.AutoDiscoverOpts.Delete),
-			DocoCDLabels.Repository.Name:                payload.FullName,
-			DocoCDLabels.Repository.URL:                 payload.WebURL,
-			api.ProjectLabel:                            project.Name,
-			api.ServiceLabel:                            s.Name,
-			api.WorkingDirLabel:                         project.WorkingDir,
-			api.ConfigFilesLabel:                        strings.Join(project.ComposeFiles, ","),
-			api.VersionLabel:                            composeVersion,
-			api.OneoffLabel:                             "False", // default, will be overridden by docker compose
-			api.DependenciesLabel:                       strings.Join(dependencies, ","),
+			DocoCDLabels.Metadata.Manager:              config.AppName,
+			DocoCDLabels.Metadata.Version:              appVersion,
+			DocoCDLabels.Deployment.Name:               deployConfig.Name,
+			DocoCDLabels.Deployment.Timestamp:          timestamp,
+			DocoCDLabels.Deployment.ComposeHash:        projectHash,
+			DocoCDLabels.Deployment.WorkingDir:         workingDir,
+			DocoCDLabels.Deployment.Trigger:            payload.CommitSHA,
+			DocoCDLabels.Deployment.CommitSHA:          latestCommit,
+			DocoCDLabels.Deployment.TargetRef:          deployConfig.Reference,
+			DocoCDLabels.Deployment.ConfigHash:         deployConfig.Internal.Hash,
+			DocoCDLabels.Deployment.AutoDiscover:       strconv.FormatBool(deployConfig.AutoDiscover),
+			DocoCDLabels.Deployment.AutoDiscoverDelete: strconv.FormatBool(deployConfig.AutoDiscoverOpts.Delete),
+			DocoCDLabels.Repository.Name:               payload.FullName,
+			DocoCDLabels.Repository.URL:                payload.WebURL,
+			api.ProjectLabel:                           project.Name,
+			api.ServiceLabel:                           s.Name,
+			api.WorkingDirLabel:                        project.WorkingDir,
+			api.ConfigFilesLabel:                       strings.Join(project.ComposeFiles, ","),
+			api.VersionLabel:                           composeVersion,
+			api.OneoffLabel:                            "False", // default, will be overridden by docker compose
+			api.DependenciesLabel:                      strings.Join(dependencies, ","),
 		}
 		project.Services[i] = s
 	}
 }
 
-func addComposeVolumeLabels(project *types.Project, deployConfig config.DeployConfig, payload webhook.ParsedPayload, appVersion, timestamp, composeVersion, latestCommit string) {
+func addComposeVolumeLabels(project *types.Project, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+	appVersion, timestamp, composeVersion, latestCommit, projectHash string,
+) {
 	for i, v := range project.Volumes {
 		v.CustomLabels = map[string]string{
-			DocoCDLabels.Metadata.Manager:     config.AppName,
-			DocoCDLabels.Metadata.Version:     appVersion,
-			DocoCDLabels.Deployment.Name:      deployConfig.Name,
-			DocoCDLabels.Deployment.Timestamp: timestamp,
-			DocoCDLabels.Deployment.Trigger:   payload.CommitSHA,
-			DocoCDLabels.Deployment.TargetRef: deployConfig.Reference,
-			DocoCDLabels.Deployment.CommitSHA: latestCommit,
-			DocoCDLabels.Repository.Name:      payload.FullName,
-			DocoCDLabels.Repository.URL:       payload.WebURL,
-			api.ProjectLabel:                  project.Name,
-			api.VolumeLabel:                   v.Name,
-			api.VersionLabel:                  composeVersion,
+			DocoCDLabels.Metadata.Manager:       config.AppName,
+			DocoCDLabels.Metadata.Version:       appVersion,
+			DocoCDLabels.Deployment.Name:        deployConfig.Name,
+			DocoCDLabels.Deployment.Timestamp:   timestamp,
+			DocoCDLabels.Deployment.ComposeHash: projectHash,
+			DocoCDLabels.Deployment.Trigger:     payload.CommitSHA,
+			DocoCDLabels.Deployment.TargetRef:   deployConfig.Reference,
+			DocoCDLabels.Deployment.CommitSHA:   latestCommit,
+			DocoCDLabels.Repository.Name:        payload.FullName,
+			DocoCDLabels.Repository.URL:         payload.WebURL,
+			api.ProjectLabel:                    project.Name,
+			api.VolumeLabel:                     v.Name,
+			api.VersionLabel:                    composeVersion,
 		}
 		project.Volumes[i] = v
 	}
 }
 
 // LoadCompose parses and loads Compose files as specified by the Docker Compose specification.
-func LoadCompose(ctx context.Context, workingDir, projectName string, composeFiles, envFiles, profiles []string, environment map[string]string) (*types.Project, error) {
+func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, composeFiles,
+	envFiles, profiles []string, environment map[string]string,
+) (*types.Project, error) {
 	// Resolve compose file paths to absolute paths relative to workingDir.
 	// This is necessary because the compose-go library's LoadConfigFiles internally
 	// uses filepath.Abs which resolves relative paths against os.Getwd(), not against
@@ -160,13 +179,26 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 		return nil, fmt.Errorf("failed to get app config: %w", err)
 	}
 
-	absoluteComposeFiles := make([]string, len(composeFiles))
-	for i, f := range composeFiles {
-		if filepath.IsAbs(f) {
-			absoluteComposeFiles[i] = f
-		} else {
-			absoluteComposeFiles[i] = filepath.Join(workingDir, f)
+	var absComposeFiles []string
+
+	// If the user changed the default compose files, we throw an error of the custom compose file is not found
+	throwError := !reflect.DeepEqual(composeFiles, cli.DefaultFileNames)
+
+	for _, f := range composeFiles {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(workingDir, f)
 		}
+
+		// Check if file exists
+		if _, err = os.Stat(f); err != nil {
+			if throwError {
+				return nil, fmt.Errorf("could not find compose file: %w", err)
+			}
+
+			continue
+		}
+
+		absComposeFiles = append(absComposeFiles, f)
 	}
 
 	// if envFiles only contains ".env", we check if the file exists in the working directory
@@ -176,26 +208,47 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 		}
 	}
 
-	absoluteEnvFiles := make([]string, 0, len(envFiles))
+	absEnvFiles := make([]string, 0, len(envFiles))
 	for _, f := range envFiles {
 		if filepath.IsAbs(f) {
-			absoluteEnvFiles = append(absoluteEnvFiles, f)
+			absEnvFiles = append(absEnvFiles, f)
 		} else {
-			absoluteEnvFiles = append(absoluteEnvFiles, filepath.Join(workingDir, f))
+			absEnvFiles = append(absEnvFiles, filepath.Join(workingDir, f))
+		}
+	}
+
+	var decryptedFiles []string
+
+	decryptFiles := slices.Concat(absComposeFiles, absEnvFiles)
+	for _, file := range decryptFiles {
+		decrypted, err := encryption.DecryptFileInPlace(file, repoPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decrypt file %s: %w", file, err)
+		}
+
+		if decrypted {
+			decryptedFiles = append(decryptedFiles, file)
 		}
 	}
 
 	options, err := cli.NewProjectOptions(
-		absoluteComposeFiles,
+		absComposeFiles,
 		cli.WithName(projectName),
 		cli.WithWorkingDirectory(workingDir),
 		cli.WithInterpolation(true),
 		cli.WithResolvedPaths(true),
-		cli.WithEnvFiles(absoluteEnvFiles...), // env files for variable interpolation
+		cli.WithEnvFiles(absEnvFiles...), // env files for variable interpolation
 		cli.WithProfiles(profiles),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project options: %w", err)
+	}
+
+	if len(composeFiles) == 0 {
+		err = cli.WithDefaultConfigPath(options)
+		if err != nil {
+			return nil, fmt.Errorf("failed to use default compose file: %w", err)
+		}
 	}
 
 	if c.PassEnv {
@@ -215,7 +268,25 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 		return nil, fmt.Errorf("failed to get .env file for interpolation: %w", err)
 	}
 
+	// Preload project for decrypting project-related files
 	project, err := options.LoadProject(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load compose project: %w", err)
+	}
+
+	// Decrypt any project-related files
+	files, err := DecryptProjectFiles(repoPath, project)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt project files: %w", err)
+	}
+
+	decryptedFiles = append(decryptedFiles, files...)
+	if len(decryptedFiles) > 0 {
+		slog.Debug("decrypted SOPS-encrypted files", slog.String("stack", project.Name), slog.Any("files", decryptedFiles))
+	}
+
+	// Reload project after decryption to ensure all decrypted values are properly loaded into the project.
+	project, err = options.LoadProject(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load compose project: %w", err)
 	}
@@ -230,8 +301,7 @@ func LoadCompose(ctx context.Context, workingDir, projectName string, composeFil
 
 // deployCompose deploys a project as specified by the Docker Compose specification (LoadCompose).
 func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Project,
-	deployConfig *config.DeployConfig, payload webhook.ParsedPayload,
-	repoDir, latestCommit, appVersion, secretHash string,
+	deployConfig *config.DeployConfig, recreateMode string, services []string,
 ) error {
 	var (
 		err          error
@@ -244,29 +314,12 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 		return err
 	}
 
-	timestamp := time.Now().UTC().Format(time.RFC3339)
-
-	if ComposeVersion == "" {
-		ComposeVersion, err = GetModuleVersion("github.com/docker/compose/v5")
-		if err != nil {
-			if errors.Is(err, ErrModuleNotFound) {
-				// Placeholder for when the module is not found
-				ComposeVersion = "unknown"
-			} else {
-				return fmt.Errorf("failed to get module version: %w", err)
-			}
-		}
-	}
-
 	if deployConfig.PruneImages {
 		beforeImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
 		if err != nil {
 			return fmt.Errorf("failed to get existing images: %w", err)
 		}
 	}
-
-	addComposeServiceLabels(project, *deployConfig, payload, repoDir, appVersion, timestamp, ComposeVersion, latestCommit, secretHash)
-	addComposeVolumeLabels(project, *deployConfig, payload, appVersion, timestamp, ComposeVersion, latestCommit)
 
 	if deployConfig.ForceImagePull {
 		for i, s := range project.Services {
@@ -282,9 +335,8 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 		}
 	}
 
-	recreateType := api.RecreateDiverged
-	if deployConfig.ForceRecreate {
-		recreateType = api.RecreateForce
+	if recreateMode == "" {
+		recreateMode = api.RecreateDiverged
 	}
 
 	// Convert deployConfig.BuildOpts.Args to types.MappingWithEquals
@@ -307,9 +359,10 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	}
 
 	createOpts := api.CreateOptions{
+		Services:             services,
 		RemoveOrphans:        deployConfig.RemoveOrphans,
-		Recreate:             recreateType,
-		RecreateDependencies: recreateType,
+		Recreate:             recreateMode,
+		RecreateDependencies: api.RecreateDiverged,
 		QuietPull:            true,
 	}
 
@@ -362,80 +415,26 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 
 // DeployStack deploys the stack using the provided deployment configuration.
 func DeployStack(
-	jobLog *slog.Logger, internalRepoPath, externalRepoPath string, ctx *context.Context,
+	jobLog *slog.Logger, externalRepoPath string, ctx *context.Context,
 	dockerCli *command.Cli, dockerClient *client.Client, payload *webhook.ParsedPayload, deployConfig *config.DeployConfig,
-	changedFiles []gitInternal.ChangedFile, latestCommit, appVersion, triggerEvent string, forceDeploy bool,
-	resolvedSecrets secrettypes.ResolvedSecrets, secretsChanged bool,
+	changedFiles []gitInternal.ChangedFile, latestCommit, appVersion string, forceDeploy bool,
+	resolvedSecrets secrettypes.ResolvedSecrets,
 ) error {
 	startTime := time.Now()
 
 	stackLog := jobLog.
 		With(slog.String("stack", deployConfig.Name))
 
-	// Validate and sanitize the working directory
-	if strings.Contains(deployConfig.WorkingDirectory, "..") {
-		errMsg := "invalid working directory: potential path traversal detected"
-		jobLog.Error(errMsg, slog.String("working_directory", deployConfig.WorkingDirectory))
-
-		return fmt.Errorf("%s: %w", errMsg, errors.New("validation error"))
-	}
-
-	// Path inside the container
-	internalWorkingDir := path.Join(internalRepoPath, deployConfig.WorkingDirectory)
-
-	internalWorkingDir, err := filepath.Abs(internalWorkingDir)
-	if err != nil || !strings.HasPrefix(internalWorkingDir, internalRepoPath) {
-		errMsg := "invalid working directory: resolved path is outside the allowed base directory"
-		jobLog.Error(errMsg, slog.String("resolved_path", internalWorkingDir))
-
-		return fmt.Errorf("%s", errMsg)
-	}
-
 	// Path on the host
 	externalWorkingDir := path.Join(externalRepoPath, deployConfig.WorkingDirectory)
 
-	externalWorkingDir, err = filepath.Abs(externalWorkingDir)
+	externalWorkingDir, err := filepath.Abs(externalWorkingDir)
 	if err != nil || !strings.HasPrefix(externalWorkingDir, externalRepoPath) {
 		errMsg := "invalid working directory: resolved path is outside the allowed base directory"
 		jobLog.Error(errMsg, slog.String("resolved_path", externalWorkingDir))
 
 		return fmt.Errorf("%s", errMsg)
 	}
-
-	// Check if the default compose files are used
-	if reflect.DeepEqual(deployConfig.ComposeFiles, cli.DefaultFileNames) {
-		var tmpComposeFiles []string
-
-		jobLog.Debug("checking for default compose files")
-
-		// Check if the default compose files exist
-		for _, f := range deployConfig.ComposeFiles {
-			if _, err = os.Stat(path.Join(internalWorkingDir, f)); errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-
-			tmpComposeFiles = append(tmpComposeFiles, f)
-		}
-
-		if len(tmpComposeFiles) == 0 {
-			errMsg := "no compose files found"
-			return fmt.Errorf("%s: %w", errMsg, err)
-		}
-
-		deployConfig.ComposeFiles = tmpComposeFiles
-	}
-
-	// Check if files in the working directory are SOPS encrypted and decrypt them if necessary
-	f, err := encryption.DecryptFilesInDirectory(internalRepoPath, internalWorkingDir)
-	if err != nil {
-		return fmt.Errorf("file decryption failed: %w", err)
-	}
-
-	if len(f) > 0 {
-		stackLog.Debug("decrypted SOPS-encrypted files", slog.Any("files", f))
-	}
-
-	secretHash := secretprovider.Hash(resolvedSecrets)
 
 	// Create a temporary env file if environment variables are specified in the deployment config
 	if deployConfig.Internal.Environment != nil {
@@ -454,10 +453,9 @@ func DeployStack(
 		}(tmpEnvFile)
 	}
 
-	project, err := LoadCompose(*ctx, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles, deployConfig.EnvFiles, deployConfig.Profiles, resolvedSecrets)
+	project, err := LoadCompose(*ctx, externalRepoPath, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles, deployConfig.EnvFiles, deployConfig.Profiles, resolvedSecrets)
 	if err != nil {
-		errMsg := "failed to load compose config"
-		return fmt.Errorf("%s: %w", errMsg, err)
+		return fmt.Errorf("failed to load compose config: %w", err)
 	}
 
 	done := make(chan struct{})
@@ -477,11 +475,30 @@ func DeployStack(
 		}
 	}()
 
+	timestamp := time.Now().UTC().Format(time.RFC3339)
+
+	// Generate project hash with doco-cd labels
+	// We don't want to compare the hashes with these labels
+	projectHash, err := ProjectHash(project)
+	if err != nil {
+		return fmt.Errorf("failed to generate project hash: %w", err)
+	}
+
 	// When SwarmModeEnabled is true, we deploy the stack using Docker Swarm.
 	if swarm.ModeEnabled {
 		stackLog.Info("deploying swarm stack")
 
-		err = DeploySwarmStack(*ctx, *dockerCli, project, deployConfig, *payload, externalWorkingDir, latestCommit, appVersion, secretHash, resolvedSecrets)
+		cfg, opts, err := LoadSwarmStack(dockerCli, project, deployConfig, resolvedSecrets, externalWorkingDir)
+		if err != nil {
+			return fmt.Errorf("failed to load swarm stack: %w", err)
+		}
+
+		addSwarmServiceLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit, projectHash)
+		addSwarmVolumeLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
+		addSwarmConfigLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
+		addSwarmSecretLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
+
+		err = DeploySwarmStack(*ctx, *dockerCli, cfg, opts)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
 
@@ -521,44 +538,39 @@ func DeployStack(
 			}
 		}
 	} else {
-		detectedChanges, err := ProjectFilesHaveChanges(changedFiles, project)
+		detectedChanges, err := ProjectFilesHaveChanges(externalRepoPath, changedFiles, project)
 		if err != nil {
 			errMsg := "failed to check for changed project files"
 			return fmt.Errorf("%s: %w", errMsg, err)
 		}
 
-		hasChangedCompose, err := HasChangedComposeFiles(changedFiles, project)
-		if err != nil {
-			errMsg := "failed to check for changed compose files"
-			return fmt.Errorf("%s: %w", errMsg, err)
-		}
+		addComposeServiceLabels(project, deployConfig, payload, externalWorkingDir, appVersion, timestamp, ComposeVersion, latestCommit, projectHash)
+		addComposeVolumeLabels(project, deployConfig, payload, appVersion, timestamp, ComposeVersion, latestCommit, projectHash)
+
+		forcedServices := set.New[string]() // services to recreate if project files changed
+		recreateMode := api.RecreateDiverged
 
 		switch {
 		case forceDeploy:
-			deployConfig.ForceRecreate = true
+			recreateMode = api.RecreateForce
 
 			stackLog.Debug("force deploy enabled, forcing recreate of all services")
-		case secretsChanged:
-			deployConfig.ForceRecreate = true
+		case len(detectedChanges) > 0:
+			recreateMode = api.RecreateForce
 
-			stackLog.Debug("changed external secrets detected, forcing recreate of all services")
-		case len(detectedChanges) > 0 || (hasChangedCompose && triggerEvent == "poll"):
-			deployConfig.ForceRecreate = true
+			for _, change := range detectedChanges {
+				forcedServices.Add(change.Services...)
+			}
 
-			stackLog.Debug("changed project files detected, forcing recreate of all services", slog.Any("changed_files", detectedChanges))
-		case hasChangedCompose:
-			stackLog.Debug("changed compose files detected, continue normal deployment")
+			stackLog.Debug("changed project files detected, forcing recreate", slog.Any("changes", detectedChanges))
 		}
 
-		stackLog.Info("deploying stack", slog.Bool("forced", deployConfig.ForceRecreate))
+		stackLog.Info("deploying stack", slog.Group("recreate", slog.String("mode", recreateMode), slog.Any("forced_services", forcedServices.ToSlice())))
 
-		err = deployCompose(*ctx, *dockerCli, project, deployConfig, *payload, externalWorkingDir, latestCommit, appVersion, secretHash)
+		err = deployCompose(*ctx, *dockerCli, project, deployConfig, recreateMode, forcedServices.ToSlice())
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
-
-			errMsg := "failed to deploy stack"
-
-			return fmt.Errorf("%s: %w", errMsg, err)
+			return fmt.Errorf("failed to deploy stack: %w", err)
 		}
 	}
 
@@ -611,10 +623,10 @@ func DestroyStack(
 	return nil
 }
 
-func getAbsolutePaths(changedFiles []gitInternal.ChangedFile, repoRoot string) []string {
+func getPaths(changedFiles []gitInternal.ChangedFile, basePath string) []string {
 	var absPaths []string
 
-	repoRoot = filepath.Clean(repoRoot)
+	basePath = filepath.Clean(basePath)
 
 	for _, f := range changedFiles {
 		checkPaths := []diff.File{f.From, f.To}
@@ -627,495 +639,243 @@ func getAbsolutePaths(changedFiles []gitInternal.ChangedFile, repoRoot string) [
 			p := filepath.Clean(checkPath.Path())
 
 			if !filepath.IsAbs(p) {
-				p = filepath.Join(repoRoot, p)
+				p = filepath.Join(basePath, p)
 			}
 
-			if !slices.Contains(absPaths, p) {
-				absPaths = append(absPaths, p)
-			}
+			absPaths = append(absPaths, p)
 		}
 	}
 
-	return absPaths
+	return slice.Unique(absPaths)
+}
+
+// checkPathAffected checks if a changed file is affected by a used file.
+func checkPathAffected(changed string, used string) bool {
+	used = filepath.Clean(used)
+	changed = filepath.Clean(changed)
+
+	rel, err := filepath.Rel(used, changed)
+	if err != nil {
+		// It' share same reporoot, so it should not happen
+		slog.Debug("checkPathAffected ",
+			slog.String("used", used),
+			slog.String("changed", changed),
+			slog.Any("error", err),
+		)
+
+		return false
+	}
+
+	return !strings.HasPrefix(rel, "..")
 }
 
 // HasChangedConfigs checks if any files used in docker compose `configs:` definitions have changed using the Git status.
-func HasChangedConfigs(changedFiles []gitInternal.ChangedFile, project *types.Project) (bool, error) {
-	paths := getAbsolutePaths(changedFiles, project.WorkingDir)
+func HasChangedConfigs(paths []string, project *types.Project) ([]string, error) {
+	configToServicesMap := make(map[string][]string)
 
-	for _, c := range project.Configs {
-		configPath := c.File
-		if configPath == "" {
+	for name, s := range project.Services {
+		for _, cfg := range s.Configs {
+			configToServicesMap[cfg.Source] = append(configToServicesMap[cfg.Source], name)
+		}
+	}
+
+	var changedServices []string
+
+	for name, c := range project.Configs {
+		// Changes in config.Content are handled in project hash comparison
+		if c.File == "" {
 			continue
 		}
 
-		if !path.IsAbs(configPath) {
-			configPath = filepath.Join(project.WorkingDir, configPath)
-		}
-
 		for _, p := range paths {
-			if p == configPath {
-				return true, nil
+			if checkPathAffected(p, c.File) {
+				changedServices = append(changedServices, configToServicesMap[name]...)
 			}
 		}
 	}
 
-	return false, nil
+	return slice.Unique(changedServices), nil
 }
 
 // HasChangedSecrets checks if any files used in docker compose `secrets:` definitions have changed using the Git status.
-func HasChangedSecrets(changedFiles []gitInternal.ChangedFile, project *types.Project) (bool, error) {
-	paths := getAbsolutePaths(changedFiles, project.WorkingDir)
+func HasChangedSecrets(paths []string, project *types.Project) ([]string, error) {
+	secretsToServicesMap := make(map[string][]string)
 
-	for _, s := range project.Secrets {
-		secretPath := s.File
-		if secretPath == "" {
+	for name, s := range project.Services {
+		for _, secret := range s.Secrets {
+			secretsToServicesMap[secret.Source] = append(secretsToServicesMap[secret.Source], name)
+		}
+	}
+
+	var changedServices []string
+
+	for name, s := range project.Secrets {
+		if s.File == "" {
 			continue
 		}
 
-		if !path.IsAbs(secretPath) {
-			secretPath = filepath.Join(project.WorkingDir, secretPath)
-		}
-
 		for _, p := range paths {
-			if p == secretPath {
-				return true, nil
+			if checkPathAffected(p, s.File) {
+				changedServices = append(changedServices, secretsToServicesMap[name]...)
 			}
 		}
 	}
 
-	return false, nil
+	return slice.Unique(changedServices), nil
 }
 
 // HasChangedBindMounts checks if any files used in docker compose `volumes:` definitions with type `bind` have changed using the Git status.
-func HasChangedBindMounts(changedFiles []gitInternal.ChangedFile, project *types.Project) (bool, error) {
-	paths := getAbsolutePaths(changedFiles, project.WorkingDir)
+func HasChangedBindMounts(paths []string, project *types.Project) ([]string, error) {
+	var changedServices []string
 
 	for _, s := range project.Services {
+	out:
 		for _, v := range s.Volumes {
 			if v.Type == "bind" && v.Source != "" {
 				for _, p := range paths {
-					info, err := os.Stat(p)
-					if err != nil {
-						if errors.Is(err, os.ErrNotExist) {
-							continue
-						}
-
-						return false, fmt.Errorf("failed to stat bind mount source %s: %w", p, err)
-					}
-
-					// Redeployment is not needed if the bind mount source is a directory
-					if info.IsDir() {
-						return false, nil
-					}
-
-					if strings.HasPrefix(p, v.Source) {
-						return true, nil
+					if checkPathAffected(p, v.Source) {
+						changedServices = append(changedServices, s.Name)
+						break out
 					}
 				}
 			}
 		}
 	}
 
-	return false, nil
+	return slice.Unique(changedServices), nil
 }
 
 // HasChangedEnvFiles checks if any files used in docker compose `env_file:` definitions have changed using the Git status.
-func HasChangedEnvFiles(changedFiles []gitInternal.ChangedFile, project *types.Project) (bool, error) {
-	paths := getAbsolutePaths(changedFiles, project.WorkingDir)
+func HasChangedEnvFiles(paths []string, project *types.Project) ([]string, error) {
+	var changedServices []string
 
 	for _, s := range project.Services {
+	out:
 		for _, envFile := range s.EnvFiles {
-			envFilePath := envFile.Path
+			for _, p := range paths {
+				if checkPathAffected(p, envFile.Path) {
+					changedServices = append(changedServices, s.Name)
+					break out
+				}
+			}
+		}
+	}
 
-			if !path.IsAbs(envFilePath) {
-				envFilePath = filepath.Join(project.WorkingDir, envFilePath)
+	return slice.Unique(changedServices), nil
+}
+
+// HasChangedBuildFiles checks if any files used as build context in docker compose `build:` definitions have changed using the Git status.
+// This includes any file within the build context directory for each service. If a changed file is within a build context, it returns true.
+func HasChangedBuildFiles(paths []string, project *types.Project) ([]string, error) {
+	var changedServices []string
+
+	for _, s := range project.Services {
+		if s.Build == nil {
+			continue
+		}
+
+		buildContext := s.Build.Context
+		additionalContexts := s.Build.AdditionalContexts
+		dockerFile := s.Build.Dockerfile
+		buildSecrets := s.Build.Secrets
+
+		if buildContext == "" && len(additionalContexts) == 0 && dockerFile == "" && len(buildSecrets) == 0 {
+			continue
+		}
+
+		var contexts []string
+
+		if buildContext != "" {
+			contexts = append(contexts, buildContext)
+		}
+
+		for _, v := range additionalContexts {
+			if v != "" {
+				contexts = append(contexts, v)
+			}
+		}
+
+		for _, secret := range buildSecrets {
+			if secret.Source != "" {
+				contexts = append(contexts, secret.Source)
+			}
+		}
+
+		if dockerFile != "" {
+			contexts = append(contexts, dockerFile)
+		}
+
+	out:
+
+		for _, ctxFile := range contexts {
+			if !path.IsAbs(ctxFile) {
+				ctxFile = filepath.Join(project.WorkingDir, ctxFile)
 			}
 
 			for _, p := range paths {
-				if p == envFilePath {
-					return true, nil
+				if checkPathAffected(p, ctxFile) {
+					changedServices = append(changedServices, s.Name)
+					break out
 				}
 			}
 		}
 	}
 
-	return false, nil
+	return slice.Unique(changedServices), nil
 }
 
-// HasChangedComposeFiles checks if any of the compose files have changed using the Git status.
-func HasChangedComposeFiles(changedFiles []gitInternal.ChangedFile, project *types.Project) (bool, error) {
-	// Get absolute paths of changed files
-	changedPaths := getAbsolutePaths(changedFiles, project.WorkingDir)
-
-	for _, file := range project.ComposeFiles {
-		changed, err := checkFilePath(file, changedPaths, project.WorkingDir)
-		if err != nil {
-			return false, err
-		}
-
-		if changed {
-			return true, nil
-		}
-	}
-
-	return false, nil
+type Change struct {
+	Type     string
+	Services []string
 }
 
-/*
-getExtendsFilesFromYaml parses the compose files as YAML and extracts the file paths used in `extends:` definitions.
-These files can also trigger a redeployment if they are changed,
-but they are not included in the compose project configuration and therefore need to be extracted manually.
+// sortChanges sorts the changes first by type and then by service name within each change.
+func sortChanges(changes []Change) {
+	slices.SortFunc(changes, func(a, b Change) int {
+		return strings.Compare(a.Type, b.Type)
+	})
 
-Recursively follows nested `extends:` references to collect all extended files.
-
-https://docs.docker.com/compose/how-tos/multiple-compose-files/extends/
-*/
-func getExtendsFilesFromYaml(composeFiles []string, workingDir string) ([]string, error) {
-	type composeFile struct {
-		Services map[string]struct {
-			Extends struct {
-				File    string `yaml:"file"`
-				Service string `yaml:"service"`
-			} `yaml:"extends"`
-		} `yaml:"services"`
+	for i := range changes {
+		slices.Sort(changes[i].Services)
 	}
-
-	out := set.New[string]()
-	visited := set.New[string]()
-
-	var processFile func(string) error
-
-	processFile = func(f string) error {
-		if !filepath.IsAbs(f) {
-			f = filepath.Join(workingDir, f)
-		}
-
-		f = filepath.Clean(f)
-
-		// Avoid infinite loops and reprocessing
-		if visited.Contains(f) {
-			return nil
-		}
-
-		visited.Add(f)
-
-		b, err := os.ReadFile(f)
-		if err != nil {
-			// The file list may contain candidate names that don't exist
-			// on disk (e.g., docker-compose.yml instead of compose.yml).
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-
-			return err
-		}
-
-		var cfg composeFile
-		if err = yaml.Unmarshal(b, &cfg); err != nil {
-			return err
-		}
-
-		for _, svc := range cfg.Services {
-			if svc.Extends.File == "" {
-				continue
-			}
-
-			ext := svc.Extends.File
-			if !filepath.IsAbs(ext) {
-				ext = filepath.Join(filepath.Dir(f), ext)
-			}
-
-			ext = filepath.Clean(ext)
-			out.Add(ext)
-
-			// Recursively process nested extends
-			if err = processFile(ext); err != nil {
-				return err
-			}
-		}
-
-		return nil
-	}
-
-	for _, f := range composeFiles {
-		if err := processFile(f); err != nil {
-			return nil, err
-		}
-	}
-
-	return out.ToSlice(), nil
-}
-
-// HasChangedExtendsFiles checks if any files referenced in docker compose `extends:` definitions have changed using the Git status.
-func HasChangedExtendsFiles(changedFiles []gitInternal.ChangedFile, composeFiles []string, workingDir string, repoRoot string) (bool, error) {
-	changedPaths := getAbsolutePaths(changedFiles, repoRoot)
-
-	// Convert compose files to absolute paths
-	absoluteComposeFiles := make([]string, 0, len(composeFiles))
-	for _, composeFile := range composeFiles {
-		if !filepath.IsAbs(composeFile) {
-			composeFile = filepath.Join(workingDir, composeFile)
-		}
-
-		composeFile = filepath.Clean(composeFile)
-		absoluteComposeFiles = append(absoluteComposeFiles, composeFile)
-	}
-
-	extends, err := getExtendsFilesFromYaml(absoluteComposeFiles, workingDir)
-	if err != nil {
-		return false, fmt.Errorf("failed to get extends files from compose yaml: %w", err)
-	}
-
-	for _, file := range extends {
-		changed, err := checkFilePath(file, changedPaths, workingDir)
-		if err != nil {
-			return false, err
-		}
-
-		if changed {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-/*
-getIncludeFilesFromYaml parses the compose files as YAML and extracts the file paths used in `include:` definitions.
-These files can also trigger a redeployment if they are changed,
-but they are already resolved by the compose-go library and therefore need to be extracted manually.
-
-Recursively follows nested `include:` references to collect all included files.
-
-Handles both simple string form and object form with a `path` key.
-
-https://docs.docker.com/compose/how-tos/multiple-compose-files/include
-*/
-func getIncludeFilesFromYaml(composeFiles []string, workingDir string) ([]string, error) {
-	// extractPaths recursively extracts include file paths from supported compose include forms.
-	// Supported forms:
-	// - include: file.yml
-	// - include: [file.yml, other.yml]
-	// - include:
-	//   - path: file.yml
-	//   - path: [a.yml, b.yml]
-	var extractPaths func(node *yaml.Node) []string
-
-	extractPaths = func(node *yaml.Node) []string {
-		if node == nil {
-			return nil
-		}
-
-		switch node.Kind {
-		case yaml.ScalarNode:
-			v := strings.TrimSpace(node.Value)
-			if v == "" {
-				return nil
-			}
-
-			return []string{v}
-		case yaml.SequenceNode:
-			out := make([]string, 0, len(node.Content))
-			for _, child := range node.Content {
-				out = append(out, extractPaths(child)...)
-			}
-
-			return out
-		case yaml.MappingNode:
-			out := make([]string, 0)
-
-			for i := 0; i+1 < len(node.Content); i += 2 {
-				key := node.Content[i]
-				val := node.Content[i+1]
-
-				if key.Value != "path" {
-					continue
-				}
-
-				out = append(out, extractPaths(val)...)
-			}
-
-			return out
-		default:
-			return nil
-		}
-	}
-
-	out := set.New[string]()
-	visited := set.New[string]()
-
-	var processFile func(string) error
-
-	processFile = func(f string) error {
-		if !filepath.IsAbs(f) {
-			f = filepath.Join(workingDir, f)
-		}
-
-		f = filepath.Clean(f)
-
-		// Avoid infinite loops and reprocessing
-		if visited.Contains(f) {
-			return nil
-		}
-
-		visited.Add(f)
-
-		b, err := os.ReadFile(f)
-		if err != nil {
-			// The file list may contain candidate names that don't exist
-			// on disk (e.g., docker-compose.yml instead of compose.yml).
-			if errors.Is(err, os.ErrNotExist) {
-				return nil
-			}
-
-			return err
-		}
-
-		var root yaml.Node
-		if err = yaml.Unmarshal(b, &root); err != nil {
-			return err
-		}
-
-		if len(root.Content) == 0 {
-			return nil
-		}
-
-		doc := root.Content[0]
-		if doc.Kind != yaml.MappingNode {
-			return nil
-		}
-
-		for i := 0; i+1 < len(doc.Content); i += 2 {
-			key := doc.Content[i]
-			val := doc.Content[i+1]
-
-			if key.Value != "include" {
-				continue
-			}
-
-			for _, inc := range extractPaths(val) {
-				// Exclude OCI artifacts which are referenced in the compose file but not present on the filesystem
-				// These are not supported as triggers for redeployment since they are not part of the Git repository and cannot be monitored for changes
-				// https://docs.docker.com/compose/how-tos/multiple-compose-files/include
-				if strings.HasPrefix(inc, "oci://") {
-					continue
-				}
-
-				incPath := inc
-				if !filepath.IsAbs(inc) {
-					incPath = filepath.Join(filepath.Dir(f), inc)
-				}
-
-				incPath = filepath.Clean(incPath)
-				out.Add(incPath)
-
-				// Recursively process nested includes
-				if err = processFile(incPath); err != nil {
-					return err
-				}
-			}
-		}
-
-		return nil
-	}
-
-	for _, f := range composeFiles {
-		if err := processFile(f); err != nil {
-			return nil, err
-		}
-	}
-
-	return out.ToSlice(), nil
-}
-
-// HasChangedIncludeFiles checks if any files referenced in docker compose `include:` definitions have changed using the Git status.
-func HasChangedIncludeFiles(changedFiles []gitInternal.ChangedFile, composeFiles []string, workingDir string, repoRoot string) (bool, error) {
-	changedPaths := getAbsolutePaths(changedFiles, repoRoot)
-
-	// Convert compose files to absolute paths
-	absoluteComposeFiles := make([]string, 0, len(composeFiles))
-	for _, composeFile := range composeFiles {
-		if !filepath.IsAbs(composeFile) {
-			composeFile = filepath.Join(workingDir, composeFile)
-		}
-
-		composeFile = filepath.Clean(composeFile)
-		absoluteComposeFiles = append(absoluteComposeFiles, composeFile)
-	}
-
-	includeFiles, err := getIncludeFilesFromYaml(absoluteComposeFiles, workingDir)
-	if err != nil {
-		return false, fmt.Errorf("failed to get include files from compose yaml: %w", err)
-	}
-
-	for _, file := range includeFiles {
-		changed, err := checkFilePath(file, changedPaths, workingDir)
-		if err != nil {
-			return false, err
-		}
-
-		if changed {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-// checkFilePath checks if the given file path matches any of the paths in the list,
-// considering both absolute and relative paths and allowing for matching based on the last 4 parts of the path.
-func checkFilePath(file string, paths []string, workingDir string) (bool, error) {
-	if !path.IsAbs(file) {
-		file = filepath.Join(workingDir, file)
-	}
-
-	file = filepath.Clean(file)
-
-	// Get the last 4 parts of the file path
-	fileParts := strings.Split(file, string(os.PathSeparator))
-
-	pathSuffix := path.Join(fileParts...)
-	if len(fileParts) > 4 {
-		pathSuffix = path.Join(fileParts[len(fileParts)-4:]...)
-	}
-
-	for _, p := range paths {
-		pClean := filepath.Clean(p)
-		if pClean == file || pClean == pathSuffix || strings.HasSuffix(pClean, pathSuffix) {
-			return true, nil
-		}
-	}
-
-	return false, nil
 }
 
 // ProjectFilesHaveChanges checks if any files related to the compose project have changed.
-func ProjectFilesHaveChanges(changedFiles []gitInternal.ChangedFile, project *types.Project) ([]string, error) {
+func ProjectFilesHaveChanges(repoRootExternal string, changedFiles []gitInternal.ChangedFile, project *types.Project) ([]Change, error) {
 	checks := []struct {
 		name string
-		fn   func([]gitInternal.ChangedFile, *types.Project) (bool, error)
+		fn   func([]string, *types.Project) ([]string, error)
 	}{
 		{"configs", HasChangedConfigs},
 		{"secrets", HasChangedSecrets},
 		{"bindMounts", HasChangedBindMounts},
 		{"envFiles", HasChangedEnvFiles},
+		{"buildFiles", HasChangedBuildFiles},
 	}
 
-	var changeReasons []string
+	paths := getPaths(changedFiles, repoRootExternal)
+
+	var changes []Change
 
 	for _, check := range checks {
-		changed, err := check.fn(changedFiles, project)
+		changedServices, err := check.fn(paths, project)
 		if err != nil {
 			return nil, fmt.Errorf("failed to check '%s' for changes: %w", check.name, err)
 		}
 
-		if changed {
-			changeReasons = append(changeReasons, check.name)
+		if len(changedServices) > 0 {
+			slices.Sort(changedServices)
+
+			changes = append(changes, Change{
+				Type:     check.name,
+				Services: changedServices,
+			})
 		}
 	}
 
-	return changeReasons, nil
+	sortChanges(changes)
+
+	return changes, nil
 }
 
 // RestartProject restarts all services in the specified project.
@@ -1281,4 +1041,125 @@ func GetImages(ctx context.Context, dockerCli command.Cli, projectName string) (
 	}
 
 	return images, nil
+}
+
+// CheckDefaultComposeFiles checks if the default compose files are used and returns them if true.
+func CheckDefaultComposeFiles(composeFiles []string, workingDir string) ([]string, error) {
+	if reflect.DeepEqual(composeFiles, cli.DefaultFileNames) {
+		var (
+			err             error
+			tmpComposeFiles []string
+		)
+
+		// Check if the default compose files exist
+
+		for _, f := range composeFiles {
+			if _, err = os.Stat(path.Join(workingDir, f)); errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+
+			tmpComposeFiles = append(tmpComposeFiles, f)
+		}
+
+		if len(tmpComposeFiles) == 0 {
+			errMsg := "no compose files found"
+			return nil, fmt.Errorf("%s: %w", errMsg, err)
+		}
+
+		return tmpComposeFiles, nil
+	}
+
+	return composeFiles, nil
+}
+
+// DecryptProjectFiles decrypts all files used in the compose project that are encrypted using doco-cd's encryption mechanism.
+// This includes configs, secrets, bind mounts, env files and build contexts.
+// Since absolute file paths in types.Project are paths on the docker host, repoPath also needs to be the external path to the repository.
+// We use the symlink inside the container to follow the external path to the correct internal path.
+func DecryptProjectFiles(repoPath string, p *types.Project) ([]string, error) {
+	var (
+		projectFiles   []string
+		decryptedFiles []string
+	)
+
+	for _, s := range p.Services {
+		for _, cfg := range s.Configs {
+			if cfg.Source != "" {
+				projectFiles = append(projectFiles, cfg.Source)
+			}
+		}
+
+		for _, secret := range s.Secrets {
+			if secret.Source != "" {
+				projectFiles = append(projectFiles, secret.Source)
+			}
+		}
+
+		for _, v := range s.Volumes {
+			if v.Type == "bind" && v.Source != "" {
+				info, err := os.Stat(v.Source)
+				if err != nil {
+					if errors.Is(err, os.ErrNotExist) {
+						continue
+					}
+
+					return decryptedFiles, fmt.Errorf("failed to stat bind mount source '%s': %w", v.Source, err)
+				}
+
+				if info.IsDir() {
+					decryptedFiles, err = encryption.DecryptFilesInDirectory(repoPath, v.Source)
+					if err != nil {
+						return decryptedFiles, fmt.Errorf("failed to decrypt files in bind mount directory '%s': %w", v.Source, err)
+					}
+
+					continue
+				}
+
+				projectFiles = append(projectFiles, v.Source)
+			}
+		}
+
+		for _, envFile := range s.EnvFiles {
+			if envFile.Path != "" {
+				projectFiles = append(projectFiles, envFile.Path)
+			}
+		}
+
+		if s.Build != nil {
+			if s.Build.Dockerfile != "" {
+				if filepath.IsAbs(s.Build.Dockerfile) {
+					projectFiles = append(projectFiles, s.Build.Dockerfile)
+				} else {
+					projectFiles = append(projectFiles, filepath.Join(s.Build.Context, s.Build.Dockerfile))
+				}
+			}
+
+			for _, secret := range s.Build.Secrets {
+				if secret.Source != "" {
+					if filepath.IsAbs(secret.Source) {
+						projectFiles = append(projectFiles, secret.Source)
+					} else {
+						projectFiles = append(projectFiles, filepath.Join(s.Build.Context, secret.Source))
+					}
+				}
+			}
+		}
+	}
+
+	for _, f := range slice.Unique(projectFiles) {
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(p.WorkingDir, f)
+		}
+
+		decrypted, err := encryption.DecryptFileInPlace(f, repoPath)
+		if err != nil {
+			return decryptedFiles, fmt.Errorf("failed to decrypt project file '%s': %w", f, err)
+		}
+
+		if decrypted {
+			decryptedFiles = append(decryptedFiles, f)
+		}
+	}
+
+	return decryptedFiles, nil
 }

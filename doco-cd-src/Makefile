@@ -81,7 +81,7 @@ cleanup:
 	@CONTAINERS=$$(docker container ls --format "{{.ID}}" --filter "label=cd.doco.metadata.manager"); \
 	if [ -n "$$CONTAINERS" ]; then \
 		for PROJECT in $$(for ID in $$CONTAINERS; do docker container inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' $$ID; done | sort | uniq); do \
-			docker compose -p $$PROJECT down; \
+			docker compose -p $$PROJECT down -v; \
 		done; \
 	else \
 		echo "No containers to clean up."; \
@@ -89,3 +89,11 @@ cleanup:
 
 clean-testcache:
 	go clean -testcache
+
+webhook:
+	@SIGNATURE=$$(openssl dgst -sha256 -hmac "test_Secret1" < cmd/doco-cd/testdata/github_payload.json | sed 's/^.* //'); \
+  	curl -X POST -H "X-Hub-Signature-256: sha256=$$SIGNATURE" \
+  		-H "Content-Type: application/json" \
+  		-H "X-GitHub-Event: push" \
+  		--data @cmd/doco-cd/testdata/github_payload.json \
+  		http://localhost/v1/webhook

@@ -1,1 +1,13 @@
+.bin/
+bin
+.idea/
+.vscode/
+.git/
+docs/
+test/
+test-cases/
 **/testdata
+Dockerfile
+*.compose.yaml
+docker-compose.yaml
+.dockerignore
