@@ -65,6 +65,10 @@ func DecryptContent(content []byte, format string) ([]byte, error) {
 
 // DecryptFilesInDirectory walks through the specified directory and decrypts all SOPS-encrypted files.
 func DecryptFilesInDirectory(repoPath, dirPath string) ([]string, error) {
+	if !filesystem.InBasePath(repoPath, dirPath) {
+		return nil, fmt.Errorf("%w: %s is outside the repository root %s", filesystem.ErrPathTraversal, dirPath, repoPath)
+	}
+
 	var decryptedFiles []string
 
 	var ignoreMatcher gitignore.Matcher
@@ -116,6 +120,9 @@ func DecryptFilesInDirectory(repoPath, dirPath string) ([]string, error) {
 
 			// Recursively walk the symlink target
 			_, err = DecryptFilesInDirectory(repoPath, absTarget)
+			if errors.Is(err, filesystem.ErrPathTraversal) {
+				return nil
+			}
 
 			return err
 		}
