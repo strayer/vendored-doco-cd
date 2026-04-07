@@ -17,6 +17,14 @@ import (
 	"github.com/kimdre/doco-cd/internal/git"
 )
 
+func shouldSkipDeployment(composeChanged bool, changedServices []docker.Change, ignoredInfo docker.IgnoredInfo, imagesChanged, forceRecreate bool) bool {
+	return !forceRecreate && !composeChanged && len(changedServices) == 0 && ignoredInfo.IsEmpty() && !imagesChanged
+}
+
+func shouldCheckImageUpdates(forceImagePull, forceRecreate bool) bool {
+	return forceImagePull && !forceRecreate
+}
+
 func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Logger) error {
 	s.Stages.PreDeploy.StartedAt = time.Now()
 
@@ -70,7 +78,7 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		return fmt.Errorf("failed to hash deploy configuration: %w", err)
 	}
 
-	if s.DeployConfig.ForceImagePull {
+	if shouldCheckImageUpdates(s.DeployConfig.ForceImagePull, s.DeployConfig.ForceRecreate) {
 		stageLog.Debug("force image pull enabled, checking for image updates")
 
 		var (
@@ -111,6 +119,8 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		} else {
 			stageLog.Debug("no running containers found for the deployment, skipping image pull check")
 		}
+	} else if s.DeployConfig.ForceImagePull && s.DeployConfig.ForceRecreate {
+		stageLog.Debug("force recreate enabled, skipping pre-deploy image pull check")
 	}
 
 	stageLog.Debug("comparing commits",
@@ -118,12 +128,6 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		slog.String("latest_commit", latestCommit))
 
 	if deployedCommit != "" {
-		// Check for file changes
-		s.DeployState.ChangedFiles, err = git.GetChangedFilesBetweenCommits(s.Repository.Git, plumbing.NewHash(deployedCommit), plumbing.NewHash(latestCommit))
-		if err != nil {
-			return fmt.Errorf("failed to get changed files between commits: %w", err)
-		}
-
 		// Validate and sanitize the working directory
 		if strings.Contains(s.DeployConfig.WorkingDirectory, "..") {
 			return errors.New("invalid working directory: must not contain '..' to prevent directory traversal")
@@ -162,23 +166,42 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 			stageLog.Debug("compose project has changed, proceeding with deployment", slog.String("new_hash", newHash), slog.String("old_hash", curProjectHash))
 		}
 
-		changedFiles, err := docker.ProjectFilesHaveChanges(s.Repository.PathExternal, s.DeployState.ChangedFiles, s.Docker.Project)
+		// Check for file changes
+		gitChangedFiles, err := git.GetChangedFilesBetweenCommits(s.Repository.Git, plumbing.NewHash(deployedCommit), plumbing.NewHash(latestCommit))
+		if err != nil {
+			return fmt.Errorf("failed to get changed files between commits: %w", err)
+		}
+
+		changedFiles := docker.GetPathsFromGitChangedFiles(gitChangedFiles, s.Repository.PathExternal)
+
+		changedServices, ignoredInfo, err := docker.ProjectFilesHaveChanges(s.Repository.PathExternal, changedFiles, s.Docker.Project)
 		if err != nil {
 			return fmt.Errorf("failed to check for changed project files: %s", err)
 		}
 
-		if !composeChanged && len(changedFiles) == 0 && !imagesChanged {
+		if shouldSkipDeployment(composeChanged, changedServices, ignoredInfo, imagesChanged, s.DeployConfig.ForceRecreate) {
 			stageLog.Debug("no changes detected, skipping deployment",
-				slog.String("directory", s.DeployConfig.WorkingDirectory))
+				slog.String("directory", s.DeployConfig.WorkingDirectory),
+			)
 
 			return ErrSkipDeployment
 		}
+
+		if s.DeployConfig.ForceRecreate && !composeChanged && len(changedServices) == 0 && ignoredInfo.IsEmpty() && !imagesChanged {
+			stageLog.Debug("force recreate enabled, proceeding with deployment",
+				slog.String("directory", s.DeployConfig.WorkingDirectory),
+			)
+		}
+
+		s.DeployState.changedServices = changedServices
+		s.DeployState.ignoredInfo = ignoredInfo
 
 		stageLog.Debug("changes detected, proceeding with deployment",
 			slog.String("directory", s.DeployConfig.WorkingDirectory),
 			slog.Group("has_changes",
 				slog.Bool("compose_config", composeChanged),
-				slog.Any("files", changedFiles),
+				slog.Any("files", changedServices),
+				slog.Any("ignored_info", ignoredInfo),
 				slog.Bool("images", imagesChanged),
 			),
 		)
