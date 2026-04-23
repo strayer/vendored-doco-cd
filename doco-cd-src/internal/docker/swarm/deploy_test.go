@@ -7,12 +7,16 @@ import (
 
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/flags"
+	"github.com/moby/moby/client"
 )
 
-func TestCheckDaemonIsSwarmManager(t *testing.T) {
+func getDockerClient(t *testing.T) client.APIClient {
+	t.Helper()
+
 	dockerCli, err := command.NewDockerCli(
 		command.WithOutputStream(os.Stdout),
 		command.WithErrorStream(os.Stderr),
+		command.WithAPIClientOptions(client.FromEnv),
 	)
 	if err != nil {
 		t.Fatalf("Failed to create docker cli: %v", err)
@@ -25,7 +29,13 @@ func TestCheckDaemonIsSwarmManager(t *testing.T) {
 		t.Fatal(fmt.Errorf("failed to initialize docker cli: %w", err))
 	}
 
-	_, err = CheckDaemonIsSwarmManager(t.Context(), dockerCli)
+	return dockerCli.Client()
+}
+
+func TestCheckDaemonIsSwarmManager(t *testing.T) {
+	dockerCli := getDockerClient(t)
+
+	_, err := checkDaemonIsSwarmManager(t.Context(), dockerCli)
 	if err != nil {
 		t.Fatalf("Failed to check if Docker daemon is a swarm manager: %v", err)
 	}

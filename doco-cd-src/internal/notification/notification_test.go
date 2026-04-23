@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/google/uuid"
-
 	"github.com/kimdre/doco-cd/internal/test"
+	"github.com/kimdre/doco-cd/internal/utils/id"
 )
 
 func TestSend(t *testing.T) {
@@ -35,7 +34,7 @@ func TestSend(t *testing.T) {
 		Repository: "test",
 		Stack:      "test-stack",
 		Revision:   "main",
-		JobID:      uuid.Must(uuid.NewV7()).String(),
+		JobID:      id.GenID(),
 	}
 
 	appriseComposeYAML := `services:
@@ -116,4 +115,30 @@ func TestGetRevision(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFormatMessage(t *testing.T) {
+	t.Parallel()
+
+	t.Run("single-line message adds newline after first colon", func(t *testing.T) {
+		t.Parallel()
+
+		message := formatMessage("Deployment failed: timeout reached", Metadata{})
+		expected := "Deployment failed:\ntimeout reached\n"
+
+		if message != expected {
+			t.Errorf("expected %q, got %q", expected, message)
+		}
+	})
+
+	t.Run("multi-line version message keeps inline versions", func(t *testing.T) {
+		t.Parallel()
+
+		message := formatMessage("Current Version: v0.80.0\nLatest Version: v0.80.1", Metadata{})
+		expected := "Current Version: v0.80.0\nLatest Version: v0.80.1\n"
+
+		if message != expected {
+			t.Errorf("expected %q, got %q", expected, message)
+		}
+	})
 }

@@ -1,4 +1,4 @@
-# Contributing to doco-cd
+# Contributing to Doco-CD
 
 Thank you for your support. Help is always appreciated!
 
@@ -37,6 +37,7 @@ Please follow these guidelines when contributing code:
 - Write comments and documentation where necessary.
 - Follow Go best practices and conventions. Refer to the [Effective Go](https://golang.org/doc/effective_go) guide for more information.
 - Write unit tests for your code that cover various scenarios and edge cases including error cases if applicable.
+- YAML and JSON fields must be in `snake_case`, Go struct fields must be in `camelCase`, and environment variables must be in `UPPER_SNAKE_CASE`.
 - Write clear, concise, and descriptive commit messages and use [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/).
 - Always sign your commits. See [Signing commits](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits) for more information.
 
@@ -52,7 +53,7 @@ Run the tests with `make test` or `make test-verbose` and run specific tests wit
 
 You can provide container registry credentials to avoid rate limiting issues when running tests.
 
-Follow the [Accessing private container registries](https://github.com/kimdre/doco-cd/wiki/Tips-and-Tricks#accessing-private-container-registries) Guide in the Wiki for more information.
+Follow the [Accessing private container registries](https://doco.cd/latest/Tips-and-Tricks/#accessing-private-container-registries) Guide in the docs for more information.
 
 ### Building from Source
 
@@ -87,6 +88,12 @@ Or using Docker with the `DISABLE_BITWARDEN=true` build argument:
 ```bash
 docker build --build-arg DISABLE_BITWARDEN=true -t doco-cd:nobitwarden .
 ```
+
+### Documentation (Wiki)
+
+The documentation site lives in the `wiki/` directory and is built with [Zensical](https://zensical.org/).
+
+See the [Documentation Guidelines](wiki/README.md) for instructions on how to contribute to the documentation and run the local docs server.
 
 ### Submitting your code
 

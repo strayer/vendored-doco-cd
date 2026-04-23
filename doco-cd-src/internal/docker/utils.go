@@ -49,9 +49,22 @@ type (
 	Labels  map[string]string // Labels of the Service
 )
 
+func (l Labels) Get(key string) (string, bool) {
+	v, ok := l[key]
+	return v, ok
+}
+
+func (l Labels) GetDeploymentCommitSHA() (string, bool) {
+	return l.Get(DocoCDLabels.Deployment.CommitSHA)
+}
+
+func (l Labels) GetDeploymentComposeHash() (string, bool) {
+	return l.Get(DocoCDLabels.Deployment.ComposeHash)
+}
+
 // GetServiceLabels retrieves the Labels for each Service in a given stack.
-func GetServiceLabels(ctx context.Context, cli *client.Client, stackName string) (map[Service]Labels, error) {
-	if swarmInternal.ModeEnabled {
+func GetServiceLabels(ctx context.Context, cli client.APIClient, stackName string) (map[Service]Labels, error) {
+	if swarmInternal.GetModeEnabled() {
 		services, err := swarmInternal.GetStackServices(ctx, cli, stackName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get services for stack %s: %w", stackName, err)
@@ -79,7 +92,7 @@ func GetServiceLabels(ctx context.Context, cli *client.Client, stackName string)
 }
 
 // GetLabeledContainers retrieves all containers with a specific label key and value.
-func GetLabeledContainers(ctx context.Context, cli *client.Client, key, value string) (containers []container.Summary, err error) {
+func GetLabeledContainers(ctx context.Context, cli client.APIClient, key, value string) (containers []container.Summary, err error) {
 	result, err := cli.ContainerList(ctx, client.ContainerListOptions{
 		Filters: make(client.Filters).Add("label", key+"="+value),
 		All:     false,
@@ -92,8 +105,8 @@ func GetLabeledContainers(ctx context.Context, cli *client.Client, key, value st
 }
 
 // GetLabeledServices retrieves all services with a specific label key and value, along with their labels.
-func GetLabeledServices(ctx context.Context, cli *client.Client, key, value string) (map[Service]map[string]string, error) {
-	if swarmInternal.ModeEnabled {
+func GetLabeledServices(ctx context.Context, cli client.APIClient, key, value string) (map[Service]map[string]string, error) {
+	if swarmInternal.GetModeEnabled() {
 		services, err := swarmInternal.GetServicesByLabel(ctx, cli, key, value)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get services with label %s=%s: %w", key, value, err)
@@ -121,7 +134,7 @@ func GetLabeledServices(ctx context.Context, cli *client.Client, key, value stri
 }
 
 // GetLabeledVolumes retrieves all volumes with a specific label key and value.
-func GetLabeledVolumes(ctx context.Context, cli *client.Client, key, value string) (volumes []volume.Volume, err error) {
+func GetLabeledVolumes(ctx context.Context, cli client.APIClient, key, value string) (volumes []volume.Volume, err error) {
 	volResp, err := cli.VolumeList(ctx, client.VolumeListOptions{
 		Filters: make(client.Filters).Add("label", key+"="+value),
 	})
@@ -133,7 +146,7 @@ func GetLabeledVolumes(ctx context.Context, cli *client.Client, key, value strin
 }
 
 // GetLabeledConfigs retrieves all configs with a specific label key and value.
-func GetLabeledConfigs(ctx context.Context, cli *client.Client, key, value string) (configs []swarm.Config, err error) {
+func GetLabeledConfigs(ctx context.Context, cli client.APIClient, key, value string) (configs []swarm.Config, err error) {
 	result, err := cli.ConfigList(ctx, client.ConfigListOptions{
 		Filters: make(client.Filters).Add("label", key+"="+value),
 	})
@@ -145,7 +158,7 @@ func GetLabeledConfigs(ctx context.Context, cli *client.Client, key, value strin
 }
 
 // GetLabeledSecrets retrieves all secrets with a specific label key and value.
-func GetLabeledSecrets(ctx context.Context, cli *client.Client, key, value string) (secrets []swarm.Secret, err error) {
+func GetLabeledSecrets(ctx context.Context, cli client.APIClient, key, value string) (secrets []swarm.Secret, err error) {
 	result, err := cli.SecretList(ctx, client.SecretListOptions{
 		Filters: make(client.Filters).Add("label", key+"="+value),
 	})
@@ -157,7 +170,7 @@ func GetLabeledSecrets(ctx context.Context, cli *client.Client, key, value strin
 }
 
 // GetMountPointByDestination retrieves the mount point of a container volume/bind mount by its destination (mount point inside the container).
-func GetMountPointByDestination(cli *client.Client, containerID, destination string) (container.MountPoint, error) {
+func GetMountPointByDestination(cli client.APIClient, containerID, destination string) (container.MountPoint, error) {
 	// Get the container info
 	result, err := cli.ContainerInspect(context.TODO(), containerID, client.ContainerInspectOptions{})
 	if err != nil {
@@ -200,9 +213,9 @@ func CheckMountPointWriteable(mountPoint container.MountPoint) error {
 	return nil
 }
 
-func RemoveLabeledVolumes(ctx context.Context, dockerClient *client.Client, stackName string) error {
+func RemoveLabeledVolumes(ctx context.Context, dockerClient client.APIClient, stackName string) error {
 	filterLabel := api.ProjectLabel
-	if swarmInternal.ModeEnabled {
+	if swarmInternal.GetModeEnabled() {
 		filterLabel = swarmInternal.StackNamespaceLabel
 	}
 
@@ -214,7 +227,7 @@ func RemoveLabeledVolumes(ctx context.Context, dockerClient *client.Client, stac
 	for _, vol := range volumes {
 		retries := 5
 
-		for i := 0; i < retries; i++ {
+		for range retries {
 			_, err = dockerClient.VolumeRemove(ctx, vol.Name, client.VolumeRemoveOptions{Force: true})
 			if err != nil {
 				if strings.Contains(err.Error(), ErrIsInUse.Error()) {

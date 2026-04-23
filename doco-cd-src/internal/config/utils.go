@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -32,7 +33,22 @@ func LoadFileBasedEnvVars(mappings *[]EnvVarFileMapping) error {
 				return fmt.Errorf("%w: %s or %s", ErrBothSecretsSet, m.EnvName, m.EnvName+"_FILE")
 			}
 
-			*m.EnvValue = strings.TrimSpace(*m.FileValue)
+			fileContent := strings.TrimSpace(*m.FileValue)
+
+			// If *_FILE content is SOPS-encrypted, decrypt it before assigning.
+			if encryption.IsEncryptedContent(fileContent) {
+				filePath := os.Getenv(m.EnvName + "_FILE")
+				format := encryption.GetFileFormat(filePath)
+
+				decrypted, err := encryption.DecryptContent([]byte(fileContent), format)
+				if err != nil {
+					return fmt.Errorf("failed to decrypt %s_FILE content: %w", m.EnvName, err)
+				}
+
+				fileContent = strings.TrimSpace(string(decrypted))
+			}
+
+			*m.EnvValue = fileContent
 
 			continue
 		}
@@ -46,7 +62,7 @@ func LoadFileBasedEnvVars(mappings *[]EnvVarFileMapping) error {
 }
 
 // ParseConfigFromEnv parses the configuration from environment variables and file-based environment variables.
-func ParseConfigFromEnv(config interface{}, mappings *[]EnvVarFileMapping) error {
+func ParseConfigFromEnv(config any, mappings *[]EnvVarFileMapping) error {
 	// Parse the environment variables into the config struct
 	// Also load any values from files if *_FILE env vars are set
 	if err := env.Parse(config); err != nil {
@@ -110,9 +126,7 @@ func LoadLocalDotEnv(deployConfig *DeployConfig, basePath string) error {
 				}
 			}
 
-			for k, v := range envMap {
-				deployConfig.Internal.Environment[k] = v
-			}
+			maps.Copy(deployConfig.Internal.Environment, envMap)
 		} else {
 			f = strings.TrimPrefix(f, remotePrefix)
 			remoteEnvFiles = append(remoteEnvFiles, f)

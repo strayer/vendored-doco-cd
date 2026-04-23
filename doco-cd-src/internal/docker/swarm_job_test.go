@@ -9,27 +9,26 @@ import (
 func TestRunSwarmJob(t *testing.T) {
 	t.Parallel()
 
-	dockerCli, err := CreateDockerCli(false, false)
+	dockerCli, err := CreateDockerCli(false)
 	if err != nil {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(t.Context(), dockerCli)
-	if err != nil {
+	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
 		t.Errorf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
 
-	if !swarm.ModeEnabled {
+	if !swarm.GetModeEnabled() {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
 	testCases := []struct {
-		mode    JobMode
+		mode    swarm.DeployMode
 		command []string
 		title   string
 	}{
-		{mode: JobModeGlobal, command: []string{"docker", "info"}, title: "global-docker-info"},
-		{mode: JobModeReplicated, command: []string{"docker", "info"}, title: "replicated-docker-info"},
+		{mode: swarm.DeployModeGlobalJob, command: []string{"docker", "info"}, title: "global-docker-info"},
+		{mode: swarm.DeployModeReplicatedJob, command: []string{"docker", "info"}, title: "replicated-docker-info"},
 	}
 
 	for _, tc := range testCases {
@@ -49,17 +48,16 @@ func TestRunSwarmJob(t *testing.T) {
 func TestRunImagePruneJob(t *testing.T) {
 	t.Parallel()
 
-	dockerCli, err := CreateDockerCli(false, false)
+	dockerCli, err := CreateDockerCli(false)
 	if err != nil {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(t.Context(), dockerCli)
-	if err != nil {
+	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
 		t.Errorf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
 
-	if !swarm.ModeEnabled {
+	if !swarm.GetModeEnabled() {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 

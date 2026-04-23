@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+
+{% block extrahead %}
+  {{ super() }}
+  <!-- Patch URL constructor to handle relative URLs (e.g. new URL(".")) without a base -->
+  <script>
+    (function () {
+      var _URL = window.URL;
+      function PatchedURL(url, base) {
+        if (base === undefined && typeof url === "string" && !url.match(/^[a-zA-Z][a-zA-Z0-9+\-.]*:/)) {
+          base = location.href;
+        }
+        return new _URL(url, base);
+      }
+      PatchedURL.prototype = _URL.prototype;
+      PatchedURL.createObjectURL = _URL.createObjectURL.bind(_URL);
+      PatchedURL.revokeObjectURL = _URL.revokeObjectURL.bind(_URL);
+      window.URL = PatchedURL;
+    })();
+  </script>
+{% endblock %}
+
+{% block htmltitle %}
+  {% if page and page.title and config.site_name and page.title == config.site_name %}
+    <title>{{ page.title }}</title>
+  {% else %}
+    {{ super() }}
+  {% endif %}
+{% endblock %}
+
+{% block outdated %}
+  <span data-next-version-message hidden>
+    You're viewing the <strong>unreleased</strong> (next) version of this documentation. Content may be incomplete or subject to change.
+    <a href="{{ '../' ~ base_url }}/{{ config.extra.version.default }}/{{ page.url }}">
+      <strong>Click here to go to the latest stable version.</strong>
+    </a>
+  </span>
+  <span data-non-next-version-message>
+    You're not viewing the latest version.
+    <a href="{{ '../' ~ base_url }}/{{ config.extra.version.default }}/{{ page.url }}">
+      <strong>Click here to go to latest.</strong>
+    </a>
+  </span>
+  <script>
+    (function () {
+      var path = window.location.pathname || "";
+      var isNextVersion = /(^|\/)next(\/|$)/.test(path);
+      var nextMessage = document.querySelector("[data-next-version-message]");
+      var nonNextMessage = document.querySelector("[data-non-next-version-message]");
+      if (!nextMessage || !nonNextMessage) {
+        return;
+      }
+      nextMessage.hidden = !isNextVersion;
+      nonNextMessage.hidden = isNextVersion;
+    })();
+  </script>
+{% endblock %}

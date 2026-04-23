@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -64,7 +65,7 @@ func init() {
 	ComposeVersion = version
 }
 
-func CreateDockerCli(quiet, verifyTLS bool) (command.Cli, error) {
+func CreateDockerCli(quiet bool) (command.Cli, error) {
 	var (
 		outputStream io.Writer
 		errorStream  io.Writer
@@ -81,12 +82,13 @@ func CreateDockerCli(quiet, verifyTLS bool) (command.Cli, error) {
 	dockerCli, err := command.NewDockerCli(
 		command.WithOutputStream(outputStream),
 		command.WithErrorStream(errorStream),
+		command.WithAPIClientOptions(client.FromEnv),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create docker cli: %w", err)
 	}
 
-	opts := &flags.ClientOptions{Context: "default", LogLevel: "error", TLSVerify: verifyTLS}
+	opts := &flags.ClientOptions{Context: "default", LogLevel: "error"}
 
 	err = dockerCli.Initialize(opts)
 	if err != nil {
@@ -258,9 +260,7 @@ func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, 
 	}
 
 	// Inject external secrets into the environment for variable interpolation
-	for k, v := range environment {
-		options.Environment[k] = v
-	}
+	maps.Copy(options.Environment, environment)
 
 	err = cli.WithDotEnv(options)
 	if err != nil {
@@ -422,8 +422,8 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 // DeployStack deploys the stack using the provided deployment configuration.
 func DeployStack(
 	jobLog *slog.Logger, externalRepoPath string, ctx *context.Context,
-	dockerCli *command.Cli, dockerClient *client.Client, payload *webhook.ParsedPayload, deployConfig *config.DeployConfig,
-	detectedChanges []Change, needSignal []SignalService, latestCommit, appVersion string, forceDeploy bool,
+	dockerCli command.Cli, payload *webhook.ParsedPayload, deployConfig *config.DeployConfig,
+	detectedChanges []Change, needSignal []SignalService, latestCommit, appVersion string,
 ) error {
 	startTime := time.Now()
 
@@ -474,7 +474,7 @@ func DeployStack(
 	}
 
 	// When SwarmModeEnabled is true, we deploy the stack using Docker Swarm.
-	if swarm.ModeEnabled {
+	if swarm.GetModeEnabled() {
 		stackLog.Info("deploying swarm stack")
 
 		cfg, opts, err := LoadSwarmStack(dockerCli, project, deployConfig, externalWorkingDir)
@@ -487,7 +487,7 @@ func DeployStack(
 		addSwarmConfigLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
 		addSwarmSecretLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
 
-		err = DeploySwarmStack(*ctx, *dockerCli, cfg, opts)
+		err = DeploySwarmStack(*ctx, dockerCli, cfg, opts)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
 
@@ -496,7 +496,7 @@ func DeployStack(
 			return fmt.Errorf("%s: %w", errMsg, err)
 		}
 
-		err = PruneStackConfigs(*ctx, dockerClient, deployConfig.Name)
+		err = PruneStackConfigs(*ctx, dockerCli.Client(), deployConfig.Name)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
 
@@ -505,7 +505,7 @@ func DeployStack(
 			return fmt.Errorf("%s: %w", errMsg, err)
 		}
 
-		err = PruneStackSecrets(*ctx, dockerClient, deployConfig.Name)
+		err = PruneStackSecrets(*ctx, dockerCli.Client(), deployConfig.Name)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
 
@@ -517,7 +517,7 @@ func DeployStack(
 		if deployConfig.PruneImages {
 			stackLog.Info("prune images on swarm nodes")
 
-			err = RunImagePruneJob(*ctx, *dockerCli)
+			err = RunImagePruneJob(*ctx, dockerCli)
 			if err != nil {
 				prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
 
@@ -534,10 +534,6 @@ func DeployStack(
 		recreateMode := api.RecreateDiverged
 
 		switch {
-		case forceDeploy:
-			recreateMode = api.RecreateForce
-
-			stackLog.Debug("force deploy enabled, forcing recreate of all services")
 		case len(detectedChanges) > 0:
 			recreateMode = api.RecreateForce
 
@@ -559,7 +555,7 @@ func DeployStack(
 			slog.Any("need_signal", needSignal),
 		)
 
-		err = deployCompose(*ctx, *dockerCli, project, deployConfig, recreateMode,
+		err = deployCompose(*ctx, dockerCli, project, deployConfig, recreateMode,
 			forcedServices.ToSlice(), needSignal)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
@@ -583,7 +579,7 @@ func DestroyStack(
 
 	stackLog.Info("destroying stack")
 
-	if swarm.ModeEnabled {
+	if swarm.GetModeEnabled() {
 		err := RemoveSwarmStack(*ctx, *dockerCli, deployConfig.Name)
 		if err != nil {
 			errMsg := "failed to destroy swarm stack"
@@ -860,6 +856,10 @@ func (i IgnoredInfo) IsEmpty() bool {
 	return len(i.Ignored) == 0 && len(i.NeedSendSignal) == 0
 }
 
+func (i IgnoredInfo) IsNeedSignal() bool {
+	return len(i.NeedSendSignal) == 0
+}
+
 type SignalService struct {
 	ServiceName string `json:"service_name"`
 	Signal      string `json:"signal"`
@@ -1024,7 +1024,7 @@ func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([
 				continue
 			}
 
-			if strings.Contains(err.Error(), "no such image") || strings.Contains(err.Error(), "not found") {
+			if strings.Contains(strings.ToLower(err.Error()), "no such image") || strings.Contains(strings.ToLower(err.Error()), "not found") {
 				// Ignore error if image does not exist
 				continue
 			}

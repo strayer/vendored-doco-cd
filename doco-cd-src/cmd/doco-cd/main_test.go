@@ -17,11 +17,11 @@ import (
 	"github.com/avast/retry-go/v5"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
-	"github.com/google/uuid"
 	"github.com/moby/moby/api/types/container"
-	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
+	"github.com/kimdre/doco-cd/internal/utils/id"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
@@ -55,7 +55,7 @@ func TestMain(m *testing.M) {
 
 	ctx := context.Background()
 
-	dockerCli, err := docker.CreateDockerCli(false, false)
+	dockerCli, err := docker.CreateDockerCli(false)
 	if err != nil {
 		log.Fatalf("Failed to create docker client: %v", err)
 	}
@@ -65,12 +65,11 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to verify docker socket connection: %v", err)
 	}
 
-	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(ctx, dockerCli)
-	if err != nil {
+	if err := swarm.RefreshModeEnabled(ctx, dockerCli.Client()); err != nil {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
 
-	if swarm.ModeEnabled {
+	if swarm.GetModeEnabled() {
 		log.Println("Testing in Docker Swarm mode")
 	} else {
 		log.Println("Testing in Docker Standalone mode")
@@ -207,19 +206,14 @@ func TestHandleEvent(t *testing.T) {
 		t.Fatalf("failed to get app config: %s", err.Error())
 	}
 
-	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
+	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy)
 	if err != nil {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	swarm.ModeEnabled, err = swarm.CheckDaemonIsSwarmManager(t.Context(), dockerCli)
-	if err != nil {
+	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
-
-	dockerClient, _ := client.New(
-		client.FromEnv,
-	)
 
 	encryption.SetupAgeKeyEnvVar(t)
 
@@ -236,8 +230,9 @@ func TestHandleEvent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			if swarm.ModeEnabled != tc.swarmMode {
-				t.Skipf("Skipping test because it requires swarm mode %v, but current mode is %v", tc.swarmMode, swarm.ModeEnabled)
+			mode := swarm.GetModeEnabled()
+			if mode != tc.swarmMode {
+				t.Skipf("Skipping test because it requires swarm mode %v, but current mode is %v", tc.swarmMode, mode)
 			}
 
 			tmpDir := t.TempDir()
@@ -251,7 +246,7 @@ func TestHandleEvent(t *testing.T) {
 				t.Skip("Skipping test for private repository because GIT_ACCESS_TOKEN is not set")
 			}
 
-			jobID := uuid.Must(uuid.NewV7()).String()
+			jobID := id.GenID()
 			jobLog := logger.New(logger.LevelCritical).With(slog.String("job_id", jobID))
 
 			ctx := context.Background()
@@ -296,7 +291,7 @@ func TestHandleEvent(t *testing.T) {
 					Volumes:       true,
 				}
 
-				if swarm.ModeEnabled {
+				if swarm.GetModeEnabled() {
 					err = docker.RemoveSwarmStack(ctx, dockerCli, stackName)
 				} else if svcErr == nil && service != nil {
 					err = service.Down(ctx, stackName, downOpts)
@@ -312,6 +307,11 @@ func TestHandleEvent(t *testing.T) {
 				Source:      tmpDir,
 				Destination: tmpDir,
 				Mode:        "rw",
+			}
+			metadata := notification.Metadata{
+				JobID:      jobID,
+				Repository: git.GetRepoName(tc.payload.CloneURL),
+				Revision:   notification.GetRevision(tc.payload.Ref, tc.payload.CommitSHA),
 			}
 
 			err = retry.New(
@@ -329,9 +329,8 @@ func TestHandleEvent(t *testing.T) {
 					testMountPoint,
 					tc.payload,
 					tc.customTarget,
-					jobID,
+					metadata,
 					dockerCli,
-					dockerClient,
 					&secretProvider,
 					stackName,
 				)

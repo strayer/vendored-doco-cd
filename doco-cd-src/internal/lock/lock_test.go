@@ -1,59 +1,10 @@
-package main
+package lock
 
 import (
 	"strconv"
 	"sync"
 	"testing"
 )
-
-func TestShouldForceDeploy(t *testing.T) {
-	t.Parallel()
-
-	tests := []struct {
-		name     string
-		commits  []string
-		expected []bool
-	}{
-		{
-			name:     "No loop detected",
-			commits:  []string{"commit1", "commit2", "commit3"},
-			expected: []bool{false, false, false},
-		},
-		{
-			name:     "Loop detected after 3 same commits",
-			commits:  []string{"commitX", "commitX", "commitX", "commitY"},
-			expected: []bool{false, false, true, false},
-		},
-		{
-			name:     "Multiple stacks with independent loops",
-			commits:  []string{"commitA", "commitA", "commitB", "commitB", "commitB"},
-			expected: []bool{false, false, false, false, true},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			stackName := t.Name()
-
-			// Reset the tracker for each test case
-			deploymentLoopTracker.Lock()
-			deploymentLoopTracker.loops = make(map[string]struct {
-				lastCommit string
-				count      uint
-			})
-			deploymentLoopTracker.Unlock()
-
-			for i, commit := range tt.commits {
-				result := shouldForceDeploy(stackName, commit, 3)
-				if result != tt.expected[i] {
-					t.Errorf("shouldForceDeploy(%s, %s) = %v; want %v", stackName, commit, result, tt.expected[i])
-				}
-			}
-		})
-	}
-}
 
 // reset helper to isolate tests.
 func resetRepoLocks(t *testing.T) {
@@ -137,7 +88,7 @@ func TestRepoLock_ConcurrentTryLock_SameRepo(t *testing.T) {
 		winners []string
 	)
 
-	for i := 0; i < goroutines; i++ {
+	for i := range goroutines {
 		jobID := "job-" + strconv.Itoa(i)
 		go func(id string) {
 			defer wg.Done()

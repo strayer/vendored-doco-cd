@@ -16,7 +16,7 @@ services:
     ports:
       - "80:80" # Webhook endpoint
       - "9120:9120" # Prometheus metrics
-    # For all available environment variables and explanations, see https://github.com/kimdre/doco-cd/wiki/App-Settings
+    # For all available environment variables and explanations, see https://doco.cd/latest/App-Settings/
     environment:
       TZ: Europe/Berlin
       GIT_ACCESS_TOKEN: xxx
@@ -27,6 +27,8 @@ services:
       # The data volume (left side) can also be replaced with a bind mount to a local directory, for example:
       # - ./data:/data
       - data:/data
+    cap_drop:
+      - ALL
     healthcheck:
       test: [ "CMD", "/doco-cd", "healthcheck" ]
       start_period: 15s
