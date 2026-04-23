@@ -89,7 +89,7 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	cloneUrl := "https://github.com/kimdre/doco-cd.git"
 	indexPath := path.Join("test", "index.html")
 
-	if swarm.ModeEnabled {
+	if swarm.GetModeEnabled() {
 		payloadFile = githubPayloadFileSwarmMode
 		cloneUrl = "https://github.com/kimdre/doco-cd_tests.git"
 		indexPath = path.Join("html", "index.html")
@@ -116,14 +116,12 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 
 	log := logger.New(logger.LevelCritical)
 
-	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy, !appConfig.SkipTLSVerification)
+	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy)
 	if err != nil {
 		t.Fatalf("Failed to create docker client: %v", err)
 	}
 
-	dockerClient, _ := client.New(
-		client.FromEnv,
-	)
+	dockerClient := dockerCli.Client()
 
 	t.Cleanup(func() {
 		err = dockerCli.Client().Close()
@@ -133,10 +131,9 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	})
 
 	h := handlerData{
-		dockerCli:    dockerCli,
-		dockerClient: dockerClient,
-		appConfig:    appConfig,
-		appVersion:   config.AppVersion,
+		dockerCli:  dockerCli,
+		appConfig:  appConfig,
+		appVersion: config.AppVersion,
 		dataMountPoint: container.MountPoint{
 			Type:        "bind",
 			Source:      tmpDir,
@@ -182,7 +179,7 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		testContainerPort string
 	)
 
-	if swarm.ModeEnabled {
+	if swarm.GetModeEnabled() {
 		t.Log("Testing in Swarm mode")
 
 		inspectName := stackName + "_" + "test"
@@ -257,7 +254,7 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	httpClient := &http.Client{Timeout: 3 * time.Second}
 
 	resp := &http.Response{}
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		resp, err = httpClient.Get(testURL) // #nosec G107
 		if err != nil {
 			t.Logf("Failed to make GET request to test container (attempt %d): %v", i+1, err)

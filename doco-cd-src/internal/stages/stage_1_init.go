@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"time"
@@ -81,7 +82,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		repo, err := git.OpenRepository(s.Repository.PathInternal)
 		switch {
 		case err == nil:
-			err = git.FetchRepository(repo, string(s.Repository.CloneURL), s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth)
+			err = git.FetchRepository(repo, string(s.Repository.CloneURL), s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
 			if err != nil {
 				return fmt.Errorf("failed to fetch repository: %w", err)
 			}
@@ -106,7 +107,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 			stageLog.Debug("repository URL provided, cloning remote repository")
 
 			_, err = git.CloneRepository(s.Repository.PathInternal, string(s.Repository.CloneURL), s.DeployConfig.Reference,
-				s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules)
+				s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
 			if err != nil && !errors.Is(err, git.ErrRepositoryAlreadyExists) {
 				return fmt.Errorf("failed to clone repository: %w", err)
 			}
@@ -123,12 +124,20 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		}
 	}
 
+	if len(s.DeployConfig.Environment) > 0 {
+		if s.DeployConfig.Internal.Environment == nil {
+			s.DeployConfig.Internal.Environment = make(map[string]string)
+		}
+
+		maps.Copy(s.DeployConfig.Internal.Environment, s.DeployConfig.Environment)
+	}
+
 	if s.DeployConfig.Destroy {
 		// Skip deployment if another project with the same name already exists
 		// Check if containers do not belong to this repository or if doco-cd does not manage the stack
 		correctRepo := true
 
-		serviceLabels, err := docker.GetServiceLabels(ctx, s.Docker.Client, s.DeployConfig.Name)
+		serviceLabels, err := docker.GetServiceLabels(ctx, s.Docker.Cmd.Client(), s.DeployConfig.Name)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve service labels: %w", err)
 		}
@@ -161,7 +170,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		stageLog.Debug("checking out reference "+s.DeployConfig.Reference, slog.String("path", s.Repository.PathExternal))
 
 		s.Repository.Git, err = git.UpdateRepository(s.Repository.PathInternal, string(s.Repository.CloneURL), s.DeployConfig.Reference,
-			s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules)
+			s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
 		if err != nil {
 			return fmt.Errorf("failed to checkout repository: %w", err)
 		}

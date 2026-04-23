@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -38,42 +39,59 @@ const DefaultReference = "refs/heads/main"
 
 // DeployConfig is the structure of the deployment configuration file.
 type DeployConfig struct {
-	Name               string   `yaml:"name" json:"name"`                                                                                                                  // Name of the docker-compose deployment / stack
-	RepositoryUrl      HttpUrl  `yaml:"repository_url" json:"repository_url" default:"" validate:"httpUrl"`                                                                // RepositoryUrl is the http URL of the Git repository to deploy
-	WebhookEventFilter string   `yaml:"webhook_filter" json:"webhook_filter" default:""`                                                                                   // WebhookEventFilter is a regular expression to whitelist deployment triggers based on the webhook event payload (e.g., branch like "^refs/heads/main$" or "main", tag like "^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$" or "v[0-9]+\.[0-9]+\.[0-9]+")
-	Reference          string   `yaml:"reference" json:"reference" default:""`                                                                                             // Reference is the Git reference to the deployment, e.g., refs/heads/main, main, refs/tags/v1.0.0 or v1.0.0
-	WorkingDirectory   string   `yaml:"working_dir" json:"working_dir" default:"."`                                                                                        // WorkingDirectory is the working directory for the deployment
-	ComposeFiles       []string `yaml:"compose_files" json:"compose_files" default:"[\"compose.yaml\", \"compose.yml\", \"docker-compose.yml\", \"docker-compose.yaml\"]"` // ComposeFiles is the list of docker-compose files to use
-	EnvFiles           []string `yaml:"env_files" json:"env_files" default:"[\".env\"]"`                                                                                   // EnvFiles is the list of dotenv files to use for variable interpolation
-	RemoveOrphans      bool     `yaml:"remove_orphans" json:"remove_orphans" default:"true"`                                                                               // RemoveOrphans removes containers for services not defined in the Compose file
-	PruneImages        bool     `yaml:"prune_images" json:"prune_images" default:"true"`                                                                                   // PruneImages removes images that are no longer used by any service in the deployment or any other running container
-	ForceRecreate      bool     `yaml:"force_recreate" json:"force_recreate" default:"false"`                                                                              // ForceRecreate forces the recreation/redeployment of containers even if the configuration has not changed
-	ForceImagePull     bool     `yaml:"force_image_pull" json:"force_image_pull" default:"false"`                                                                          // ForceImagePull always pulls the latest version of the image tags you've specified if a newer version is available
-	Timeout            int      `yaml:"timeout" json:"timeout" default:"180"`                                                                                              // Timeout is the time in seconds to wait for the deployment to finish in seconds before timing out
+	Name               string            `yaml:"name" json:"name"`                                                                                                                  // Name of the docker-compose deployment / stack
+	RepositoryUrl      HttpUrl           `yaml:"repository_url" json:"repository_url" default:"" validate:"httpUrl"`                                                                // RepositoryUrl is the http URL of the Git repository to deploy
+	WebhookEventFilter string            `yaml:"webhook_filter" json:"webhook_filter" default:""`                                                                                   // WebhookEventFilter is a regular expression to whitelist deployment triggers based on the webhook event payload (e.g., branch like "^refs/heads/main$" or "main", tag like "^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$" or "v[0-9]+\.[0-9]+\.[0-9]+")
+	Reference          string            `yaml:"reference" json:"reference" default:""`                                                                                             // Reference is the Git reference to the deployment, e.g., refs/heads/main, main, refs/tags/v1.0.0 or v1.0.0
+	WorkingDirectory   string            `yaml:"working_dir" json:"working_dir" default:"."`                                                                                        // WorkingDirectory is the working directory for the deployment
+	ComposeFiles       []string          `yaml:"compose_files" json:"compose_files" default:"[\"compose.yaml\", \"compose.yml\", \"docker-compose.yml\", \"docker-compose.yaml\"]"` // ComposeFiles is the list of docker-compose files to use
+	Environment        map[string]string `yaml:"environment" json:"environment"`                                                                                                    // Environment is a map of environment variables to use for variable interpolation in the compose files
+	EnvFiles           []string          `yaml:"env_files" json:"env_files" default:"[\".env\"]"`                                                                                   // EnvFiles is the list of dotenv files to use for variable interpolation
+	RemoveOrphans      bool              `yaml:"remove_orphans" json:"remove_orphans" default:"true"`                                                                               // RemoveOrphans removes containers for services not defined in the Compose file
+	PruneImages        bool              `yaml:"prune_images" json:"prune_images" default:"true"`                                                                                   // PruneImages removes images that are no longer used by any service in the deployment or any other running container
+	ForceRecreate      bool              `yaml:"force_recreate" json:"force_recreate" default:"false"`                                                                              // ForceRecreate forces the recreation/redeployment of containers even if the configuration has not changed
+	ForceImagePull     bool              `yaml:"force_image_pull" json:"force_image_pull" default:"false"`                                                                          // ForceImagePull always pulls the latest version of the image tags you've specified if a newer version is available
+	Timeout            int               `yaml:"timeout" json:"timeout" default:"180"`                                                                                              // Timeout is the time in seconds to wait for the deployment to finish in seconds before timing out
 	BuildOpts          struct {
 		ForceImagePull bool              `yaml:"force_image_pull" json:"force_image_pull" default:"false"` // ForceImagePull always attempt to pull a newer version of the image
 		Quiet          bool              `yaml:"quiet" json:"quiet" default:"false"`                       // Quiet suppresses the build output
 		Args           map[string]string `yaml:"args" json:"args"`                                         // BuildArgs is a map of build-time arguments to pass to the build process
 		NoCache        bool              `yaml:"no_cache" json:"no_cache" default:"false"`                 // NoCache disables the use of the cache when building images
 	} `yaml:"build_opts"` // BuildOpts is the build options for the deployment
+	GitDepth    int  `yaml:"git_depth" json:"git_depth" default:"0"` // GitDepth limits the number of commits to fetch. 0 means use global GIT_CLONE_DEPTH. A positive value overrides the global setting.
 	Destroy     bool `yaml:"destroy" json:"destroy" default:"false"` // Destroy removes the deployment and all its resources from the Docker host
 	DestroyOpts struct {
 		RemoveVolumes bool `yaml:"remove_volumes" json:"remove_volumes" default:"true"` // RemoveVolumes removes the volumes used by the deployment (always enabled in docker swarm mode)
 		RemoveImages  bool `yaml:"remove_images" json:"remove_images" default:"true"`   // RemoveImages removes the images used by the deployment (currently not supported in docker swarm mode)
 		RemoveRepoDir bool `yaml:"remove_dir" json:"remove_dir" default:"true"`         // RemoveRepoDir removes the repository directory after the deployment is destroyed
 	} `yaml:"destroy_opts" json:"destroy_opts"` // DestroyOpts is the destroy options for the deployment
-	Profiles         []string          `yaml:"profiles" json:"profiles" default:"[]"`              // Profiles is a list of profiles to use for the deployment, e.g., ["dev", "prod"]. See https://docs.docker.com/compose/how-tos/profiles/
-	ExternalSecrets  map[string]string `yaml:"external_secrets" json:"external_secrets"`           // ExternalSecrets maps env vars to secret IDs/keys for injecting secrets from external providers like Bitwarden SM at deployment, e.g. {"DB_PASSWORD": "138e3697-ed58-431c-b866-b3550066343a"}
-	AutoDiscover     bool              `yaml:"auto_discover" json:"auto_discover" default:"false"` // AutoDiscover enables autodiscovery of services to deploy in the working directory by checking for subdirectories with docker-compose files
+	Profiles         []string                     `yaml:"profiles" json:"profiles" default:"[]"`              // Profiles is a list of profiles to use for the deployment, e.g., ["dev", "prod"]. See https://docs.docker.com/compose/how-tos/profiles/
+	ExternalSecrets  map[string]ExternalSecretRef `yaml:"external_secrets" json:"external_secrets"`           // ExternalSecrets maps env vars to legacy string references or structured references (e.g. webhook store_ref/remote_ref).
+	AutoDiscover     bool                         `yaml:"auto_discover" json:"auto_discover" default:"false"` // AutoDiscover enables autodiscovery of services to deploy in the working directory by checking for subdirectories with docker-compose files
 	AutoDiscoverOpts struct {
 		ScanDepth int  `yaml:"depth" json:"depth" default:"0"`      // ScanDepth is the maximum depth of subdirectories to scan for docker-compose files
 		Delete    bool `yaml:"delete" json:"delete" default:"true"` // Delete removes obsolete auto-discovered deployments that are no longer present in the repository
 	} `yaml:"auto_discover_opts" json:"auto_discover_opts"` // AutoDiscoverOpts are options for the autodiscovery feature
+	Reconciliation struct {
+		Enabled  bool `yaml:"enabled" json:"enabled" default:"true"` // Enabled enables the reconciliation feature
+		Interval int  `yaml:"interval" json:"interval" default:"60"` // Interval is the interval in seconds at which the reconciliation job is run
+	} `yaml:"reconciliation" json:"reconciliation"` // Reconciliation is the configuration for the reconciliation feature
 	Internal struct {
 		File        string            `yaml:"-"` // File is the path to the deployment configuration file in the repository (if RepositoryUrl is not set) or in the cloned repository (if RepositoryUrl is set)
 		Environment map[string]string // Environment is stores environment variables for variable interpolation in the compose project
 		Hash        string            `yaml:"-"` // Hash is a hash of the DeployConfig struct (without changing the order of its elements)
 	} // Internal holds internal configuration values that are not set by the user
+}
+
+// ResolveGitDepth returns the effective git clone depth.
+// If the deploy-level GitDepth is > 0, it overrides the global value.
+// Otherwise the global depth is used. 0 means full clone (no limit).
+func (c *DeployConfig) ResolveGitDepth(globalDepth int) int {
+	if c.GitDepth > 0 {
+		return c.GitDepth
+	}
+
+	return globalDepth
 }
 
 // DefaultDeployConfig creates a DeployConfig with default values.
@@ -94,6 +112,10 @@ func (c DeployConfig) LogValue() slog.Value {
 func (c *DeployConfig) validateConfig() error {
 	if c.Name == "" && !c.AutoDiscover {
 		return fmt.Errorf("%w: name", ErrKeyNotFound)
+	}
+
+	if c.GitDepth < 0 {
+		return fmt.Errorf("%w: git_depth must be >= 0", ErrInvalidConfig)
 	}
 
 	c.WorkingDirectory = filepath.Clean(c.WorkingDirectory)
@@ -137,7 +159,7 @@ func (c *DeployConfig) validateConfig() error {
 	return nil
 }
 
-func (c *DeployConfig) UnmarshalYAML(unmarshal func(interface{}) error) error {
+func (c *DeployConfig) UnmarshalYAML(unmarshal func(any) error) error {
 	err := defaults.Set(c)
 	if err != nil {
 		return err
@@ -289,10 +311,10 @@ func GetDeployConfigs(repoRoot, deployConfigBaseDir, name, customTarget, referen
 					repoDir = path.Join(path.Dir(repoRoot), gitInternal.GetRepoName(string(c.RepositoryUrl)))
 
 					// Clone the repository to repoDir if it does not exist, otherwise fetch the latest changes and checkout to the correct reference
-					_, err = gitInternal.CloneRepository(repoDir, string(c.RepositoryUrl), c.Reference, appConfig.SkipTLSVerification, appConfig.HttpProxy, auth, appConfig.GitCloneSubmodules)
+					_, err = gitInternal.CloneRepository(repoDir, string(c.RepositoryUrl), c.Reference, appConfig.SkipTLSVerification, appConfig.HttpProxy, auth, appConfig.GitCloneSubmodules, c.ResolveGitDepth(appConfig.GitCloneDepth))
 					if err != nil {
 						if errors.Is(err, git.ErrRepositoryAlreadyExists) {
-							_, err = gitInternal.UpdateRepository(repoDir, string(c.RepositoryUrl), c.Reference, appConfig.SkipTLSVerification, appConfig.HttpProxy, auth, appConfig.GitCloneSubmodules)
+							_, err = gitInternal.UpdateRepository(repoDir, string(c.RepositoryUrl), c.Reference, appConfig.SkipTLSVerification, appConfig.HttpProxy, auth, appConfig.GitCloneSubmodules, c.ResolveGitDepth(appConfig.GitCloneDepth))
 							if err != nil {
 								return nil, fmt.Errorf("failed to update repository: %w", err)
 							}
@@ -524,9 +546,7 @@ func deepCopy(src, dst *DeployConfig) {
 
 	if src.BuildOpts.Args != nil {
 		dst.BuildOpts.Args = make(map[string]string)
-		for k, v := range src.BuildOpts.Args {
-			dst.BuildOpts.Args[k] = v
-		}
+		maps.Copy(dst.BuildOpts.Args, src.BuildOpts.Args)
 	}
 
 	if src.Profiles != nil {
@@ -535,9 +555,7 @@ func deepCopy(src, dst *DeployConfig) {
 	}
 
 	if src.ExternalSecrets != nil {
-		dst.ExternalSecrets = make(map[string]string)
-		for k, v := range src.ExternalSecrets {
-			dst.ExternalSecrets[k] = v
-		}
+		dst.ExternalSecrets = make(map[string]ExternalSecretRef)
+		maps.Copy(dst.ExternalSecrets, src.ExternalSecrets)
 	}
 }
