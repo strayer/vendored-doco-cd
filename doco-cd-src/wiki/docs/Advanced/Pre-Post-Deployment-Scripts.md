@@ -19,6 +19,8 @@ Available options to run scripts/commands during deployment or container lifecyc
 - [Sidecar Containers](#sidecar-containers)
 - [Compose Lifecycle Hooks](#compose-lifecycle-hooks)
 
+--8<-- "wiki/docs/_snippets/reconciliation-note.md"
+
 ## Init Containers
 
 Init containers are containers that run before the main application containers in your Docker Compose setup and complete their tasks before the main containers start. They are useful for performing setup tasks, such as initializing databases, running migrations, or preparing configuration files.
@@ -31,6 +33,9 @@ Some common use cases for init containers include:
 
 We use the `depends_on` option with the `condition: service_completed_successfully` condition to ensure that the main application container waits for the init container to complete successfully before starting. The init container will run its specified commands and exit with a status code of 0 to indicate success, allowing the main application container to start afterward.
 
+!!! success "Recommended Restart Policy for One-Time Script Services"
+    It is recommended to use `#!yaml restart: on-failure` for one-time script services to allow them to remain stopped after successful completion, while still enabling automatic restarts in case of failures.
+
 ### Example
 
 ```yaml title="docker-compose.yml" hl_lines="1-2 4-18 23 28-30"
@@ -40,16 +45,17 @@ x-common-env: &common-env
 services:
   init:
     image: busybox
+    restart: on-failure:3 # (3)!
     environment:
       <<: *common-env
     entrypoint: "sh -c"  # Use sh -c as the entrypoint to run multiple commands in "command" section
     volumes:
       - ./web:/web
     working_dir: /web
-    command:
+    command: # (1)!
       - |
         echo Starting pre-deployment script
-        echo "Hello $${MYVAR}!" > /web/index.html # Double dollar-sign is required here to use the variable in the shell script 
+        echo "Hello $${MYVAR}!" > /web/index.html
         echo Finished pre-deployment script
         exit 0  # Exit with code 0 to indicate success, not required if the last command already returns 0 but added here for clarity
 
@@ -63,8 +69,12 @@ services:
       - 8080:80
     depends_on:
       init:
-        condition: service_completed_successfully  # Wait for init container to complete/stop with exit code 0
+        condition: service_completed_successfully # (2)!
 ```
+
+1. Double dollar-sign (`$$`) is required to use variables in the shell script, otherwise Docker Compose will try to resolve it as a variable in the `docker-compose.yml` file instead of passing it to the container.
+2. Wait for init container to complete/stop with exit code 0
+3. Using `restart: on-failure:3` allows the init container to be retried up to 3 times in case of failure during script execution, while still allowing it to remain stopped after successful completion. To retry indefinitely, you can use `restart: on-failure` without a retry limit.
 
 - If you have a shell script in your repo for the init stuff, you can remove `entrypoint` and mount the script directly and run it via the `command` option:
   ```yaml title="docker-compose.yml"
@@ -84,8 +94,10 @@ If the deployment fails with an error containing a message like `container <init
 **Example**:
 ```yaml title="Add a sleep command to the init container in your docker-compose.yml"
 entrypoint: ["/bin/sh", "-c"]
-command: ["<your-commands-here> && sleep 3"]  # Depending on the complexity of your init commands, you may need to adjust the sleep duration.
+command: ["<your-commands-here> && sleep 3"] # (1)!
 ```
+
+1. Depending on the complexity of your init commands, you may need to adjust the sleep duration.
 
 Related issue: [#1115](https://github.com/kimdre/doco-cd/issues/1115)
 
@@ -113,6 +125,7 @@ services:
 
   sidecar:
     image: busybox
+    restart: always # (1)!
     volumes:
       - webdata:/webdata
     depends_on:
@@ -126,6 +139,8 @@ services:
           sleep 60
         done
 ```
+
+1. Using `restart: always` ensures that the sidecar container continues to run and perform its tasks as long as the main application container is running.
 
 ## Compose Lifecycle Hooks
 
@@ -194,3 +209,5 @@ services:
 - [Using lifecycle hooks with Compose](https://docs.docker.com/compose/how-tos/lifecycle/)
 - [Docker Compose Post Start Hook Documentation](https://docs.docker.com/reference/compose-file/services/#post_start)
 - [Docker Compose Pre Stop Hook Documentation](https://docs.docker.com/reference/compose-file/services/#pre_stop)
+- [Reconciliation settings](../Deploy-Settings.md#reconciliation-settings)
+- [Known Limitations: Reconciliation behavior for one-time services](../Known-Limitations.md#reconciliation-behavior-for-one-time-services)
