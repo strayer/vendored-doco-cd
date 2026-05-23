@@ -16,8 +16,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/filesystem"
+	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/utils/module"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
@@ -37,7 +40,6 @@ import (
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
 
-	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/prometheus"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
@@ -103,7 +105,7 @@ addComposeServiceLabels adds the labels docker compose expects to exist on servi
 This is required for future compose operations to work, such as finding
 containers that are part of a service.
 */
-func addComposeServiceLabels(project *types.Project, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+func addComposeServiceLabels(project *types.Project, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
 	workingDir, appVersion, timestamp, composeVersion, latestCommit, projectHash string,
 ) {
 	for i, s := range project.Services {
@@ -116,38 +118,38 @@ func addComposeServiceLabels(project *types.Project, deployConfig *config.Deploy
 		}
 
 		s.CustomLabels = map[string]string{
-			DocoCDLabels.Metadata.Manager:              config.AppName,
-			DocoCDLabels.Metadata.Version:              appVersion,
-			DocoCDLabels.Deployment.Name:               deployConfig.Name,
-			DocoCDLabels.Deployment.Timestamp:          timestamp,
-			DocoCDLabels.Deployment.ComposeHash:        projectHash,
-			DocoCDLabels.Deployment.WorkingDir:         workingDir,
-			DocoCDLabels.Deployment.Trigger:            payload.CommitSHA,
-			DocoCDLabels.Deployment.CommitSHA:          latestCommit,
-			DocoCDLabels.Deployment.TargetRef:          deployConfig.Reference,
-			DocoCDLabels.Deployment.ConfigHash:         deployConfig.Internal.Hash,
-			DocoCDLabels.Deployment.AutoDiscover:       strconv.FormatBool(deployConfig.AutoDiscover),
-			DocoCDLabels.Deployment.AutoDiscoverDelete: strconv.FormatBool(deployConfig.AutoDiscoverOpts.Delete),
-			DocoCDLabels.Repository.Name:               payload.FullName,
-			DocoCDLabels.Repository.URL:                payload.WebURL,
-			api.ProjectLabel:                           project.Name,
-			api.ServiceLabel:                           s.Name,
-			api.WorkingDirLabel:                        project.WorkingDir,
-			api.ConfigFilesLabel:                       strings.Join(project.ComposeFiles, ","),
-			api.VersionLabel:                           composeVersion,
-			api.OneoffLabel:                            "False", // default, will be overridden by docker compose
-			api.DependenciesLabel:                      strings.Join(dependencies, ","),
+			DocoCDLabels.Metadata.Manager:               app.Name,
+			DocoCDLabels.Metadata.Version:               appVersion,
+			DocoCDLabels.Deployment.Name:                deployConfig.Name,
+			DocoCDLabels.Deployment.Timestamp:           timestamp,
+			DocoCDLabels.Deployment.ComposeHash:         projectHash,
+			DocoCDLabels.Deployment.WorkingDir:          workingDir,
+			DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
+			DocoCDLabels.Deployment.CommitSHA:           latestCommit,
+			DocoCDLabels.Deployment.TargetRef:           deployConfig.Reference,
+			DocoCDLabels.Deployment.ConfigHash:          deployConfig.Internal.Hash,
+			DocoCDLabels.Deployment.AutoDiscovery:       strconv.FormatBool(deployConfig.AutoDiscovery.Enabled),
+			DocoCDLabels.Deployment.AutoDiscoveryDelete: strconv.FormatBool(deployConfig.AutoDiscovery.Delete),
+			DocoCDLabels.Repository.Name:                payload.FullName,
+			DocoCDLabels.Repository.URL:                 payload.WebURL,
+			api.ProjectLabel:                            project.Name,
+			api.ServiceLabel:                            s.Name,
+			api.WorkingDirLabel:                         project.WorkingDir,
+			api.ConfigFilesLabel:                        strings.Join(project.ComposeFiles, ","),
+			api.VersionLabel:                            composeVersion,
+			api.OneoffLabel:                             "False", // default, will be overridden by docker compose
+			api.DependenciesLabel:                       strings.Join(dependencies, ","),
 		}
 		project.Services[i] = s
 	}
 }
 
-func addComposeVolumeLabels(project *types.Project, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+func addComposeVolumeLabels(project *types.Project, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
 	appVersion, timestamp, composeVersion, latestCommit, projectHash string,
 ) {
 	for i, v := range project.Volumes {
 		v.CustomLabels = map[string]string{
-			DocoCDLabels.Metadata.Manager:       config.AppName,
+			DocoCDLabels.Metadata.Manager:       app.Name,
 			DocoCDLabels.Metadata.Version:       appVersion,
 			DocoCDLabels.Deployment.Name:        deployConfig.Name,
 			DocoCDLabels.Deployment.Timestamp:   timestamp,
@@ -175,7 +177,7 @@ func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, 
 	// the specified working directory. Without this, concurrent deployments with
 	// different working directories would fail since they share the same process
 	// working directory.
-	c, err := config.GetAppConfig()
+	c, err := app.GetConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get app config: %w", err)
 	}
@@ -300,7 +302,7 @@ func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, 
 
 // deployCompose deploys a project as specified by the Docker Compose specification (LoadCompose).
 func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Project,
-	deployConfig *config.DeployConfig, recreateMode string, services []string,
+	deployConfig *deploy.Config, recreateMode string, services []string,
 	needSignal []SignalService,
 ) error {
 	var (
@@ -323,7 +325,10 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	if deployConfig.PruneImages {
 		beforeImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to get existing images: %w", err)
+			// No such image error is okay since we wanted to remove the image anyway
+			if !strings.Contains(strings.ToLower(err.Error()), ErrNoSuchImage.Error()) {
+				return fmt.Errorf("failed to get existing images: %w", err)
+			}
 		}
 	}
 
@@ -372,31 +377,39 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 		QuietPull:            true,
 	}
 
-	startOpts := api.StartOptions{
-		Project:     project,
-		Wait:        true,
-		WaitTimeout: time.Duration(deployConfig.Timeout) * time.Second,
+	startServices, err := getStartServicesForDeploy(project)
+	if err != nil {
+		return err
 	}
 
-	err = service.Up(ctx, project, api.UpOptions{
-		Create: createOpts,
-		Start:  startOpts,
-	})
+	err = service.Create(ctx, project, createOpts)
 	if err != nil {
-		if errors.Is(err, ErrNoContainerToStart) {
-			err = service.Start(ctx, project.Name, startOpts)
-			if err != nil {
+		return err
+	}
+
+	if len(startServices) > 0 {
+		startOpts := api.StartOptions{
+			Project:     project,
+			Wait:        true,
+			WaitTimeout: time.Duration(deployConfig.Timeout) * time.Second,
+			Services:    startServices,
+		}
+
+		err = service.Start(ctx, project.Name, startOpts)
+		if err != nil {
+			if !errors.Is(err, ErrNoContainerToStart) {
 				return err
 			}
-		} else {
-			return err
 		}
 	}
 
 	if deployConfig.PruneImages {
 		afterImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
 		if err != nil {
-			return fmt.Errorf("failed to get images after deployment: %w", err)
+			// No such image error is okay since we wanted to remove the image anyway
+			if !strings.Contains(strings.ToLower(err.Error()), ErrNoSuchImage.Error()) {
+				return fmt.Errorf("failed to get images after deployment: %w", err)
+			}
 		}
 
 		// Determine unused images by comparing image SHAs used by services before and after the deployment
@@ -422,13 +435,20 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 // DeployStack deploys the stack using the provided deployment configuration.
 func DeployStack(
 	jobLog *slog.Logger, externalRepoPath string, ctx *context.Context,
-	dockerCli command.Cli, payload *webhook.ParsedPayload, deployConfig *config.DeployConfig,
+	dockerCli command.Cli, payload *webhook.ParsedPayload, deployConfig *deploy.Config,
 	detectedChanges []Change, needSignal []SignalService, latestCommit, appVersion string,
 ) error {
 	startTime := time.Now()
 
 	stackLog := jobLog.
 		With(slog.String("stack", deployConfig.Name))
+
+	stackLog.Debug("waiting for scheduler/deploy lock")
+	lock.LockScheduledDeploy()
+
+	defer lock.UnlockScheduledDeploy()
+
+	stackLog.Debug("acquired scheduler/deploy lock")
 
 	// Path on the host
 	externalWorkingDir := path.Join(externalRepoPath, deployConfig.WorkingDirectory)
@@ -445,6 +465,10 @@ func DeployStack(
 		deployConfig.EnvFiles, deployConfig.Profiles, deployConfig.Internal.Environment)
 	if err != nil {
 		return fmt.Errorf("failed to load compose config: %w", err)
+	}
+
+	if err = validateScheduledJobPolicies(project, swarm.GetModeEnabled()); err != nil {
+		return fmt.Errorf("invalid scheduled job restart policy: %w", err)
 	}
 
 	done := make(chan struct{})
@@ -563,6 +587,14 @@ func DeployStack(
 		}
 	}
 
+	// cache the deployment status after successful deployment
+	setDeployStatusToCache(gitInternal.GetRepoName(payload.CloneURL), deployConfig.Name,
+		deployStatus{
+			CommitSHA:   latestCommit,
+			ComposeHash: projectHash,
+		},
+	)
+
 	prometheus.DeploymentsTotal.WithLabelValues(deployConfig.Name).Inc()
 	prometheus.DeploymentDuration.WithLabelValues(deployConfig.Name).Observe(time.Since(startTime).Seconds())
 
@@ -572,7 +604,7 @@ func DeployStack(
 // DestroyStack destroys the stack using the provided deployment configuration.
 func DestroyStack(
 	jobLog *slog.Logger, ctx *context.Context,
-	dockerCli *command.Cli, deployConfig *config.DeployConfig,
+	dockerCli *command.Cli, deployConfig *deploy.Config,
 ) error {
 	stackLog := jobLog.
 		With(slog.String("stack", deployConfig.Name))
@@ -596,10 +628,10 @@ func DestroyStack(
 
 	downOpts := api.DownOptions{
 		RemoveOrphans: deployConfig.RemoveOrphans,
-		Volumes:       deployConfig.DestroyOpts.RemoveVolumes,
+		Volumes:       deployConfig.Destroy.RemoveVolumes,
 	}
 
-	if deployConfig.DestroyOpts.RemoveImages {
+	if deployConfig.Destroy.RemoveImages {
 		downOpts.Images = "all"
 	}
 
@@ -857,7 +889,7 @@ func (i IgnoredInfo) IsEmpty() bool {
 }
 
 func (i IgnoredInfo) IsNeedSignal() bool {
-	return len(i.NeedSendSignal) == 0
+	return len(i.NeedSendSignal) > 0
 }
 
 type SignalService struct {
@@ -1008,89 +1040,6 @@ func GetProjectContainers(ctx context.Context, dockerCli command.Cli, projectNam
 	})
 }
 
-// pruneImages tries to remove the specified image IDs from the Docker host and returns a list of pruned image IDs.
-// If an image is still in use by a running container, the image won't be removed.
-func pruneImages(ctx context.Context, dockerCli command.Cli, images []string) ([]string, error) {
-	var prunedImages []string
-
-	for _, img := range images {
-		result, err := dockerCli.Client().ImageRemove(ctx, img, client.ImageRemoveOptions{
-			Force:         true,
-			PruneChildren: true,
-		})
-		if err != nil {
-			if strings.Contains(err.Error(), "image is being used by running container") {
-				// Ignore error if image is being used by a running container
-				continue
-			}
-
-			if strings.Contains(strings.ToLower(err.Error()), "no such image") || strings.Contains(strings.ToLower(err.Error()), "not found") {
-				// Ignore error if image does not exist
-				continue
-			}
-
-			return nil, fmt.Errorf("failed to remove image %s: %w", img, err)
-		}
-
-		for _, r := range result.Items {
-			if r.Deleted != "" {
-				prunedImages = append(prunedImages, r.Deleted)
-			} else if r.Untagged != "" {
-				prunedImages = append(prunedImages, r.Untagged)
-			}
-		}
-	}
-
-	return prunedImages, nil
-}
-
-// PullImages pulls all images defined in the compose project.
-func PullImages(ctx context.Context, dockerCli command.Cli, projectName string) error {
-	service, err := compose.NewComposeService(dockerCli)
-	if err != nil {
-		return err
-	}
-
-	containers, err := GetProjectContainers(ctx, dockerCli, projectName)
-	if err != nil {
-		return fmt.Errorf("failed to get project containers: %w", err)
-	}
-
-	containerNames := make([]string, 0, len(containers))
-	for _, c := range containers {
-		containerNames = append(containerNames, c.Name)
-	}
-
-	project, err := service.Generate(ctx, api.GenerateOptions{ProjectName: projectName, Containers: containerNames})
-	if err != nil {
-		return fmt.Errorf("failed to generate project: %w", err)
-	}
-
-	return service.Pull(ctx, project, api.PullOptions{
-		Quiet: true,
-	})
-}
-
-// GetImages retrieves all image IDs used by the services in the compose project.
-func GetImages(ctx context.Context, dockerCli command.Cli, projectName string) (set.Set[string], error) {
-	service, err := compose.NewComposeService(dockerCli)
-	if err != nil {
-		return nil, err
-	}
-
-	imageSummaries, err := service.Images(ctx, projectName, api.ImagesOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("failed to get images: %w", err)
-	}
-
-	images := set.New[string]()
-	for _, img := range imageSummaries {
-		images.Add(img.ID)
-	}
-
-	return images, nil
-}
-
 // CheckDefaultComposeFiles checks if the default compose files are used and returns them if true.
 func CheckDefaultComposeFiles(composeFiles []string, workingDir string) ([]string, error) {
 	if reflect.DeepEqual(composeFiles, cli.DefaultFileNames) {
@@ -1218,4 +1167,43 @@ func DecryptProjectFiles(repoPath string, p *types.Project) ([]string, error) {
 	}
 
 	return decryptedFiles, nil
+}
+
+func getStartServicesForDeploy(project *types.Project) ([]string, error) {
+	startServices := make([]string, 0, len(project.Services))
+
+	for serviceName, svc := range project.Services {
+		labels := getServiceSchedulerLabels(svc)
+		_, hasScheduleLabel := labels[docoCDJobLabelNames.JobEnabled]
+
+		_, enabled, err := ParseJobScheduleLabels(labels)
+		if err != nil {
+			return nil, fmt.Errorf("service %s: %w", serviceName, err)
+		}
+
+		if enabled || hasScheduleLabel {
+			continue
+		}
+
+		if svc.GetScale() == 0 {
+			continue
+		}
+
+		startServices = append(startServices, serviceName)
+	}
+
+	return startServices, nil
+}
+
+func getServiceSchedulerLabels(svc types.ServiceConfig) map[string]string {
+	if len(svc.CustomLabels) == 0 {
+		return svc.Labels
+	}
+
+	labels := make(map[string]string, len(svc.Labels)+len(svc.CustomLabels))
+	maps.Copy(labels, svc.Labels)
+
+	maps.Copy(labels, svc.CustomLabels)
+
+	return labels
 }

@@ -4,26 +4,42 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/avast/retry-go/v5"
+
+	"github.com/kimdre/doco-cd/internal/config/app"
+
+	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/notification"
 )
+
+type githubRelease struct {
+	TagName      string `json:"tag_name"`
+	IsPreRelease bool   `json:"prerelease"`
+	IsDraft      bool   `json:"draft"`
+}
 
 // getLatestAppVersion gets the latest application version from the GitHub releases API.
 func getLatestAppReleaseVersion() (string, error) {
 	const releaseApiUrl = "https://api.github.com/repos/kimdre/doco-cd/releases"
 
-	var (
-		releases []struct {
-			TagName      string `json:"tag_name"`
-			IsPreRelease bool   `json:"prerelease"`
-			IsDraft      bool   `json:"draft"`
-		}
-		resp *http.Response
-	)
-
 	httpClient := &http.Client{Timeout: 3 * time.Second}
+
+	return getLatestAppReleaseVersionFromURL(releaseApiUrl, httpClient)
+}
+
+func getLatestAppReleaseVersionFromURL(releaseApiURL string, httpClient *http.Client) (string, error) {
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
+
+	var (
+		releases []githubRelease
+		resp     *http.Response
+	)
 
 	err := retry.New(
 		retry.Attempts(5),
@@ -33,14 +49,14 @@ func getLatestAppReleaseVersion() (string, error) {
 		func() error {
 			var err error
 
-			resp, err = httpClient.Get(releaseApiUrl)
+			resp, err = httpClient.Get(releaseApiURL)
 			if err != nil {
 				return err
 			}
 
 			defer func() {
 				if resp.Body != nil {
-					resp.Body.Close()
+					_ = resp.Body.Close()
 				}
 			}()
 
@@ -62,4 +78,28 @@ func getLatestAppReleaseVersion() (string, error) {
 	}
 
 	return "", errors.New("no stable release found")
+}
+
+func notificationForNewAppVersion(log *slog.Logger) {
+	latestVersion, err := getLatestAppReleaseVersion()
+	if err != nil {
+		log.Error("failed to get latest application release version", logger.ErrAttr(err))
+	} else {
+		if app.Version != latestVersion {
+			log.Warn("new application version available",
+				slog.String("current", app.Version),
+				slog.String("latest", latestVersion),
+			)
+
+			err = notification.Send(notification.Info,
+				"New version of doco-cd is available",
+				fmt.Sprintf("Current Version: %s\nLatest Version: %s\n\nhttps://github.com/kimdre/doco-cd/releases", app.Version, latestVersion),
+				notification.Metadata{})
+			if err != nil {
+				return
+			}
+		} else {
+			log.Debug("application is up to date", slog.String("version", app.Version))
+		}
+	}
 }

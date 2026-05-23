@@ -29,6 +29,7 @@ You can think of it as a simple Portainer or ArgoCD alternative for Docker.
 - Supports various [Git providers](https://doco.cd/latest/#supported-git-providers)
 - Supports both Docker Compose projects and Swarm stacks in [Swarm mode](https://doco.cd/latest/Advanced/Swarm-Mode/).
 - Provides [notifications](https://doco.cd/latest/Advanced/Notifications/) and [Prometheus metrics](https://doco.cd/latest/Endpoints/Metrics/) for monitoring.
+- Supports [Job Scheduling / Cron Jobs](https://doco.cd/latest/Advanced/Job-Scheduling/) for running periodic tasks.
 
 ## Documentation
 
@@ -37,11 +38,11 @@ You can find the documentation at [doco.cd](https://doco.cd/latest/).
 ## Community
 
 - Ask questions or discuss ideas on [GitHub Discussions](https://github.com/kimdre/doco-cd/discussions)
-- Report bugs or suggest features by [opening an issue](https://github.com/kimdre/doco-cd/issues/new)
+- Report bugs or suggest features by [opening an issue](https://github.com/kimdre/doco-cd/issues/new/choose)
 
 ## Contributing
 
-Contributions are welcome! Please see the [contributing guidelines](https://github.com/kimdre/doco-cd/blob/main/CONTRIBUTING.md) for more information.
+Contributions are welcome! Please see the [contributing guidelines](https://doco.cd/latest/Contributing/) for more information.
 
 ## Star History
 

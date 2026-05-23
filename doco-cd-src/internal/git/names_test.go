@@ -1,0 +1,68 @@
+package git
+
+import (
+	"testing"
+)
+
+func TestGetFullName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		cloneURL string
+		expected string
+	}{
+		{
+			cloneURL: "https://github.com/kimdre/doco-cd_tests.git",
+			expected: "kimdre/doco-cd_tests",
+		},
+		{
+			cloneURL: "https://user:password@github.com/kimdre/doco-cd_tests.git", // #nosec G101 -- This is a test URL, not a real token
+			expected: "kimdre/doco-cd_tests",
+		},
+		{
+			cloneURL: "http://git.example.com/doco-cd.git",
+			expected: "doco-cd",
+		},
+		// SSH SCP-like
+		{
+			cloneURL: "git@github.com:kimdre/doco-cd_tests.git",
+			expected: "kimdre/doco-cd_tests",
+		},
+		// SSH URL
+		{
+			cloneURL: "ssh://git@github.com/kimdre/doco-cd_tests.git",
+			expected: "kimdre/doco-cd_tests",
+		},
+		{
+			cloneURL: "ssh://github.com/kimdre/doco-cd_tests.git",
+			expected: "kimdre/doco-cd_tests",
+		},
+		// Token-injected HTTPS
+		{
+			cloneURL: "https://oauth2:TOKEN@github.com/kimdre/doco-cd_tests.git", // #nosec G101 -- This is a test URL, not a real token
+			expected: "kimdre/doco-cd_tests",
+		},
+		{
+			cloneURL: "http://git.example.com/infra/alpha/local/netbird-doco.git",
+			expected: "infra/alpha/local/netbird-doco",
+		},
+		{
+			cloneURL: "git@gitlab.com:gitlab-org/5-minute-production-app/sandbox/cats.git",
+			expected: "gitlab-org/5-minute-production-app/sandbox/cats",
+		},
+		{
+			cloneURL: "https://gitlab.com/gitlab-org/5-minute-production-app/sandbox/cats.git",
+			expected: "gitlab-org/5-minute-production-app/sandbox/cats",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.cloneURL, func(t *testing.T) {
+			t.Parallel()
+
+			result := GetFullName(tt.cloneURL)
+			if result != tt.expected {
+				t.Errorf("getFullName failed for %s: expected %s, got %s", tt.cloneURL, tt.expected, result)
+			}
+		})
+	}
+}

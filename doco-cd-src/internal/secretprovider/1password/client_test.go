@@ -3,13 +3,13 @@ package onepassword
 import (
 	"testing"
 
-	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/config/app"
 )
 
 func skipWrongProvider(t *testing.T) {
 	t.Helper()
 
-	c, err := config.GetAppConfig()
+	c, err := app.GetConfig()
 	if err != nil {
 		t.Fatalf("unable to get app config: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestProvider_GetSecret_OnePassword(t *testing.T) {
 		t.Fatalf("unable to get config: %v", err)
 	}
 
-	provider, err := NewProvider(t.Context(), cfg.AccessToken, "test")
+	provider, err := NewProvider(t.Context(), cfg, "test")
 	if err != nil {
 		t.Fatalf("Failed to create OnePassword provider: %v", err)
 	}

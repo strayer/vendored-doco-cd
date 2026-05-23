@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 )
@@ -38,7 +38,7 @@ func (s *StageManager) RunDestroyStage(ctx context.Context, stageLog *slog.Logge
 
 	// Find deployed commit and external secrets hash from labels of deployed services
 	for _, labels := range serviceLabels {
-		if labels[docker.DocoCDLabels.Metadata.Manager] == config.AppName {
+		if labels[docker.DocoCDLabels.Metadata.Manager] == app.Name {
 			managed = true
 			break
 		}
@@ -53,14 +53,14 @@ func (s *StageManager) RunDestroyStage(ctx context.Context, stageLog *slog.Logge
 		return fmt.Errorf("failed to destroy stack: %w", err)
 	}
 
-	if swarm.GetModeEnabled() && s.DeployConfig.DestroyOpts.RemoveVolumes {
+	if swarm.GetModeEnabled() && s.DeployConfig.Destroy.RemoveVolumes {
 		err = docker.RemoveLabeledVolumes(ctx, s.Docker.Cmd.Client(), s.DeployConfig.Name)
 		if err != nil {
 			return fmt.Errorf("failed to remove volumes: %w", err)
 		}
 	}
 
-	if s.DeployConfig.DestroyOpts.RemoveRepoDir {
+	if s.DeployConfig.Destroy.RemoveRepoDir {
 		// Remove the repository directory after destroying the stack
 		stageLog.Debug("removing deployment directory", slog.String("path", s.Repository.PathExternal))
 		// Check if the parent directory has multiple subdirectories/repos

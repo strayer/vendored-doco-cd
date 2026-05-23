@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1@sha256:2780b5c3bab67f1f76c781860de469442999ed1a0d7992a5efdf2cffc0e3d769
-FROM golang:1.26.2@sha256:1e598ea5752ae26c093b746fd73c5095af97d6f2d679c43e83e0eac484a33dc3 AS prerequisites
+FROM golang:1.26.3@sha256:2981696eed011d747340d7252620932677929cce7d2d539602f56a8d7e9b660b AS prerequisites
 
 ARG APP_VERSION=dev
 ARG DISABLE_BITWARDEN=false
@@ -9,14 +9,16 @@ ARG TARGETVARIANT
 # Set destination for COPY
 WORKDIR /app
 
-# Automatically disable Bitwarden for armv7
-# The Bitwarden Go SDK does not support 32-bit ARM architecture
-RUN if [ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]; then \
-    echo "Detected armv7 architecture - Bitwarden support will be disabled"; \
+# Automatically disable Bitwarden for armv7 and riscv64
+# The Bitwarden Go SDK does not support 32-bit ARM architecture or RISC-V 64-bit architecture
+RUN if ([ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]) || ([ "$TARGETARCH" = "riscv64" ]); then \
+    echo "Detected unsupported ${TARGETARCH} ${TARGETVARIANT} architecture - Bitwarden support will be disabled"; \
     fi
 
-# Install prerequisites for Bitwarden SDK (only if not disabled and not armv7)
-RUN if [ "$DISABLE_BITWARDEN" != "true" ] && ! ([ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]); then \
+# Install prerequisites for Bitwarden SDK (only if not disabled and not armv7 or riscv64)
+RUN if [ "$DISABLE_BITWARDEN" != "true" ] && \
+    ! ([ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]) && \
+    ! ([ "$TARGETARCH" = "riscv64" ]); then \
     apt-get update && apt-get install -y \
     musl-tools \
     && rm -rf /var/lib/apt/lists/*; \
@@ -45,18 +47,18 @@ ARG TARGETVARIANT
 COPY . .
 
 # Build with or without Bitwarden support
-# armv7 builds are automatically built without Bitwarden
+# armv7 and riscv64 builds are automatically built without Bitwarden
 # CGO_ENABLED=1 and CC=musl-gcc are required for Bitwarden SDK when enabled
 # For builds without Bitwarden, CGO is not needed
 RUN --mount=type=cache,target=/go/pkg/mod/ \
     --mount=type=cache,target="/root/.cache/go-build" \
     --mount=type=bind,target=. \
-    if [ "$DISABLE_BITWARDEN" = "true" ] || ([ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]); then \
+    if [ "$DISABLE_BITWARDEN" = "true" ] || ([ "$TARGETARCH" = "arm" ] && [ "$TARGETVARIANT" = "v7" ]) || ([ "$TARGETARCH" = "riscv64" ]); then \
         echo "Building without Bitwarden support"; \
-        CGO_ENABLED=1 go build -tags nobitwarden -ldflags="-s -w -X github.com/kimdre/doco-cd/internal/config.AppVersion=${APP_VERSION}" -o / ./...; \
+        CGO_ENABLED=1 go build -tags nobitwarden -ldflags="-s -w -X github.com/kimdre/doco-cd/internal/config/app.Version=${APP_VERSION}" -o / ./...; \
     else \
         echo "Building with Bitwarden support"; \
-        CGO_ENABLED=1 CC=musl-gcc go build -ldflags="-s -w -X github.com/kimdre/doco-cd/internal/config.AppVersion=${APP_VERSION} ${BW_SDK_BUILD_FLAGS}" -o / ./...; \
+        CGO_ENABLED=1 CC=musl-gcc go build -ldflags="-s -w -X github.com/kimdre/doco-cd/internal/config/app.Version=${APP_VERSION} ${BW_SDK_BUILD_FLAGS}" -o / ./...; \
     fi
 
 FROM gcr.io/distroless/base-debian13@sha256:c83f022002fc917a92501a8c30c605efdad3010157ba2c8998a2cbf213299201 AS release

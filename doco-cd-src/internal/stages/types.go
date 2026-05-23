@@ -10,10 +10,13 @@ import (
 	"github.com/go-git/go-git/v5"
 	"github.com/moby/moby/api/types/container"
 
+	types2 "github.com/kimdre/doco-cd/internal/config"
+
+	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/notification"
 
-	"github.com/kimdre/doco-cd/internal/config"
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	"github.com/kimdre/doco-cd/internal/webhook"
@@ -106,7 +109,7 @@ type Stages struct {
 
 // RepositoryData holds information about the triggering repository.
 type RepositoryData struct {
-	CloneURL     config.HttpUrl  // Repository clone URL (e.g., "https://github.com/user/my-repo.git")
+	CloneURL     types2.HttpUrl  // Repository clone URL (e.g., "https://github.com/user/my-repo.git")
 	Name         string          // Repository name (e.g., "user/my-repo")
 	PathInternal string          // Path to the repository inside the container
 	PathExternal string          // Path to the repository on the host machine
@@ -133,13 +136,14 @@ type StageManager struct {
 	JobID             string            // Unique identifier for the job
 	JobTrigger        JobTrigger        // Trigger type for the job (e.g., "webhook", "poll")
 	NotifyFailureFunc NotifyFailureFunc // Function to call on failure
-	AppConfig         *config.AppConfig
-	DeployConfig      *config.DeployConfig
+	AppConfig         *app.Config
+	DeployConfig      *deploy.Config
 	DeployState       *DeploymentState
 	Docker            *Docker
 	Payload           *webhook.ParsedPayload
 	Repository        *RepositoryData
 	SecretProvider    *secretprovider.SecretProvider
+	Metadata          notification.Metadata // Notification metadata (may include reconciliation event info)
 }
 
 type NotifyFailureFunc func(log *slog.Logger, err error, metadata notification.Metadata)
@@ -148,8 +152,9 @@ type NotifyFailureFunc func(log *slog.Logger, err error, metadata notification.M
 func NewStageManager(jobID string, jobTrigger JobTrigger, log *slog.Logger,
 	failNotifyFunc NotifyFailureFunc,
 	repoData *RepositoryData, dockerData *Docker, payload *webhook.ParsedPayload,
-	appConfig *config.AppConfig, deployConfig *config.DeployConfig,
+	appConfig *app.Config, deployConfig *deploy.Config,
 	secretProvider *secretprovider.SecretProvider,
+	metadata notification.Metadata,
 ) *StageManager {
 	return &StageManager{
 		Log:               log.With(),
@@ -163,6 +168,7 @@ func NewStageManager(jobID string, jobTrigger JobTrigger, log *slog.Logger,
 		Payload:           payload,
 		Repository:        repoData,
 		SecretProvider:    secretProvider,
+		Metadata:          metadata,
 		Stages: &Stages{
 			Init: &InitStageData{
 				MetaData: NewMetaData(StageInit),
@@ -174,10 +180,13 @@ func NewStageManager(jobID string, jobTrigger JobTrigger, log *slog.Logger,
 				MetaData: NewMetaData(StageDeploy),
 			},
 			Destroy: &DestroyStageData{
-				MetaData: NewMetaData(StageDeploy),
+				MetaData: NewMetaData(StageDestroy),
 			},
 			PostDeploy: &PostDeployStageData{
 				MetaData: NewMetaData(StagePostDeploy),
+			},
+			PostDestroy: &PostDestroyStageData{
+				MetaData: NewMetaData(StagePostDestroy),
 			},
 			Cleanup: &CleanupStageData{
 				MetaData: NewMetaData(StageCleanup),
@@ -232,11 +241,12 @@ func (s *StageManager) NotifyFailure(notifyErr error) {
 
 		revision := notification.GetRevision(s.DeployConfig.Reference, commitSha)
 
-		s.NotifyFailureFunc(s.Log, notifyErr, notification.Metadata{
-			Repository: s.Repository.Name,
-			Stack:      s.DeployConfig.Name,
-			Revision:   revision,
-			JobID:      s.JobID,
-		})
+		metadata := s.Metadata
+		metadata.Repository = s.Repository.Name
+		metadata.Stack = s.DeployConfig.Name
+		metadata.Revision = revision
+		metadata.JobID = s.JobID
+
+		s.NotifyFailureFunc(s.Log, notifyErr, metadata)
 	}
 }

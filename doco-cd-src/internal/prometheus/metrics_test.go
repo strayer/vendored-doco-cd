@@ -9,7 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
-	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/config/app"
 )
 
 // TestServe tests the metrics endpoint serving functionality.
@@ -19,12 +19,13 @@ func TestServe(t *testing.T) {
 	expectedStatusCode := 200
 	expectedContentType := "text/plain; version=0.0.4; charset=utf-8; escaping=underscores"
 
-	appConfig, err := config.GetAppConfig()
+	appConfig, err := app.GetConfig()
 	if err != nil {
 		t.Fatalf("Failed to get app config: %v", err)
 	}
 
 	AppInfo.WithLabelValues("test", appConfig.LogLevel, time.Now().Format(time.RFC3339)).Set(1)
+	ScheduledRunsTotal.WithLabelValues("test-stack", "backup", "container", "restart").Inc()
 
 	req, err := http.NewRequest("GET", MetricsPath, nil)
 	if err != nil {
@@ -52,5 +53,9 @@ func TestServe(t *testing.T) {
 	// Check if the response body contains the expected metrics
 	if !strings.Contains(rr.Body.String(), "doco_cd_info") {
 		t.Error("Expected response body to contain 'doco_cd_info' metric, but it does not")
+	}
+
+	if !strings.Contains(rr.Body.String(), "doco_cd_scheduled_runs_total") {
+		t.Error("Expected response body to contain 'doco_cd_scheduled_runs_total' metric, but it does not")
 	}
 }

@@ -30,6 +30,8 @@ nav = [
   { Configuration = [
     { "App Settings" = "App-Settings.md" },
     { "Deploy Settings" = "Deploy-Settings.md" },
+    { "Docker Settings" = "Docker-Settings.md" },
+    { "Git Settings" = "Git-Settings.md" },
     { "Poll Settings" = "Poll-Settings.md" },
   ] },
   { Advanced = [
@@ -42,16 +44,19 @@ nav = [
       { "Bitwarden Secrets Manager" = "External-Secrets/Bitwarden-Secrets-Manager.md" },
       { "Bitwarden Vault / Vaultwarden" = "External-Secrets/Bitwarden-Vault-Vaultwarden.md" },
       { "1Password" = "External-Secrets/1Password.md" },
+      { "1Password Connect" = "External-Secrets/1Password-Connect.md" },
       { Infisical = "External-Secrets/Infisical.md" },
       { OpenBao = "External-Secrets/Openbao.md" },
       { Webhook = "External-Secrets/Webhook.md" }] },
     { Notifications = "Advanced/Notifications.md" },
     { "Pre- / Post-Deployment Scripts" = "Advanced/Pre-Post-Deployment-Scripts.md" },
-    { "Tips & Tricks" = "Advanced/Tips-and-Tricks.md" }
+    { "Job Scheduling / Cron Jobs" = "Advanced/Job-Scheduling.md" },
+    { "Tips & Tricks" = "Advanced/Tips-and-Tricks.md" },
   ] },
   { Reference = [
     { "Core Concepts" = "Core-Concepts.md" },
     { Endpoints = [
+      { "Healthcheck" = "Endpoints/Healthcheck.md" },
       { "Prometheus Metrics / Monitoring" = "Endpoints/Metrics.md" },
       { "REST API" = "Endpoints/REST-API.md" },
       { "Webhook Listener" = "Endpoints/Webhook-Listener.md" },
@@ -85,6 +90,7 @@ features = [
   "content.code.select",
   "content.code.copy",
   "content.code.annotate",
+  "content.footnote.tooltips",
   "navigation.footer",
   "navigation.indexes",
   "navigation.instant",
@@ -183,6 +189,8 @@ custom_checkbox = true
 
 [project.markdown_extensions.pymdownx.tilde]
 [project.markdown_extensions.pymdownx.snippets]
+auto_append = ["wiki/includes/abbreviations.md"]
+check_paths = true
 
 # zensical
 [project.markdown_extensions.zensical.extensions.preview]

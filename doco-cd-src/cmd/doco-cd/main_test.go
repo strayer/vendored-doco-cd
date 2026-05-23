@@ -19,6 +19,8 @@ import (
 	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/moby/moby/api/types/container"
 
+	"github.com/kimdre/doco-cd/internal/config/app"
+
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
 	"github.com/kimdre/doco-cd/internal/utils/id"
@@ -28,7 +30,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 
-	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/git"
@@ -201,7 +202,7 @@ func TestHandleEvent(t *testing.T) {
 		},
 	}
 
-	appConfig, err := config.GetAppConfig()
+	appConfig, err := app.GetConfig()
 	if err != nil {
 		t.Fatalf("failed to get app config: %s", err.Error())
 	}
@@ -210,6 +211,12 @@ func TestHandleEvent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
+
+	t.Cleanup(func() {
+		if closeErr := dockerCli.Client().Close(); closeErr != nil {
+			t.Logf("Failed to close Docker client: %v", closeErr)
+		}
+	})
 
 	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
@@ -250,13 +257,6 @@ func TestHandleEvent(t *testing.T) {
 			jobLog := logger.New(logger.LevelCritical).With(slog.String("job_id", jobID))
 
 			ctx := context.Background()
-
-			t.Cleanup(func() {
-				err = dockerCli.Client().Close()
-				if err != nil {
-					return
-				}
-			})
 
 			err = docker.VerifySocketConnection()
 			if err != nil {
@@ -318,7 +318,7 @@ func TestHandleEvent(t *testing.T) {
 				retry.Attempts(3),
 				retry.Delay(1*time.Second),
 				retry.RetryIf(func(err error) bool {
-					return strings.Contains(err.Error(), "No such image:")
+					return strings.Contains(strings.ToLower(err.Error()), "no such image")
 				}),
 			).Do(func() error {
 				HandleEvent(

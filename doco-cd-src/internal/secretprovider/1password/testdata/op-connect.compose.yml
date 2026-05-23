@@ -1,0 +1,57 @@
+services:
+  init-tools:
+    image: busybox:latest
+    entrypoint: "sh -xec"
+    command:
+      - cp /bin/busybox /tools/wget
+    volumes:
+      - op_tools:/tools
+
+  op-connect-api:
+    image: 1password/connect-api:latest@sha256:e915c0c843972f02b0e7e2de502bda8bd4a092288b3f1866098a857bd715a281
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./internal/secretprovider/1password/testdata/1password-credentials.json:/home/opuser/.op/1password-credentials.json
+      - op_data:/home/opuser/.op/data
+      - op_tools:/opt/tools:ro
+    depends_on:
+      init-tools:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/opt/tools/wget", "--spider", "-q", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  op-connect-sync:
+    image: 1password/connect-sync:latest@sha256:6297ca6136c0f0fb096bc64c49e1bc8df2aab35282ebff8c7bb60745ef176d0d
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./internal/secretprovider/1password/testdata/1password-credentials.json:/home/opuser/.op/1password-credentials.json
+      - op_data:/home/opuser/.op/data
+      - op_tools:/opt/tools:ro
+    depends_on:
+      init-tools:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/opt/tools/wget", "--spider", "-q", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  app: # doco-cd
+    environment:
+      SECRET_PROVIDER: 1password
+      SECRET_PROVIDER_CONNECT_HOST: http://op-connect-api:8080
+      SECRET_PROVIDER_CONNECT_TOKEN: ${SECRET_PROVIDER_CONNECT_TOKEN}
+    depends_on:
+      op-connect-api:
+        condition: service_healthy
+
+volumes:
+  op_data:
+  op_tools:

@@ -608,6 +608,17 @@ func updateSubmodules(repo *git.Repository, auth transport.AuthMethod, depth int
 			Depth:             depth,
 		}
 
+		if subCfg := submodule.Config(); subCfg != nil && subCfg.URL != "" {
+			resolvedAuth, err := GetAuthMethod(subCfg.URL, "", "", "")
+			if err != nil {
+				return fmt.Errorf("failed to resolve auth method for submodule %s: %w", subCfg.Path, err)
+			}
+
+			if resolvedAuth != nil {
+				opts.Auth = resolvedAuth
+			}
+		}
+
 		err = retrier.Do(
 			func() error {
 				if err = submodule.Update(opts); err != nil {
@@ -1036,17 +1047,6 @@ func normalizeOwnerRepo(p string) string {
 	// Trim trailing '.git'
 	p = strings.TrimSuffix(p, ".git")
 
-	// Clean path and split
-	clean := path.Clean(p)
-
-	parts := strings.Split(clean, "/")
-	if len(parts) < 2 {
-		// Not enough segments to form owner/repo
-		return clean // safest fallback; avoids panic
-	}
-
-	owner := parts[len(parts)-2]
-	repo := parts[len(parts)-1]
-
-	return owner + "/" + repo
+	// Clean path
+	return path.Clean(p)
 }
