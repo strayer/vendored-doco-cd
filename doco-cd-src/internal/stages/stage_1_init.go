@@ -10,7 +10,7 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 	"github.com/kimdre/doco-cd/internal/git"
@@ -49,7 +49,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 
 		// Load local (without remote: prefix) dotenv files before paths get updated to remote repository
 		// Remote dotenv files get read later
-		err = config.LoadLocalDotEnv(s.DeployConfig, s.Repository.PathInternal)
+		err = deploy.LoadLocalDotEnv(s.DeployConfig, s.Repository.PathInternal)
 		if err != nil {
 			return fmt.Errorf("failed to parse local env files: %w", err)
 		}
@@ -118,7 +118,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		}
 
 		// Now also load remote dotenv files
-		err = config.LoadLocalDotEnv(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
+		err = deploy.LoadLocalDotEnv(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
 		if err != nil {
 			return fmt.Errorf("failed to parse remote env files: %w", err)
 		}
@@ -132,7 +132,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		maps.Copy(s.DeployConfig.Internal.Environment, s.DeployConfig.Environment)
 	}
 
-	if s.DeployConfig.Destroy {
+	if s.DeployConfig.Destroy.Enabled {
 		// Skip deployment if another project with the same name already exists
 		// Check if containers do not belong to this repository or if doco-cd does not manage the stack
 		correctRepo := true
@@ -145,7 +145,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		for _, labels := range serviceLabels {
 			name, ok := labels[docker.DocoCDLabels.Repository.Name]
 
-			if !ok || name != getFullName(s.Repository.CloneURL) {
+			if !ok || name != git.GetFullName(string(s.Repository.CloneURL)) {
 				correctRepo = false
 				break
 			}
@@ -181,7 +181,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 			Name:      git.GetRepoName(string(s.Repository.CloneURL)),
 			Ref:       s.DeployConfig.Reference,
 			CommitSHA: string(JobTriggerPoll),
-			FullName:  getFullName(s.Repository.CloneURL),
+			FullName:  git.GetFullName(string(s.Repository.CloneURL)),
 			CloneURL:  string(s.Repository.CloneURL),
 			WebURL:    string(s.Repository.CloneURL),
 		}

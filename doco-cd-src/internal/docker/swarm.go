@@ -18,6 +18,9 @@ import (
 	swarmTypes "github.com/moby/moby/api/types/swarm"
 	dockerClient "github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
+
 	swarmInternal "github.com/kimdre/doco-cd/internal/docker/swarm"
 
 	"github.com/compose-spec/compose-go/v2/types"
@@ -27,8 +30,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/docker/options"
 
 	"github.com/kimdre/doco-cd/internal/webhook"
-
-	"github.com/kimdre/doco-cd/internal/config"
 )
 
 var (
@@ -38,7 +39,7 @@ var (
 
 // LoadSwarmStack loads a Docker Swarm stack using the provided project and deploy configuration.
 func LoadSwarmStack(dockerCli command.Cli, project *types.Project,
-	deployConfig *config.DeployConfig, externalWorkingDir string,
+	deployConfig *deploy.Config, externalWorkingDir string,
 ) (*composetypes.Config, *options.Deploy, error) {
 	opts := options.Deploy{
 		Composefiles:     project.ComposeFiles,
@@ -82,24 +83,32 @@ func RemoveSwarmStack(ctx context.Context, dockerCli command.Cli, namespace stri
 }
 
 // addSwarmServiceLabels adds custom labels to the service containers in a Docker Swarm stack.
-func addSwarmServiceLabels(stack *composetypes.Config, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+func addSwarmServiceLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
 	repoDir, appVersion, timestamp, latestCommit, projectHash string,
 ) {
 	customLabels := map[string]string{
-		DocoCDLabels.Metadata.Manager:              config.AppName,
-		DocoCDLabels.Metadata.Version:              appVersion,
-		DocoCDLabels.Deployment.Name:               deployConfig.Name,
-		DocoCDLabels.Deployment.Timestamp:          timestamp,
-		DocoCDLabels.Deployment.ComposeHash:        projectHash,
-		DocoCDLabels.Deployment.WorkingDir:         repoDir,
-		DocoCDLabels.Deployment.Trigger:            payload.CommitSHA,
-		DocoCDLabels.Deployment.CommitSHA:          latestCommit,
-		DocoCDLabels.Deployment.TargetRef:          deployConfig.Reference,
-		DocoCDLabels.Deployment.ConfigHash:         deployConfig.Internal.Hash,
-		DocoCDLabels.Deployment.AutoDiscover:       strconv.FormatBool(deployConfig.AutoDiscover),
-		DocoCDLabels.Deployment.AutoDiscoverDelete: strconv.FormatBool(deployConfig.AutoDiscoverOpts.Delete),
-		DocoCDLabels.Repository.Name:               payload.FullName,
-		DocoCDLabels.Repository.URL:                payload.WebURL,
+		DocoCDLabels.Metadata.Manager:               app.Name,
+		DocoCDLabels.Metadata.Version:               appVersion,
+		DocoCDLabels.Deployment.Name:                deployConfig.Name,
+		DocoCDLabels.Deployment.Timestamp:           timestamp,
+		DocoCDLabels.Deployment.ComposeHash:         projectHash,
+		DocoCDLabels.Deployment.WorkingDir:          repoDir,
+		DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
+		DocoCDLabels.Deployment.CommitSHA:           latestCommit,
+		DocoCDLabels.Deployment.TargetRef:           deployConfig.Reference,
+		DocoCDLabels.Deployment.ConfigHash:          deployConfig.Internal.Hash,
+		DocoCDLabels.Deployment.AutoDiscovery:       strconv.FormatBool(deployConfig.AutoDiscovery.Enabled),
+		DocoCDLabels.Deployment.AutoDiscoveryDelete: strconv.FormatBool(deployConfig.AutoDiscovery.Delete),
+		DocoCDLabels.Repository.Name:                payload.FullName,
+		DocoCDLabels.Repository.URL:                 payload.WebURL,
+	}
+
+	// Service-level labels (ServiceSpec.Annotations.Labels) are required for Docker
+	// service events to be filterable by label. These are set via Deploy.Labels.
+	serviceLevelLabels := map[string]string{
+		DocoCDLabels.Metadata.Manager: app.Name,
+		DocoCDLabels.Deployment.Name:  deployConfig.Name,
+		DocoCDLabels.Repository.Name:  payload.FullName,
 	}
 
 	for i, s := range stack.Services {
@@ -109,16 +118,22 @@ func addSwarmServiceLabels(stack *composetypes.Config, deployConfig *config.Depl
 
 		maps.Copy(s.Labels, customLabels)
 
+		if s.Deploy.Labels == nil {
+			s.Deploy.Labels = make(map[string]string)
+		}
+
+		maps.Copy(s.Deploy.Labels, serviceLevelLabels)
+
 		stack.Services[i] = s
 	}
 }
 
 // addSwarmVolumeLabels adds custom labels to the volumes in a Docker Swarm stack.
-func addSwarmVolumeLabels(stack *composetypes.Config, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+func addSwarmVolumeLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
 	repoDir, appVersion, timestamp, latestCommit string,
 ) {
 	customLabels := map[string]string{
-		DocoCDLabels.Metadata.Manager:      config.AppName,
+		DocoCDLabels.Metadata.Manager:      app.Name,
 		DocoCDLabels.Metadata.Version:      appVersion,
 		DocoCDLabels.Deployment.Name:       deployConfig.Name,
 		DocoCDLabels.Deployment.Timestamp:  timestamp,
@@ -142,11 +157,11 @@ func addSwarmVolumeLabels(stack *composetypes.Config, deployConfig *config.Deplo
 }
 
 // addSwarmConfigLabels adds custom labels to the configs in a Docker Swarm stack.
-func addSwarmConfigLabels(stack *composetypes.Config, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+func addSwarmConfigLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
 	repoDir, appVersion, timestamp, latestCommit string,
 ) {
 	customLabels := map[string]string{
-		DocoCDLabels.Metadata.Manager:      config.AppName,
+		DocoCDLabels.Metadata.Manager:      app.Name,
 		DocoCDLabels.Metadata.Version:      appVersion,
 		DocoCDLabels.Deployment.Name:       deployConfig.Name,
 		DocoCDLabels.Deployment.Timestamp:  timestamp,
@@ -169,11 +184,11 @@ func addSwarmConfigLabels(stack *composetypes.Config, deployConfig *config.Deplo
 	}
 }
 
-func addSwarmSecretLabels(stack *composetypes.Config, deployConfig *config.DeployConfig, payload *webhook.ParsedPayload,
+func addSwarmSecretLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
 	repoDir, appVersion, timestamp, latestCommit string,
 ) {
 	customLabels := map[string]string{
-		DocoCDLabels.Metadata.Manager:      config.AppName,
+		DocoCDLabels.Metadata.Manager:      app.Name,
 		DocoCDLabels.Metadata.Version:      appVersion,
 		DocoCDLabels.Deployment.Name:       deployConfig.Name,
 		DocoCDLabels.Deployment.Timestamp:  timestamp,

@@ -16,8 +16,8 @@ type docoCdLabelNamesDeployment struct {
 	Trigger              string // Poll or SHA of the commit that triggered the deployment
 	CommitSHA            string // SHA of the commit that is currently deployed
 	ConfigHash           string // SHA256 hash of the deploy-config used during deployment
-	AutoDiscover         string // Whether the deployment was auto-discovered
-	AutoDiscoverDelete   string // Whether auto-discovered deployment is allowed to be deleted
+	AutoDiscovery        string // Whether the deployment was auto-discovered
+	AutoDiscoveryDelete  string // Whether auto-discovered deployment is allowed to be deleted
 	RecreateIgnore       string // Whether the deployment file changes should ignore recreate
 	RecreateIgnoreSignal string // Signal service when deployment file changes and ignore recreate
 }
@@ -50,8 +50,8 @@ var DocoCDLabels = docoCdLabelNames{
 		CommitSHA:            "cd.doco.deployment.target.sha",
 		Trigger:              "cd.doco.deployment.trigger",
 		ConfigHash:           "cd.doco.deployment.config.sha",
-		AutoDiscover:         "cd.doco.deployment.auto_discover",
-		AutoDiscoverDelete:   "cd.doco.deployment.auto_discover.delete",
+		AutoDiscovery:        "cd.doco.deployment.auto_discovery",
+		AutoDiscoveryDelete:  "cd.doco.deployment.auto_discovery.delete",
 		RecreateIgnore:       "cd.doco.deployment.recreate.ignore",
 		RecreateIgnoreSignal: "cd.doco.deployment.recreate.ignore.signal",
 	},
@@ -61,12 +61,38 @@ var DocoCDLabels = docoCdLabelNames{
 	},
 }
 
+/*
+DeprecatedAutoDiscoverLabel and DeprecatedAutoDiscoverDeleteLabel are the old label names
+kept for backwards-compatible reads. New deployments only write the new labels.
+
+Deprecated: Use DocoCDLabels.Deployment.AutoDiscovery and DocoCDLabels.Deployment.AutoDiscoveryDelete instead.
+
+TODO: Remove in a future release.
+*/
+const (
+	DeprecatedAutoDiscoverLabel       = "cd.doco.deployment.auto_discover"
+	DeprecatedAutoDiscoverDeleteLabel = "cd.doco.deployment.auto_discover.delete"
+)
+
 var docoCDJobLabelNames = struct {
-	JobSchedule string // Schedule of the job (if applicable) in cron format
-	JobLastRun  string // Timestamp of the last run in RFC3339 format
-	JobNextRun  string // Timestamp of the next scheduled run in RFC3339 format
+	JobEnabled       string // Enable scheduling for a service/container
+	JobSchedule      string // Schedule of the job in 5-field cron format or @every duration
+	JobSkipRunning   string // Skip a schedule trigger when a previous run is still in progress
+	JobExecutionMode string // Defines if a run restarts/reruns the job or starts an ephemeral one-off execution
+	JobNotifyOn      string // Controls notification behavior: none, success, failure, all
+	JobSwarmReplicas string // Number of replicas for one-off replicated-job runs in swarm mode
+	JobLastRun       string // Timestamp of the last run in RFC3339 format
+	JobNextRun       string // Timestamp of the next scheduled run in RFC3339 format
 }{
-	JobSchedule: "cd.doco.job.schedule",
-	JobLastRun:  "cd.doco.job.last_run",
-	JobNextRun:  "cd.doco.job.next_run",
+	JobEnabled:       "cd.doco.job.enabled",
+	JobSchedule:      "cd.doco.job.schedule",
+	JobSkipRunning:   "cd.doco.job.skip_running",
+	JobExecutionMode: "cd.doco.job.execution_mode",
+	JobNotifyOn:      "cd.doco.job.notify_on",
+	JobSwarmReplicas: "cd.doco.job.swarm.replicas",
+	JobLastRun:       "cd.doco.job.last_run",
+	JobNextRun:       "cd.doco.job.next_run",
 }
+
+// DocoCDJobLabels exposes the scheduler/job labels for consumers outside this package.
+var DocoCDJobLabels = docoCDJobLabelNames

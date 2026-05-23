@@ -12,12 +12,14 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/container"
 
+	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/poll"
+
 	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	"github.com/kimdre/doco-cd/internal/stages"
 
-	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/prometheus"
@@ -28,7 +30,7 @@ import (
 var ErrInvalidHTTPMethod = errors.New("invalid http method")
 
 type handlerData struct {
-	appConfig      *config.AppConfig    // Application configuration
+	appConfig      *app.Config          // Application configuration
 	appVersion     string               // Application version
 	dataMountPoint container.MountPoint // Mount point for the data directory
 	dockerCli      command.Cli          // Docker CLI client
@@ -64,7 +66,7 @@ func onError(w http.ResponseWriter, log *slog.Logger, errMsg string, details any
 }
 
 // HandleEvent executes the deployment process for a given webhook event.
-func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter, appConfig *config.AppConfig,
+func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter, appConfig *app.Config,
 	dataMountPoint container.MountPoint, payload webhook.ParsedPayload, customTarget string, metadata notification.Metadata,
 	dockerCli command.Cli, secretProvider *secretprovider.SecretProvider,
 	testName string,
@@ -92,14 +94,38 @@ func HandleEvent(ctx context.Context, jobLog *slog.Logger, w http.ResponseWriter
 	}
 
 	cloneUrl := payload.CloneURL
-	if appConfig.SSHPrivateKey != "" {
-		cloneUrl = payload.SSHUrl
+
+	git.ConfigureAuthResolver(
+		appConfig.GitAuthDomains,
+		appConfig.SSHPrivateKey,
+		appConfig.SSHPrivateKeyPassphrase,
+		appConfig.GitAccessToken,
+		git.GitHubAppConfig{
+			ID:             appConfig.GitHubAppID,
+			PrivateKey:     appConfig.GitHubAppPrivateKey,
+			InstallationID: appConfig.GitHubAppInstallationID,
+		},
+	)
+
+	// Only attempt SSH clone when URL-specific credentials include an SSH private key.
+	resolvedSSH := git.ResolveAuthConfig(payload.SSHUrl, appConfig.SSHPrivateKey, appConfig.SSHPrivateKeyPassphrase, appConfig.GitAccessToken)
+	if payload.SSHUrl != "" && resolvedSSH.SSHPrivateKey != "" {
+		sshAuth, authErr := git.GetAuthMethod(payload.SSHUrl, appConfig.SSHPrivateKey, appConfig.SSHPrivateKeyPassphrase, appConfig.GitAccessToken)
+		if authErr != nil {
+			onError(w, jobLog.With(logger.ErrAttr(authErr)), "failed to resolve SSH auth method", authErr.Error(), http.StatusInternalServerError, metadata)
+
+			return
+		}
+
+		if sshAuth != nil {
+			cloneUrl = payload.SSHUrl
+		}
 	}
 
 	deployErr := handle(ctx, jobLog,
 		appConfig, dataMountPoint, secretProvider, dockerCli,
 		stages.JobTriggerWebhook, cloneUrl, payload.Ref, payload.Private,
-		metadata, customTarget, testName, config.PollConfig{}, payload,
+		metadata, customTarget, testName, poll.Config{}, payload,
 	)
 	if deployErr != nil {
 		// In synchronous mode we should return an error to the caller

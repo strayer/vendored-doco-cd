@@ -1,0 +1,22 @@
+package git
+
+import (
+	"strings"
+)
+
+// GetFullName extracts the full repository name without the domain part from the clone URL.
+// E.g., "github.com/kimdre/doco-cd" becomes "kimdre/doco-cd"
+// or "git.example.com/doco-cd" becomes "doco-cd".
+func GetFullName(cloneURL string) string {
+	repoName := GetRepoName(cloneURL)
+	parts := strings.Split(repoName, "/")
+	fullName := repoName
+
+	if len(parts) > 2 {
+		fullName = strings.Join(parts[1:], "/")
+	} else if len(parts) == 2 {
+		fullName = parts[1]
+	}
+
+	return fullName
+}

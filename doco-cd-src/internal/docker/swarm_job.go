@@ -12,11 +12,12 @@ import (
 	"github.com/avast/retry-go/v5"
 	"github.com/docker/cli/cli/command"
 
+	"github.com/kimdre/doco-cd/internal/config/app"
+
 	"github.com/moby/moby/api/types/mount"
 	swarmTypes "github.com/moby/moby/api/types/swarm"
 	"github.com/moby/moby/client"
 
-	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 )
 
@@ -56,7 +57,7 @@ func RunSwarmJob(ctx context.Context, dockerCLI command.Cli, mode swarm.DeployMo
 	// fix conflict error
 	// Error response from daemon: rpc error: code = Unknown desc = update out of sequence
 
-	name := fmt.Sprintf("%s_%s", config.AppName, title)
+	name := fmt.Sprintf("%s_%s", app.Name, title)
 
 	lock := getSwarmJobLock(name)
 	lock.Lock()
@@ -66,8 +67,8 @@ func RunSwarmJob(ctx context.Context, dockerCLI command.Cli, mode swarm.DeployMo
 		Annotations: swarmTypes.Annotations{
 			Name: name,
 			Labels: map[string]string{
-				DocoCDLabels.Metadata.Manager:   config.AppName,
-				DocoCDLabels.Metadata.Version:   config.AppVersion,
+				DocoCDLabels.Metadata.Manager:   app.Name,
+				DocoCDLabels.Metadata.Version:   app.Version,
 				DocoCDLabels.Deployment.Trigger: title,
 			},
 		},
@@ -189,4 +190,85 @@ func RunImagePruneJob(ctx context.Context, dockerCLI command.Cli) error {
 func RunImageRemoveJob(ctx context.Context, dockerCLI command.Cli, images []string) error {
 	args := append([]string{"docker", "image", "rm", "--force"}, images...)
 	return RunSwarmJob(ctx, dockerCLI, swarm.DeployModeGlobalJob, args, "image-remove")
+}
+
+type SwarmOneOffFromServiceOptions struct {
+	Replicas         uint64
+	SendRegistryAuth bool
+}
+
+// RunSwarmOneOffFromService creates a temporary job service from an existing service spec and waits for completion.
+func RunSwarmOneOffFromService(ctx context.Context, dockerCLI command.Cli, serviceName string, opts SwarmOneOffFromServiceOptions) error {
+	apiClient := dockerCLI.Client()
+
+	if opts.Replicas == 0 {
+		opts.Replicas = 1
+	}
+
+	inspectResult, err := apiClient.ServiceInspect(ctx, serviceName, client.ServiceInspectOptions{})
+	if err != nil {
+		return fmt.Errorf("inspect service %s: %w", serviceName, err)
+	}
+
+	sourceService := inspectResult.Service
+	oneOffSpec := sourceService.Spec
+	oneOffSpec.Name = fmt.Sprintf("%s-doco-job-%d", sourceService.Spec.Name, time.Now().UTC().UnixNano())
+
+	if oneOffSpec.TaskTemplate.ContainerSpec == nil {
+		return fmt.Errorf("service %s has no task container spec", serviceName)
+	}
+
+	if oneOffSpec.Labels == nil {
+		oneOffSpec.Labels = map[string]string{}
+	}
+
+	oneOffSpec.Labels[DocoCDLabels.Metadata.Manager] = app.Name
+	oneOffSpec.Labels[DocoCDLabels.Deployment.Trigger] = "job.schedule"
+
+	if sourceService.Spec.Mode.Global != nil || sourceService.Spec.Mode.GlobalJob != nil {
+		oneOffSpec.Mode = swarmTypes.ServiceMode{
+			GlobalJob: &swarmTypes.GlobalJob{},
+		}
+	} else {
+		oneOffSpec.Mode = swarmTypes.ServiceMode{
+			ReplicatedJob: &swarmTypes.ReplicatedJob{
+				TotalCompletions: &opts.Replicas,
+				MaxConcurrent:    &opts.Replicas,
+			},
+		}
+	}
+
+	oneOffSpec.UpdateConfig = nil
+	oneOffSpec.RollbackConfig = nil
+	oneOffSpec.TaskTemplate.RestartPolicy = &swarmTypes.RestartPolicy{
+		Condition: swarmTypes.RestartPolicyConditionNone,
+	}
+
+	createOpts := client.ServiceCreateOptions{
+		Spec: oneOffSpec,
+	}
+
+	if opts.SendRegistryAuth {
+		encodedAuth, authErr := command.RetrieveAuthTokenFromImage(dockerCLI.ConfigFile(), oneOffSpec.TaskTemplate.ContainerSpec.Image)
+		if authErr != nil {
+			return fmt.Errorf("retrieve auth token from image: %w", authErr)
+		}
+
+		createOpts.EncodedRegistryAuth = encodedAuth
+	}
+
+	createResult, err := apiClient.ServiceCreate(ctx, createOpts)
+	if err != nil {
+		return fmt.Errorf("create one-off service from %s: %w", serviceName, err)
+	}
+
+	defer func() {
+		_, _ = apiClient.ServiceRemove(context.WithoutCancel(ctx), createResult.ID, client.ServiceRemoveOptions{})
+	}()
+
+	if err = swarm.WaitOnServices(ctx, dockerCLI, []string{createResult.ID}); err != nil {
+		return fmt.Errorf("wait one-off service %s: %w", createResult.ID, err)
+	}
+
+	return nil
 }

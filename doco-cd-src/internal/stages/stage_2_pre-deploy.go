@@ -12,12 +12,10 @@ import (
 
 	"github.com/go-git/go-git/v5/plumbing"
 
-	"github.com/kimdre/doco-cd/internal/config"
-
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
-	"github.com/kimdre/doco-cd/internal/utils/set"
+	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
 	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/git"
 )
 
@@ -29,7 +27,7 @@ func shouldSkipDeployment(composeChanged bool,
 ) bool {
 	return !composeChanged &&
 		len(changedServices) == 0 &&
-		ignoredInfo.IsNeedSignal() &&
+		!ignoredInfo.IsNeedSignal() &&
 		!imagesChanged &&
 		len(mismatchServices) == 0
 }
@@ -50,7 +48,7 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	if s.SecretProvider != nil && *s.SecretProvider != nil && len(s.DeployConfig.ExternalSecrets) > 0 {
 		stageLog.Debug("resolving external secrets", slog.Any("external_secrets", s.DeployConfig.ExternalSecrets))
 
-		encodedSecrets, err := config.EncodeExternalSecretRefs(s.DeployConfig.ExternalSecrets)
+		encodedSecrets, err := secrettypes.EncodeExternalSecretRefs(s.DeployConfig.ExternalSecrets)
 		if err != nil {
 			return fmt.Errorf("failed to encode external secret references: %w", err)
 		}
@@ -75,57 +73,12 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		return fmt.Errorf("failed to hash deploy configuration: %w", err)
 	}
 
-	if s.DeployConfig.ForceRecreate {
-		stageLog.Debug("force recreate enabled, skipping pre-deploy image pull check")
-	} else if s.DeployConfig.ForceImagePull {
-		stageLog.Debug("force image pull enabled, checking for image updates")
-
-		var (
-			beforeImages set.Set[string]
-			afterImages  set.Set[string]
-		)
-
-		containers, _ := docker.GetProjectContainers(ctx, s.Docker.Cmd, s.DeployConfig.Name)
-
-		if len(containers) > 0 {
-			beforeImages, err = docker.GetImages(ctx, s.Docker.Cmd, s.DeployConfig.Name)
-			if err != nil {
-				return fmt.Errorf("failed to get images before pull: %w", err)
-			}
-
-			err = docker.PullImages(ctx, s.Docker.Cmd, s.DeployConfig.Name)
-			if err != nil {
-				return fmt.Errorf("failed to pull images: %w", err)
-			}
-
-			afterImages, err = docker.GetImages(ctx, s.Docker.Cmd, s.DeployConfig.Name)
-			if err != nil {
-				return fmt.Errorf("failed to get images after pull: %w", err)
-			}
-
-			for img := range afterImages {
-				if !beforeImages.Contains(img) {
-					imagesChanged = true
-					break
-				}
-			}
-
-			if imagesChanged {
-				stageLog.Debug("images have changed after pull, proceeding with deployment")
-			} else {
-				stageLog.Debug("images have not changed after pull")
-			}
-		} else {
-			stageLog.Debug("no running containers found for the deployment, skipping image pull check")
-		}
-	}
-
-	deployedState, err := docker.GetLatestDeployStatus(ctx, s.Docker.Cmd.Client(), getFullName(s.Repository.CloneURL), s.DeployConfig.Name)
+	deployedState, err := docker.GetLatestDeployStatus(ctx, s.Docker.Cmd.Client(), string(s.Repository.CloneURL), s.DeployConfig.Name)
 	if err != nil {
 		return fmt.Errorf("failed to get latest state from deployed services: %w", err)
 	}
 
-	if deployedCommit, _ := deployedState.Labels.GetDeploymentCommitSHA(); deployedCommit != "" {
+	if deployedCommit := deployedState.GetDeploymentCommitSHA(); deployedCommit != "" {
 		latestCommit, err := git.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
 		if err != nil {
 			return fmt.Errorf("failed to get latest commit: %w", err)
@@ -163,12 +116,29 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 			return fmt.Errorf("failed to load compose project: %w", err)
 		}
 
+		if s.DeployConfig.ForceRecreate {
+			stageLog.Debug("force recreate enabled, skipping pre-deploy image pull check")
+		} else if s.DeployConfig.ForceImagePull {
+			stageLog.Debug("force image pull enabled, checking deployed image digests against registry")
+
+			imagesChanged, err = docker.HaveDeployedServiceImageDigestsChanged(ctx, s.Docker.Cmd, s.Docker.Project, stageLog)
+			if err != nil {
+				return fmt.Errorf("failed to compare deployed service image digests: %w", err)
+			}
+
+			if imagesChanged {
+				stageLog.Debug("deployed image digests differ from registry, proceeding with deployment")
+			} else {
+				stageLog.Debug("deployed image digests match registry")
+			}
+		}
+
 		newHash, err := docker.ProjectHash(s.Docker.Project)
 		if err != nil {
 			return fmt.Errorf("failed to get project hash: %w", err)
 		}
 
-		curProjectHash, _ := deployedState.Labels.GetDeploymentComposeHash()
+		curProjectHash := deployedState.GetDeploymentComposeHash()
 
 		composeChanged := newHash != curProjectHash
 		if composeChanged {

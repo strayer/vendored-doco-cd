@@ -10,7 +10,9 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/container"
 
-	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/config/app"
+	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
+
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
@@ -21,14 +23,14 @@ import (
 
 func Deploy(ctx context.Context,
 	jobLog *slog.Logger,
-	appConfig *config.AppConfig,
+	appConfig *app.Config,
 	dataMountPoint container.MountPoint,
 	dockerCli command.Cli,
 	secretProvider *secretprovider.SecretProvider,
 	metadata notification.Metadata,
 	jobTrigger stages.JobTrigger,
 	repoData stages.RepositoryData,
-	deployConfigs []*config.DeployConfig,
+	deployConfigs []*deployConfig.Config,
 	payload *webhook.ParsedPayload,
 	testName string,
 ) error {
@@ -36,34 +38,38 @@ func Deploy(ctx context.Context,
 		dataMountPoint, dockerCli, secretProvider, metadata,
 		jobTrigger, repoData, deployConfigs, payload, testName)
 
-	// always add reconciliation job
-	reconciliationHandler.addJob(ctx, jobInfo{
-		appConfig:      appConfig,
-		dataMountPoint: dataMountPoint,
-		dockerCli:      dockerCli,
-		secretProvider: secretProvider,
-		jobLog:         jobLog,
-		metadata:       metadata,
-		jobTrigger:     jobTrigger,
-		repoData:       repoData,
-		deployConfigs:  deployConfigs,
-		payload:        payload,
-		testName:       testName,
-	})
+	// Skip long-lived reconciliation listeners for test-triggered deployments.
+	// Test runs use testName only to make stacks unique and do not need background
+	// Docker event watchers that can outlive the test and race with TempDir cleanup.
+	if testName == "" {
+		reconciliationHandler.addJob(ctx, jobInfo{
+			appConfig:      appConfig,
+			dataMountPoint: dataMountPoint,
+			dockerCli:      dockerCli,
+			secretProvider: secretProvider,
+			jobLog:         jobLog,
+			metadata:       metadata,
+			jobTrigger:     jobTrigger,
+			repoData:       repoData,
+			deployConfigs:  deployConfigs,
+			payload:        payload,
+			testName:       testName,
+		})
+	}
 
 	return err
 }
 
 func deploy(ctx context.Context,
 	jobLog *slog.Logger,
-	appConfig *config.AppConfig,
+	appConfig *app.Config,
 	dataMountPoint container.MountPoint,
 	dockerCli command.Cli,
 	secretProvider *secretprovider.SecretProvider,
 	metadata notification.Metadata,
 	jobTrigger stages.JobTrigger,
 	repoData stages.RepositoryData,
-	deployConfigs []*config.DeployConfig,
+	deployConfigs []*deployConfig.Config,
 	payload *webhook.ParsedPayload,
 	testName string,
 ) error {
@@ -76,51 +82,55 @@ func deploy(ctx context.Context,
 
 	return handleDeploy(ctx, jobLog, appConfig,
 		dataMountPoint, dockerCli, secretProvider, metadata.JobID, jobTrigger,
-		repoData, deployConfigs, payload, testName)
+		repoData, deployConfigs, payload, testName, metadata)
 }
 
 func handleDeploy(ctx context.Context,
 	jobLog *slog.Logger,
-	appConfig *config.AppConfig,
+	appConfig *app.Config,
 	dataMountPoint container.MountPoint,
 	dockerCli command.Cli,
 	secretProvider *secretprovider.SecretProvider,
 	jobID string,
 	jobTrigger stages.JobTrigger,
 	repoData stages.RepositoryData,
-	deployConfigs []*config.DeployConfig,
+	deployConfigs []*deployConfig.Config,
 	payload *webhook.ParsedPayload,
 	testName string,
+	metadata notification.Metadata,
 ) error {
 	// We'll run each deployment concurrently but grouped by repo+reference and limited by the global deployerLimiter.
 	var wg sync.WaitGroup
 
 	resultCh := make(chan error, len(deployConfigs))
 
-	for _, deployConfig := range deployConfigs {
+	for _, config := range deployConfigs {
 		deployLog := jobLog.
 			WithGroup("deploy").
 			With(
-				slog.String("stack", deployConfig.Name),
-				slog.String("reference", deployConfig.Reference))
+				slog.String("stack", config.Name),
+				slog.String("reference", config.Reference))
 
 		// Used to make test deployments unique and prevent conflicts between tests when running in parallel.
 		// It is not used in production.
 		if testName != "" {
-			deployConfig.Name = test.ConvertTestName(testName)
+			config.Name = test.ConvertTestName(testName)
 		}
+
+		reconciliationHandler.startStackDeployment(repoData.Name, config.Name)
 
 		wg.Add(1)
 
-		go func(dc *config.DeployConfig) {
+		go func(dc *deployConfig.Config) {
 			defer wg.Done()
+			defer reconciliationHandler.finishStackDeployment(repoData.Name, dc.Name)
 
 			err := handleOneDeploy(ctx, deployLog,
 				appConfig, dataMountPoint, dockerCli, secretProvider,
-				dc, jobID, jobTrigger, repoData, payload)
+				dc, jobID, jobTrigger, repoData, payload, metadata)
 
 			resultCh <- err
-		}(deployConfig)
+		}(config)
 	}
 
 	// Wait for all deployments to complete
@@ -140,14 +150,15 @@ func handleDeploy(ctx context.Context,
 }
 
 func handleOneDeploy(ctx context.Context, deployLog *slog.Logger,
-	appConfig *config.AppConfig, dataMountPoint container.MountPoint,
+	appConfig *app.Config, dataMountPoint container.MountPoint,
 	dockerCli command.Cli,
 	secretProvider *secretprovider.SecretProvider,
-	dc *config.DeployConfig,
+	dc *deployConfig.Config,
 	jobID string,
 	jobTrigger stages.JobTrigger,
 	repoData stages.RepositoryData,
 	payLad *webhook.ParsedPayload,
+	metadata notification.Metadata,
 ) error {
 	if deployerLimiter != nil {
 		deployLog.Debug("queuing deployment")
@@ -173,6 +184,7 @@ func handleOneDeploy(ctx context.Context, deployLog *slog.Logger,
 		appConfig,
 		dc,
 		secretProvider,
+		metadata,
 	)
 
 	err := stageMgr.RunStages(ctx)

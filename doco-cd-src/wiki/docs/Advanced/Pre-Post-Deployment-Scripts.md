@@ -19,7 +19,7 @@ Available options to run scripts/commands during deployment or container lifecyc
 - [Sidecar Containers](#sidecar-containers)
 - [Compose Lifecycle Hooks](#compose-lifecycle-hooks)
 
---8<-- "wiki/docs/_snippets/reconciliation-note.md"
+--8<-- "wiki/includes/reconciliation-note.md"
 
 ## Init Containers
 
@@ -33,13 +33,13 @@ Some common use cases for init containers include:
 
 We use the `depends_on` option with the `condition: service_completed_successfully` condition to ensure that the main application container waits for the init container to complete successfully before starting. The init container will run its specified commands and exit with a status code of 0 to indicate success, allowing the main application container to start afterward.
 
-!!! success "Recommended Restart Policy for One-Time Script Services"
+!!! success "Recommended [Restart Policy](https://docs.docker.com/reference/compose-file/services/#restart) for One-Time Script Services"
     It is recommended to use `#!yaml restart: on-failure` for one-time script services to allow them to remain stopped after successful completion, while still enabling automatic restarts in case of failures.
 
 ### Example
 
-```yaml title="docker-compose.yml" hl_lines="1-2 4-18 23 28-30"
-x-common-env: &common-env
+```yaml title="docker-compose.yml" hl_lines="1-2 5-19 24 29-31"
+x-common-env: &common-env # (4)!
   MYVAR: world  # We will use this variable in both init and app containers
 
 services:
@@ -48,7 +48,7 @@ services:
     restart: on-failure:3 # (3)!
     environment:
       <<: *common-env
-    entrypoint: "sh -c"  # Use sh -c as the entrypoint to run multiple commands in "command" section
+    entrypoint: "sh -c" # (5)!
     volumes:
       - ./web:/web
     working_dir: /web
@@ -73,8 +73,10 @@ services:
 ```
 
 1. Double dollar-sign (`$$`) is required to use variables in the shell script, otherwise Docker Compose will try to resolve it as a variable in the `docker-compose.yml` file instead of passing it to the container.
-2. Wait for init container to complete/stop with exit code 0
-3. Using `restart: on-failure:3` allows the init container to be retried up to 3 times in case of failure during script execution, while still allowing it to remain stopped after successful completion. To retry indefinitely, you can use `restart: on-failure` without a retry limit.
+2. Wait for init container to complete/stop with exit code `0` using [`depends_on`](https://docs.docker.com/reference/compose-file/services/#depends_on)
+3. Using `restart: on-failure:3` allows the init container to be retried up to 3 times in case of failure during script execution, while still allowing it to remain stopped after successful completion. To retry indefinitely, you can use `restart: on-failure` without a retry limit. See [Restart Policy Documentation](https://docs.docker.com/reference/compose-file/services/#restart).
+4. See [Fragments](https://docs.docker.com/reference/compose-file/fragments/) and [Extensions](https://docs.docker.com/reference/compose-file/extension/) in the Compose File Reference for more details on how to use YAML anchors and aliases to share common configuration between services.
+5. Use `sh -c` as the [entrypoint](https://docs.docker.com/reference/compose-file/services/#entrypoint) to run multiple commands in the [`command`](https://docs.docker.com/reference/compose-file/services/#command) section
 
 - If you have a shell script in your repo for the init stuff, you can remove `entrypoint` and mount the script directly and run it via the `command` option:
   ```yaml title="docker-compose.yml"
@@ -89,15 +91,18 @@ services:
 
 #### container exited (0)
 
-If the deployment fails with an error containing a message like `container <init-container-name> exited (0)`, try to add a short sleep at the end of the init container commands. This is a workaround for a known issue where the init container may exit before the main container starts waiting for it, causing the main container to miss the successful completion of the init container. Adding a short sleep ensures that the init container has time to exit properly before the main container checks its status.
+If the deployment fails with an error containing a message like `container <init-container-name> exited (0)`, try to add a short sleep at the end of the init container commands.
+This is a workaround for a known issue where the init container may exit before the main container starts waiting for it, causing the main container to miss the successful completion of the init container.
+Adding a short sleep ensures that the init container has time to exit properly before the main container checks its status.
 
-**Example**:
-```yaml title="Add a sleep command to the init container in your docker-compose.yml"
-entrypoint: ["/bin/sh", "-c"]
-command: ["<your-commands-here> && sleep 3"] # (1)!
-```
+!!! example "Add a sleep command to the init container in your docker-compose.yml"
+     The sleep duration can be adjusted based on the expected time for the init commands to complete.
+    ```yaml title="docker-compose.yml"
+    entrypoint: ["/bin/sh", "-c"]
+    command: ["<your-commands-here> && sleep 3"] # (1)!
+    ```
 
-1. Depending on the complexity of your init commands, you may need to adjust the sleep duration.
+    1. Depending on the complexity of your init commands, you may need to adjust the sleep duration.
 
 Related issue: [#1115](https://github.com/kimdre/doco-cd/issues/1115)
 
@@ -105,13 +110,14 @@ Related issue: [#1115](https://github.com/kimdre/doco-cd/issues/1115)
 Sidecar containers are additional containers that run alongside your main application containers. They can be used to provide auxiliary services, such as background tasks, metrics collection, or log forwarding.
 
 Some common use cases for sidecar containers include:
-- Background tasks, e.g. cron jobs or scheduled tasks
+
+- Background tasks, e.g. cron jobs or scheduled tasks (See also [Job Scheduling / Cron Jobs](Job-Scheduling.md) for the built-in scheduling feature)
 - Metrics collection for monitoring tools like Prometheus
 - Log forwarding to external systems
 
 ### Example
 
-```yaml title="docker-compose.yml" hl_lines="12-25"
+```yaml title="docker-compose.yml" hl_lines="12-26"
 volumes:
   webdata:
 
@@ -163,7 +169,7 @@ This example demonstrates how to use the `post_start` hook to set up the correct
    - Second hook sets appropriate read/write permissions
 4. **Application Runs**: The application can now access the volume with proper permissions
 
-```yaml title="docker-compose.yml"
+```yaml title="docker-compose.yml" hl_lines="7-11"
 services:
   app:
     image: backend
@@ -194,7 +200,7 @@ This example demonstrates how to use the `pre_stop` hook to run cleanup tasks be
     3. Notify monitoring system
 3. **Container Stops**: After hooks complete, container proceeds with shutdown or restart
 
-```yaml title="docker-compose.yml"
+```yaml title="docker-compose.yml" hl_lines="4-7"
 services:
   app:
     image: backend
@@ -210,4 +216,3 @@ services:
 - [Docker Compose Post Start Hook Documentation](https://docs.docker.com/reference/compose-file/services/#post_start)
 - [Docker Compose Pre Stop Hook Documentation](https://docs.docker.com/reference/compose-file/services/#pre_stop)
 - [Reconciliation settings](../Deploy-Settings.md#reconciliation-settings)
-- [Known Limitations: Reconciliation behavior for one-time services](../Known-Limitations.md#reconciliation-behavior-for-one-time-services)
