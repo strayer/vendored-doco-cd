@@ -41,12 +41,12 @@ func (j *job) run(ctx context.Context) {
 	if !swarmMode {
 		filterArgs.Add("label", docker.DocoCDLabels.Metadata.Manager+"="+app.Name)
 
-		repositoryLabelValue := gitInternal.GetFullName(string(j.info.repoData.CloneURL))
+		repositoryLabelValue := gitInternal.GetFullName(j.info.repoData.SourceUrl)
 		if j.info.payload != nil && strings.TrimSpace(j.info.payload.FullName) != "" {
 			repositoryLabelValue = j.info.payload.FullName
 		}
 
-		filterArgs.Add("label", docker.DocoCDLabels.Repository.Name+"="+repositoryLabelValue)
+		filterArgs.Add("label", docker.DocoCDLabels.Source.Name+"="+repositoryLabelValue)
 	}
 
 	for _, eventFilter := range dockerEventFiltersForActions(mapsKeys(j.deployConfigGroupByEvent), swarmMode) {
@@ -239,6 +239,16 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		return
 	}
 
+	if shouldIgnoreRestartReconciliationForScheduledJob(action, event.Actor.Attributes) {
+		jobLog.Debug("skipping reconciliation for scheduled restart-mode job completion",
+			slog.String("event", action),
+			slog.String("stack", stackName),
+			slog.String("container_name", event.Actor.Attributes["name"]),
+		)
+
+		return
+	}
+
 	stackID := j.info.metadata.Repository + "/" + stackName
 	stackLock := lock.GetRepoLock(stackID)
 
@@ -316,7 +326,7 @@ func (j *job) deploy(ctx context.Context, jobLog *slog.Logger, dcs []*deployConf
 	defer jobLog.Info("reconciliation completed")
 
 	if err := cleanupObsoleteAutoDiscoveredContainers(ctx, jobLog,
-		j.info.dockerCli, string(j.info.repoData.CloneURL),
+		j.info.dockerCli, j.info.repoData.SourceUrl,
 		j.info.deployConfigs, // all deploy configs
 		j.info.metadata); err != nil {
 		jobLog.Error("failed to clean up obsolete auto-discovered containers", logger.ErrAttr(err))

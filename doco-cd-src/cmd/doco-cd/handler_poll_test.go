@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/poll"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/kimdre/doco-cd/internal/git"
 
+	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/moby/moby/api/types/container"
@@ -24,6 +28,73 @@ import (
 	"github.com/kimdre/doco-cd/internal/logger"
 )
 
+func TestPollHandlerAllowsConcurrentRunsForSameRepository(t *testing.T) {
+	log := logger.New(logger.LevelCritical)
+	started := make(chan string, 2)
+	release := make(chan struct{})
+
+	h := handlerData{
+		log: log,
+		runPoll: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+			_ command.Cli, _ *slog.Logger, metadata notification.Metadata, _ *secretprovider.SecretProvider,
+		) error {
+			started <- metadata.JobID
+
+			<-release
+
+			return nil
+		},
+	}
+
+	jobConfig := poll.Config{
+		SourceUrl: "https://github.com/kimdre/doco-cd_tests.git",
+		Reference: "main",
+		Interval:  poll.MinPollInterval,
+		RunOnce:   true,
+	}
+
+	ctx := t.Context()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		h.PollHandler(ctx, &poll.Job{Config: jobConfig})
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		h.PollHandler(ctx, &poll.Job{Config: jobConfig})
+	}()
+
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(500 * time.Millisecond):
+			close(release)
+			t.Fatal("expected both poll handlers to start their runs without serializing on the repository")
+		}
+	}
+
+	close(release)
+
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("poll handlers did not exit after their run_once executions completed")
+	}
+}
+
 func TestRunPoll(t *testing.T) {
 	encryption.SetupAgeKeyEnvVar(t)
 
@@ -31,9 +102,9 @@ func TestRunPoll(t *testing.T) {
 	ctx := context.Background()
 
 	pollConfig := poll.Config{
-		CloneUrl:     "https://github.com/kimdre/doco-cd_tests.git",
+		SourceUrl:    "https://github.com/kimdre/doco-cd_tests.git",
 		Reference:    "main",
-		Interval:     10,
+		Interval:     10 * time.Second,
 		CustomTarget: "",
 	}
 
@@ -111,7 +182,7 @@ func TestRunPoll(t *testing.T) {
 	})
 
 	metadata := notification.Metadata{
-		Repository: git.GetRepoName(string(pollConfig.CloneUrl)),
+		Repository: git.GetRepoName(pollConfig.SourceUrl),
 		Stack:      stackName,
 		Revision:   notification.GetRevision(pollConfig.Reference, ""),
 	}

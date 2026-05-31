@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1@sha256:2780b5c3bab67f1f76c781860de469442999ed1a0d7992a5efdf2cffc0e3d769
-FROM golang:1.26.3@sha256:2981696eed011d747340d7252620932677929cce7d2d539602f56a8d7e9b660b AS prerequisites
+# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
+FROM golang:1.26.3@sha256:2d6c80227255c3112a4d08e67ba98e58efd3846daf15d9d7d4c389565d881b1a AS prerequisites
 
 ARG APP_VERSION=dev
 ARG DISABLE_BITWARDEN=false
@@ -61,7 +61,7 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
         CGO_ENABLED=1 CC=musl-gcc go build -ldflags="-s -w -X github.com/kimdre/doco-cd/internal/config/app.Version=${APP_VERSION} ${BW_SDK_BUILD_FLAGS}" -o / ./...; \
     fi
 
-FROM gcr.io/distroless/base-debian13@sha256:c83f022002fc917a92501a8c30c605efdad3010157ba2c8998a2cbf213299201 AS release
+FROM gcr.io/distroless/base-debian13@sha256:f2df8702d4dcc45ce76df6cbc14ad1975fcf88a04bd0e8947b6194264f9ab75e AS release
 
 WORKDIR /
 
@@ -69,6 +69,10 @@ WORKDIR /
 VOLUME /data
 
 COPY --from=build /doco-cd /doco-cd
+
+# buildx plugin so compose v5 picks BuildKit instead of the legacy `/build` endpoint
+COPY --from=docker/buildx-bin:0.34.1@sha256:ba49f75261dd3ac85491d370a9c38306454a84c5554be4e67de601cd59847cb6 \
+    /buildx /usr/libexec/docker/cli-plugins/docker-buildx
 
 ENV TZ=UTC \
     HTTP_PORT=80 \
