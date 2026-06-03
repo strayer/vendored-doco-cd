@@ -39,6 +39,7 @@ import (
 	"github.com/docker/cli/cli/flags"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
+	swarmTypes "github.com/moby/moby/api/types/swarm"
 
 	"github.com/kimdre/doco-cd/internal/prometheus"
 	"github.com/kimdre/doco-cd/internal/webhook"
@@ -126,12 +127,13 @@ func addComposeServiceLabels(project *types.Project, deployConfig *deploy.Config
 			DocoCDLabels.Deployment.WorkingDir:          workingDir,
 			DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
 			DocoCDLabels.Deployment.CommitSHA:           latestCommit,
-			DocoCDLabels.Deployment.TargetRef:           deployConfig.Reference,
+			DocoCDLabels.Deployment.TargetRef:           ExtractOciArtifactTag(deployConfig.Reference),
 			DocoCDLabels.Deployment.ConfigHash:          deployConfig.Internal.Hash,
 			DocoCDLabels.Deployment.AutoDiscovery:       strconv.FormatBool(deployConfig.AutoDiscovery.Enabled),
-			DocoCDLabels.Deployment.AutoDiscoveryDelete: strconv.FormatBool(deployConfig.AutoDiscovery.Delete),
-			DocoCDLabels.Repository.Name:                payload.FullName,
-			DocoCDLabels.Repository.URL:                 payload.WebURL,
+			DocoCDLabels.Deployment.AutoDiscoveryConfig: MarshalAutoDiscoveryConfig(deployConfig.AutoDiscovery),
+			DocoCDLabels.Source.Type:                    SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
+			DocoCDLabels.Source.Name:                    payload.FullName,
+			DocoCDLabels.Source.URL:                     payload.WebURL,
 			api.ProjectLabel:                            project.Name,
 			api.ServiceLabel:                            s.Name,
 			api.WorkingDirLabel:                         project.WorkingDir,
@@ -155,10 +157,11 @@ func addComposeVolumeLabels(project *types.Project, deployConfig *deploy.Config,
 			DocoCDLabels.Deployment.Timestamp:   timestamp,
 			DocoCDLabels.Deployment.ComposeHash: projectHash,
 			DocoCDLabels.Deployment.Trigger:     payload.CommitSHA,
-			DocoCDLabels.Deployment.TargetRef:   deployConfig.Reference,
+			DocoCDLabels.Deployment.TargetRef:   ExtractOciArtifactTag(deployConfig.Reference),
 			DocoCDLabels.Deployment.CommitSHA:   latestCommit,
-			DocoCDLabels.Repository.Name:        payload.FullName,
-			DocoCDLabels.Repository.URL:         payload.WebURL,
+			DocoCDLabels.Source.Type:            SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
+			DocoCDLabels.Source.Name:            payload.FullName,
+			DocoCDLabels.Source.URL:             payload.WebURL,
 			api.ProjectLabel:                    project.Name,
 			api.VolumeLabel:                     v.Name,
 			api.VersionLabel:                    composeVersion,
@@ -382,6 +385,11 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 		return err
 	}
 
+	jobServices, err := getJobServices(project)
+	if err != nil {
+		return err
+	}
+
 	err = service.Create(ctx, project, createOpts)
 	if err != nil {
 		return err
@@ -389,10 +397,9 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 
 	if len(startServices) > 0 {
 		startOpts := api.StartOptions{
-			Project:     project,
-			Wait:        true,
-			WaitTimeout: time.Duration(deployConfig.Timeout) * time.Second,
-			Services:    startServices,
+			Project:  project,
+			Wait:     false,
+			Services: startServices,
 		}
 
 		err = service.Start(ctx, project.Name, startOpts)
@@ -400,6 +407,12 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 			if !errors.Is(err, ErrNoContainerToStart) {
 				return err
 			}
+		}
+
+		err = waitForStartedServices(ctx, dockerCli, project.Name, startServices, jobServices,
+			time.Duration(deployConfig.Timeout)*time.Second)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -444,9 +457,9 @@ func DeployStack(
 		With(slog.String("stack", deployConfig.Name))
 
 	stackLog.Debug("waiting for scheduler/deploy lock")
-	lock.LockScheduledDeploy()
+	lock.LockStack(deployConfig.Name)
 
-	defer lock.UnlockScheduledDeploy()
+	defer lock.UnlockStack(deployConfig.Name)
 
 	stackLog.Debug("acquired scheduler/deploy lock")
 
@@ -469,6 +482,12 @@ func DeployStack(
 
 	if err = validateScheduledJobPolicies(project, swarm.GetModeEnabled()); err != nil {
 		return fmt.Errorf("invalid scheduled job restart policy: %w", err)
+	}
+
+	if deployConfig.WaitRunningJobs {
+		if err = waitForRunningJobs(*ctx, dockerCli, deployConfig, project, stackLog); err != nil {
+			return err
+		}
 	}
 
 	done := make(chan struct{})
@@ -588,7 +607,16 @@ func DeployStack(
 	}
 
 	// cache the deployment status after successful deployment
-	setDeployStatusToCache(gitInternal.GetRepoName(payload.CloneURL), deployConfig.Name,
+	repositoryKey := strings.TrimSpace(payload.CloneURL)
+	if repositoryKey == "" {
+		repositoryKey = strings.TrimSpace(payload.FullName)
+	}
+
+	if repositoryKey == "" {
+		repositoryKey = strings.TrimSpace(payload.Artifact)
+	}
+
+	setDeployStatusToCache(gitInternal.GetRepoName(repositoryKey), deployConfig.Name,
 		deployStatus{
 			CommitSHA:   latestCommit,
 			ComposeHash: projectHash,
@@ -599,6 +627,155 @@ func DeployStack(
 	prometheus.DeploymentDuration.WithLabelValues(deployConfig.Name).Observe(time.Since(startTime).Seconds())
 
 	return nil
+}
+
+// waitForRunningJobs checks if there are any running scheduled jobs that are configured to be waited for before deployment,
+// and waits until they are finished or the timeout is reached.
+func waitForRunningJobs(ctx context.Context, dockerCli command.Cli, deployConfig *deploy.Config, project *types.Project, log *slog.Logger) error {
+	jobServices, err := getScheduledJobServicesToWait(project, deployConfig.WaitRunningJobs)
+	if err != nil {
+		return err
+	}
+
+	if len(jobServices) == 0 {
+		return nil
+	}
+
+	timeout := time.Duration(deployConfig.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	deadline := time.Now().Add(timeout)
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	lastWaitLogAt := time.Time{}
+
+	for {
+		running, err := getRunningScheduledJobServices(ctx, dockerCli, deployConfig.Name, jobServices)
+		if err != nil {
+			return fmt.Errorf("failed to inspect running scheduled jobs: %w", err)
+		}
+
+		if len(running) == 0 {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for running scheduled jobs to finish: %s", timeout, strings.Join(running, ", "))
+		}
+
+		now := time.Now()
+		if lastWaitLogAt.IsZero() || now.Sub(lastWaitLogAt) >= 5*time.Second {
+			log.Info("waiting for running scheduled jobs to finish before deployment",
+				slog.Any("jobs", running),
+			)
+
+			lastWaitLogAt = now
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+func getScheduledJobServicesToWait(project *types.Project, defaultWait bool) (set.Set[string], error) {
+	ret := set.New[string]()
+
+	if project == nil {
+		return ret, nil
+	}
+
+	for _, svc := range project.Services {
+		enabledRaw, ok := svc.Labels[DocoCDJobLabels.JobEnabled]
+		if !ok {
+			continue
+		}
+
+		enabled, err := strconv.ParseBool(strings.TrimSpace(enabledRaw))
+		if err != nil || !enabled {
+			continue
+		}
+
+		waitForService := defaultWait
+
+		if waitRaw, waitLabelSet := svc.Labels[DocoCDJobLabels.JobWaitRunning]; waitLabelSet {
+			waitForService, err = strconv.ParseBool(strings.TrimSpace(waitRaw))
+			if err != nil {
+				return nil, fmt.Errorf("invalid %s label value %q on service %s", DocoCDJobLabels.JobWaitRunning, waitRaw, svc.Name)
+			}
+		}
+
+		if !waitForService {
+			continue
+		}
+
+		ret.Add(svc.Name)
+	}
+
+	return ret, nil
+}
+
+func getRunningScheduledJobServices(ctx context.Context, dockerCli command.Cli, stackName string, configuredJobServices set.Set[string]) ([]string, error) {
+	runningSet := set.New[string]()
+
+	if swarm.GetModeEnabled() {
+		services, err := swarm.GetStackServices(ctx, dockerCli.Client(), stackName)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, svc := range services {
+			if svc.Spec.TaskTemplate.ContainerSpec == nil {
+				continue
+			}
+
+			serviceName := strings.TrimSpace(svc.Spec.TaskTemplate.ContainerSpec.Labels[api.ServiceLabel])
+			if serviceName == "" || !configuredJobServices.Contains(serviceName) {
+				continue
+			}
+
+			tasks, taskErr := dockerCli.Client().TaskList(ctx, client.TaskListOptions{
+				Filters: make(client.Filters).Add("service", svc.ID),
+			})
+			if taskErr != nil {
+				return nil, taskErr
+			}
+
+			for _, task := range tasks.Items {
+				if task.DesiredState == swarmTypes.TaskStateRunning && task.Status.State == swarmTypes.TaskStateRunning {
+					runningSet.Add(serviceName)
+					break
+				}
+			}
+		}
+	} else {
+		containers, err := GetLabeledContainers(ctx, dockerCli.Client(), api.ProjectLabel, stackName, true)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, cont := range containers {
+			serviceName := strings.TrimSpace(cont.Labels[api.ServiceLabel])
+			if serviceName == "" || !configuredJobServices.Contains(serviceName) {
+				continue
+			}
+
+			if cont.State == "running" {
+				runningSet.Add(serviceName)
+			}
+		}
+	}
+
+	running := runningSet.ToSlice()
+	slices.Sort(running)
+
+	return running, nil
 }
 
 // DestroyStack destroys the stack using the provided deployment configuration.
@@ -1171,8 +1348,14 @@ func DecryptProjectFiles(repoPath string, p *types.Project) ([]string, error) {
 
 func getStartServicesForDeploy(project *types.Project) ([]string, error) {
 	startServices := make([]string, 0, len(project.Services))
+	completedDependencyServices := getServiceCompletedDependencies(project)
 
 	for serviceName, svc := range project.Services {
+		if completedDependencyServices.Contains(serviceName) ||
+			(svc.Name != "" && completedDependencyServices.Contains(svc.Name)) {
+			continue
+		}
+
 		labels := getServiceSchedulerLabels(svc)
 		_, hasScheduleLabel := labels[docoCDJobLabelNames.JobEnabled]
 
@@ -1193,6 +1376,172 @@ func getStartServicesForDeploy(project *types.Project) ([]string, error) {
 	}
 
 	return startServices, nil
+}
+
+// getServiceCompletedDependencies returns services referenced via depends_on with
+// condition=service_completed_successfully. These are init-style one-shot services
+// that should be started as dependencies but not treated as long-running start targets.
+func getServiceCompletedDependencies(project *types.Project) set.Set[string] {
+	completed := set.New[string]()
+
+	if project == nil {
+		return completed
+	}
+
+	for _, svc := range project.Services {
+		for depName, dep := range svc.DependsOn {
+			if strings.TrimSpace(dep.Condition) == types.ServiceConditionCompletedSuccessfully {
+				completed.Add(depName)
+			}
+		}
+	}
+
+	return completed
+}
+
+func getJobServices(project *types.Project) (set.Set[string], error) {
+	jobServices := set.New[string]()
+
+	if project == nil {
+		return jobServices, nil
+	}
+
+	for serviceName, svc := range project.Services {
+		labels := getServiceSchedulerLabels(svc)
+
+		_, enabled, err := ParseJobScheduleLabels(labels)
+		if err != nil {
+			return nil, fmt.Errorf("service %s: %w", serviceName, err)
+		}
+
+		if !enabled {
+			continue
+		}
+
+		if svc.Name != "" {
+			jobServices.Add(svc.Name)
+		} else {
+			jobServices.Add(serviceName)
+		}
+	}
+
+	return jobServices, nil
+}
+
+func getNonJobServices(startServices []string, jobServices set.Set[string]) set.Set[string] {
+	nonJobServices := set.New[string]()
+
+	for _, serviceName := range startServices {
+		if jobServices.Contains(serviceName) {
+			continue
+		}
+
+		nonJobServices.Add(serviceName)
+	}
+
+	return nonJobServices
+}
+
+type serviceStartStatus struct {
+	running   bool
+	unhealthy bool
+	terminal  string
+}
+
+func assessStartedServiceStates(containers []api.ContainerSummary, targetServices set.Set[string]) (bool, []string, error) {
+	statusByService := make(map[string]serviceStartStatus, targetServices.Len())
+	for svc := range targetServices {
+		statusByService[svc] = serviceStartStatus{}
+	}
+
+	for _, cont := range containers {
+		serviceName := strings.TrimSpace(cont.Labels[api.ServiceLabel])
+		if serviceName == "" || !targetServices.Contains(serviceName) {
+			continue
+		}
+
+		status := statusByService[serviceName]
+
+		state := strings.ToLower(strings.TrimSpace(string(cont.State)))
+		health := strings.ToLower(strings.TrimSpace(string(cont.Health)))
+
+		switch state {
+		case "running":
+			switch health {
+			case "", "healthy":
+				status.running = true
+			case "unhealthy":
+				status.unhealthy = true
+			}
+		case "exited", "dead":
+			status.terminal = state
+		}
+
+		statusByService[serviceName] = status
+	}
+
+	waiting := make([]string, 0, len(statusByService))
+	for serviceName, status := range statusByService {
+		if status.unhealthy {
+			return false, nil, fmt.Errorf("service %s is unhealthy", serviceName)
+		}
+
+		if status.terminal != "" && !status.running {
+			return false, nil, fmt.Errorf("service %s has a %s container", serviceName, status.terminal)
+		}
+
+		if !status.running {
+			waiting = append(waiting, serviceName)
+		}
+	}
+
+	slices.Sort(waiting)
+
+	return len(waiting) == 0, waiting, nil
+}
+
+func waitForStartedServices(ctx context.Context, dockerCli command.Cli, projectName string,
+	startServices []string, jobServices set.Set[string], timeout time.Duration,
+) error {
+	nonJobServices := getNonJobServices(startServices, jobServices)
+	if nonJobServices.Len() == 0 {
+		return nil
+	}
+
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	deadline := time.Now().Add(timeout)
+
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		containers, err := GetProjectContainers(ctx, dockerCli, projectName)
+		if err != nil {
+			return fmt.Errorf("failed to inspect project containers: %w", err)
+		}
+
+		ready, waiting, stateErr := assessStartedServiceStates(containers, nonJobServices)
+		if stateErr != nil {
+			return stateErr
+		}
+
+		if ready {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s waiting for services to start: %s", timeout, strings.Join(waiting, ", "))
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 func getServiceSchedulerLabels(svc types.ServiceConfig) map[string]string {

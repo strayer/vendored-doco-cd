@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -48,6 +49,59 @@ func (l LatestServiceStatus) GetDeploymentComposeHash() string {
 	return l.deploymentComposeHash
 }
 
+// normalizeRepositoryForLabelMatch normalizes repository strings for label matching by trimming whitespace,
+// converting to host/owner/repo format when possible, and stripping OCI digest and tag suffixes.
+func normalizeRepositoryForLabelMatch(repository string) string {
+	repository = strings.TrimSpace(repository)
+	if repository == "" {
+		return ""
+	}
+
+	// Normalize scheme/scp-like urls to host/owner/repo when possible.
+	repository = git.GetRepoName(repository)
+
+	// Strip OCI digest suffix if present (repo@sha256:...).
+	if idx := strings.LastIndex(repository, "@"); idx > 0 {
+		repository = repository[:idx]
+	}
+
+	// Strip OCI tag suffix from the last path segment (repo:tag).
+	parts := strings.Split(repository, "/")
+	if len(parts) > 0 {
+		last := parts[len(parts)-1]
+		if idx := strings.LastIndex(last, ":"); idx > 0 {
+			parts[len(parts)-1] = last[:idx]
+		}
+
+		repository = strings.Join(parts, "/")
+	}
+
+	return strings.TrimSpace(repository)
+}
+
+// buildRepositoryLabelCandidates generates a set of candidate repository label values
+// for matching by normalizing the input repository string.
+func buildRepositoryLabelCandidates(repository string) map[string]struct{} {
+	if strings.TrimSpace(repository) == "" {
+		return map[string]struct{}{"": {}}
+	}
+
+	candidates := map[string]struct{}{}
+
+	add := func(v string) {
+		v = strings.TrimSpace(v)
+		if v != "" {
+			candidates[v] = struct{}{}
+		}
+	}
+
+	normalized := normalizeRepositoryForLabelMatch(repository)
+	add(normalized)
+	add(git.GetFullName(normalized))
+
+	return candidates
+}
+
 // GetLatestDeployStatus retrieves the deployed status for a given repository and deploy name.
 func GetLatestDeployStatus(ctx context.Context, client client.APIClient, cloneURL string, deployName string) (LatestServiceStatus, error) {
 	serviceLabels, err := getDeployStatus(ctx, client, deployName)
@@ -58,10 +112,12 @@ func GetLatestDeployStatus(ctx context.Context, client client.APIClient, cloneUR
 	return getLatestServiceStatus(&deployStatusCache, serviceLabels, cloneURL, deployName), nil
 }
 
-func getLatestServiceStatus(cacheMap *sync.Map, statusMap map[Service]ServiceStatus, cloneURL string, deployName string) LatestServiceStatus {
+func getLatestServiceStatus(cacheMap *sync.Map, statusMap map[Service]ServiceStatus, repository string, deployName string) LatestServiceStatus {
 	ret := LatestServiceStatus{
 		DeployedStatus: make(map[Service]ServiceStatus),
 	}
+
+	repositoryLabelCandidates := buildRepositoryLabelCandidates(repository)
 
 	var (
 		latestLabels    Labels
@@ -79,8 +135,14 @@ func getLatestServiceStatus(cacheMap *sync.Map, statusMap map[Service]ServiceSta
 		// (latest commit SHA, compose hash). This keeps the two concerns separate.
 		labels := state.Labels
 
-		name, ok := labels[DocoCDLabels.Repository.Name]
-		if !ok || name != git.GetFullName(cloneURL) {
+		name, ok := labels[DocoCDLabels.Source.Name]
+		if !ok {
+			// When a service matches and others don't,
+			// using 'break' will return a random result.
+			continue
+		}
+
+		if _, matches := repositoryLabelCandidates[strings.TrimSpace(name)]; !matches {
 			// When a service matches and others don't,
 			// using 'break' will return a random result.
 			continue
@@ -96,7 +158,7 @@ func getLatestServiceStatus(cacheMap *sync.Map, statusMap map[Service]ServiceSta
 		}
 	}
 
-	cache, ok := getDeployStatusFromCache(cacheMap, git.GetRepoName(cloneURL), deployName)
+	cache, ok := getDeployStatusFromCache(cacheMap, normalizeRepositoryForLabelMatch(repository), deployName)
 	if ok {
 		ret.deploymentCommitSHA = cache.CommitSHA
 		ret.deploymentComposeHash = cache.ComposeHash
@@ -189,6 +251,8 @@ const (
 	ServiceMismatchReasonUnnecessary = "service is unnecessary"
 	ServiceMismatchReasonSwarmMode   = "swarm mode mismatch"
 	ServiceMismatchReasonReplicas    = "replicas mismatch"
+	oneOffServiceNameSeparator       = "-doco-job-"
+	legacyOneShotExecutionMode       = "one_shot"
 )
 
 type ServiceMismatch struct {
@@ -289,6 +353,10 @@ func CheckServiceMismatch(swarmModeEnabled bool, deployed map[Service]ServiceSta
 	}
 
 	for name := range deployedSet.Difference(wantSet) {
+		if isEphemeralOneOffService(name, deployed[Service(name)], wantSet) {
+			continue
+		}
+
 		mismatches = append(mismatches, ServiceMismatch{
 			ServiceName: name,
 			Reasons: []ServiceMismatchReason{
@@ -300,4 +368,41 @@ func CheckServiceMismatch(swarmModeEnabled bool, deployed map[Service]ServiceSta
 	}
 
 	return mismatches
+}
+
+func isEphemeralOneOffService(name string, status ServiceStatus, declaredServices set.Set[string]) bool {
+	labels := status.Labels
+	if labels == nil {
+		labels = Labels{}
+	}
+
+	if raw, ok := labels[DocoCDJobLabels.JobEphemeral]; ok {
+		isEphemeral, err := strconv.ParseBool(strings.TrimSpace(raw))
+		if err == nil {
+			return isEphemeral
+		}
+	}
+
+	mode := strings.TrimSpace(labels[DocoCDJobLabels.JobExecutionMode])
+	if mode != string(JobExecutionModeOneOff) && mode != legacyOneShotExecutionMode {
+		return false
+	}
+
+	idx := strings.LastIndex(name, oneOffServiceNameSeparator)
+	if idx <= 0 || idx+len(oneOffServiceNameSeparator) >= len(name) {
+		return false
+	}
+
+	baseName := strings.TrimSpace(name[:idx])
+
+	suffix := strings.TrimSpace(name[idx+len(oneOffServiceNameSeparator):])
+	if baseName == "" || suffix == "" {
+		return false
+	}
+
+	if _, err := strconv.ParseInt(suffix, 10, 64); err != nil {
+		return false
+	}
+
+	return declaredServices.Contains(baseName)
 }

@@ -69,32 +69,64 @@ func copyProject(orig *types.Project) *types.Project {
 	return clone
 }
 
+// behaviorLabelPrefixes lists the cd.doco.* label prefixes that configure behaviour and
+// should therefore be included in the project hash for redeploy detection.
+// All other cd.doco.* labels (metadata, timestamps, …) are excluded.
+var behaviorLabelPrefixes = []string{
+	"cd.doco.job.",
+	"cd.doco.deployment.recreate.",
+}
+
+func shouldIgnoreLabelInProjectHash(label string) bool {
+	if strings.HasPrefix(label, "com.docker.compose.") {
+		return true
+	}
+
+	if !strings.HasPrefix(label, "cd.doco.") {
+		return false
+	}
+
+	for _, prefix := range behaviorLabelPrefixes {
+		if strings.HasPrefix(label, prefix) {
+			return false
+		}
+	}
+
+	return true
+}
+
 // ProjectHash generates a SHA256 hash of the project configuration to be used for detecting changes in the project that may require a redeployment.
 func ProjectHash(p *types.Project) (string, error) {
 	pCopy := copyProject(p)
 
-	// Set all dynamic values to a constant value to avoid unnecessary changes in the hash when these values change but the actual configuration does not.
-	for name, cfg := range pCopy.Services {
-		for l := range cfg.Labels {
-			if strings.HasPrefix(l, "cd.doco.") || strings.HasPrefix(l, "com.docker.compose.") {
-				delete(cfg.Labels, l)
+	// Only behavior-configuring labels should impact redeploy decisions.
+	for name := range pCopy.Services {
+		svc := pCopy.Services[name]
+		if svc.Labels != nil {
+			for l := range svc.Labels {
+				if shouldIgnoreLabelInProjectHash(l) {
+					delete(svc.Labels, l)
+				}
 			}
 		}
 
-		pCopy.Services[name] = cfg
+		pCopy.Services[name] = svc
 	}
 
-	for v, cfg := range pCopy.Volumes {
-		for l := range cfg.Labels {
-			if strings.HasPrefix(l, "cd.doco.") || strings.HasPrefix(l, "com.docker.compose.") {
-				delete(cfg.Labels, l)
+	for vol := range pCopy.Volumes {
+		volCfg := pCopy.Volumes[vol]
+		if volCfg.Labels != nil {
+			for l := range volCfg.Labels {
+				if shouldIgnoreLabelInProjectHash(l) {
+					delete(volCfg.Labels, l)
+				}
 			}
 		}
 
-		pCopy.Volumes[v] = cfg
+		pCopy.Volumes[vol] = volCfg
 	}
 
-	b, err := json.Marshal(p)
+	b, err := json.Marshal(pCopy)
 	if err != nil {
 		return "", fmt.Errorf("failed to marshal project for hashing: %w", err)
 	}

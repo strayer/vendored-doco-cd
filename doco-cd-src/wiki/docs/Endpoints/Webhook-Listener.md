@@ -7,7 +7,7 @@ tags:
 
 # Webhook Listener
 
-The webhook payload is expected to be in JSON format and must contain the payload from a supported the Git provider, see [Supported Git Providers](../index.md#supported-git-providers).
+The webhook payload is expected to be in JSON format and must contain the payload from a [supported Git Provider](../index.md#supported-git-providers) or for a [OCI artifact](../Advanced/OCI/Webhooks.md).
 
 The application listens for incoming webhooks on the `/v1/webhook` endpoint with the port specified by the `HTTP_PORT` environment variable, see [App Settings](../App-Settings.md#general-settings).
 
@@ -32,6 +32,9 @@ a deployment configuration file with the same pattern in its name `.doco-cd.<cus
 | `/v1/webhook/gitea`         | `.doco-cd.gitea.yaml`         |
 | `/v1/webhook/paperless-ngx` | `.doco-cd.paperless-ngx.yaml` |
 | `/v1/webhook/my.server.com` | `.doco-cd.my.server.com.yaml` |
+
+!!! note "Naming convention for nested config overrides"
+    [Nested config overrides](../Deploy-Settings.md#nested-config-overrides) always use the standard [naming convention](../Deploy-Settings.md#deployment-configuration-file) (`.doco-cd.y(a)ml`), not the custom target name.
 
 ## Query Parameters
 

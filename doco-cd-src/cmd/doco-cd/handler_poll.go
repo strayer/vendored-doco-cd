@@ -9,10 +9,9 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/container"
 
+	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/poll"
-
-	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	"github.com/kimdre/doco-cd/internal/stages"
@@ -20,9 +19,14 @@ import (
 	"github.com/kimdre/doco-cd/internal/git"
 	log "github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/prometheus"
+	"github.com/kimdre/doco-cd/internal/source/oci"
 	"github.com/kimdre/doco-cd/internal/utils/id"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
+
+type pollRunner func(ctx context.Context, pollConfig poll.Config, appConfig *app.Config, dataMountPoint container.MountPoint,
+	dockerCli command.Cli, logger *slog.Logger, metadata notification.Metadata, secretProvider *secretprovider.SecretProvider,
+) error
 
 // StartPoll initializes PollJob with the provided configuration and starts the PollHandler goroutine.
 func StartPoll(ctx context.Context, h *handlerData, pollConfig poll.Config, wg *sync.WaitGroup) error {
@@ -48,40 +52,45 @@ func StartPoll(ctx context.Context, h *handlerData, pollConfig poll.Config, wg *
 	return nil
 }
 
-// PollHandler is a function that handles polling for changes in a repository.
+// PollHandler handles polling for changes in a configured source.
 func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
-	repoName := git.GetRepoName(string(pollJob.Config.CloneUrl))
+	sourceType := config.NormalizeSourceType(pollJob.Config.Source)
+	entity := logEntityForSourceType(sourceType)
 
-	logger := h.log.With(slog.String("repository", repoName))
+	repoName := git.GetRepoName(pollJob.Config.SourceUrl)
+	if sourceType == config.SourceTypeOCI {
+		repoName = oci.RepositoryNameFromArtifact(pollJob.Config.SourceUrl)
+	}
+
+	logValue := repoName
+	if sourceType == config.SourceTypeOCI {
+		logValue = pollJob.Config.SourceUrl
+	}
+
+	logger := h.log.With(slog.String(entity, logValue))
 	logger.Debug("Start poll handler")
 
-	repoLock := lock.GetRepoLock(repoName)
+	runner := h.runPoll
+	if runner == nil {
+		runner = RunPoll
+	}
 
 	for {
 		if pollJob.LastRun == 0 || time.Now().Unix() >= pollJob.NextRun {
 			jobID := id.GenID()
-			locked := repoLock.TryLock(jobID)
 
-			if !locked {
-				logger.Warn("another job is still in progress for this repository",
-					slog.String("locked_by_job", repoLock.Holder()),
-				)
-			} else {
-				metadata := notification.Metadata{
-					Repository: repoName,
-					Stack:      "",
-					Revision:   notification.GetRevision(pollJob.Config.Reference, ""),
-					JobID:      jobID,
-				}
-
-				logger.Debug("start poll job")
-
-				_ = RunPoll(ctx, pollJob.Config, h.appConfig, h.dataMountPoint, h.dockerCli, logger, metadata, h.secretProvider)
-
-				repoLock.Unlock()
+			metadata := notification.Metadata{
+				Repository: repoName,
+				Stack:      "",
+				Revision:   notification.GetRevision(pollJob.Config.Reference, ""),
+				JobID:      jobID,
 			}
 
-			pollJob.NextRun = time.Now().Unix() + int64(pollJob.Config.Interval)
+			logger.Debug("start poll job")
+
+			_ = runner(ctx, pollJob.Config, h.appConfig, h.dataMountPoint, h.dockerCli, logger, metadata, h.secretProvider)
+
+			pollJob.NextRun = time.Now().Add(pollJob.Config.Interval).Unix()
 		} else {
 			logger.Debug("skipping poll, waiting for next run")
 		}
@@ -98,7 +107,7 @@ func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
 		case <-ctx.Done():
 			logger.Debug("ctx is done in poll handler")
 			return
-		case <-time.After(time.Duration(pollJob.Config.Interval) * time.Second):
+		case <-time.After(pollJob.Config.Interval):
 			continue
 		}
 	}
@@ -128,27 +137,48 @@ func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config,
 	dockerCli command.Cli, logger *slog.Logger, metadata notification.Metadata, secretProvider *secretprovider.SecretProvider,
 ) error {
 	startTime := time.Now()
-	cloneUrl := string(pollConfig.CloneUrl)
-	repoName := git.GetRepoName(cloneUrl)
-	jobLog := logger.With(slog.String("job_id", metadata.JobID))
+	sourceType := config.NormalizeSourceType(pollConfig.Source)
+	sourceRef := pollConfig.SourceUrl
+	entity := logEntityForSourceType(sourceType)
 
-	if pollConfig.CustomTarget != "" {
-		jobLog = jobLog.With(slog.String("custom_target", pollConfig.CustomTarget))
+	repoName := git.GetRepoName(sourceRef)
+	if sourceType == config.SourceTypeOCI {
+		repoName = oci.RepositoryNameFromArtifact(sourceRef)
 	}
 
-	jobLog.Info("polling repository",
+	jobLog := logger.With(
+		slog.String("job_id", metadata.JobID),
+	)
+
+	if pollConfig.CustomTarget != "" {
+		jobLog = jobLog.With(slog.String("target", pollConfig.CustomTarget))
+	}
+
+	configVal := log.BuildLogValue(&pollConfig, "Deployments.Internal")
+	if pollConfig.Source == config.SourceTypeOCI {
+		configVal = log.BuildLogValue(&pollConfig, "Reference", "Deployments.Internal")
+	}
+
+	jobLog.Info("polling "+entity,
 		slog.Group("trigger",
 			slog.String("event", string(stages.JobTriggerPoll)),
-			slog.Any("config", &pollConfig)))
+			slog.Attr{Key: "config", Value: configVal}))
+
+	// For OCI sources, use the tag from the artifact reference as the deployment reference
+	// (e.g., "latest" from "ghcr.io/org/repo:latest") rather than pollConfig.Reference.
+	pollReference := pollConfig.Reference
+	if sourceType == config.SourceTypeOCI {
+		pollReference = oci.TagFromArtifact(sourceRef)
+	}
 
 	deployErr := handle(ctx, jobLog,
 		appConfig, dataMountPoint, secretProvider, dockerCli,
-		stages.JobTriggerPoll, cloneUrl, pollConfig.Reference, false,
+		stages.JobTriggerPoll, sourceType, sourceRef, pollReference, false,
 		metadata, pollConfig.CustomTarget, "",
 		pollConfig, webhook.ParsedPayload{},
 	)
 
-	nextRun := time.Now().Add(time.Duration(pollConfig.Interval) * time.Second).Format(time.RFC3339)
+	nextRun := time.Now().Add(pollConfig.Interval).Format(time.RFC3339)
 	elapsedTime := time.Since(startTime)
 
 	if deployErr != nil {

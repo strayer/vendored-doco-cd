@@ -8,11 +8,19 @@ tags:
 
 Deployments in `Doco-CD` run as concurrent tasks. 
 Each deployment is defined by a deployment configuration file (e.g. `.doco-cd.yml`) that controls how it runs. 
-Enable `auto_discovery` to generate multiple deployments from a single config by scanning subdirectories for Docker Compose files. It can be configured either as a boolean shorthand (`true`/`false`) or as a nested object.
 
 Concurrent tasks are grouped by repository and Git reference (e.g. branch or tag). 
 Deployments from the same repository but different references run sequentially, while those with the same repository and reference run in parallel. 
 See the [App Settings](App-Settings.md) documentation for more information on how to configure the number of concurrent deployments.
+
+## Deployment Sources
+
+Doco-CD supports deploying from the following sources:
+
+| Source                                         | Description                                                                                      |
+|------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| Git Repository                                 | Deploy directly from a Git repository.                                                           |
+| [OCI Artifact](Advanced/OCI/Artifact-Usage.md) | Deploy from an OCI artifact that contains all necessary configurations and files for deployment. |
 
 ## Deployment Configuration File
 
@@ -20,6 +28,8 @@ The deployment configuration file must be placed in the root/base directory of y
 
 - `.doco-cd.yaml`
 - `.doco-cd.yml`
+
+When using a custom target (for example `nas`), the file name must match `.doco-cd.<target>.y(a)ml`.
 
 If you use polling, you can also specify inline deployment configurations in the poll configuration file.
 See [Poll Settings](Poll-Settings.md) and this [example](Poll-Settings.md#inline-deploy-configs) for more information.
@@ -31,26 +41,28 @@ The docker compose deployment can be configured inside the [deployment configura
 !!! note "Settings without a default value are required."
 
 
-| Key                | Type              | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Default value                                                                                                          |
-|--------------------|-------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
-| `name`             | string            | Name of the deployed stack / project / application.                                                                                                                                                                                                                                                                                                                                                                                                                                  |                                                                                                                        |
-| `reference`        | string            | Git reference to deploy from, must be either a branch (e.g. `main` or `refs/heads/main`) or tag (e.g. `v1.0.0.` or `refs/tags/v1.0.0`)                                                                                                                                                                                                                                                                                                                                               | - Polling: the reference from the [Poll Config](Poll-Settings.md)<br/>- Webhooks: the reference of the webhook payload |
-| `repository_url`   | string            | HTTP clone URL of another repository that contains the docker compose files to be deployed. If specified, the deployment runs from there. Also set `reference` to specify the branch.                                                                                                                                                                                                                                                                                                | ` ` (Ignored when not specified)                                                                                       |
-| `working_dir`      | string            | The working directory for the deployment.                                                                                                                                                                                                                                                                                                                                                                                                                                            | `.` (Root/base directory of cloned repository)                                                                         |
-| `compose_files`    | array of strings  | List of docker-compose and overwrite files to use (in descending order, first file gets read first and following files [overwrite/merge](https://docs.docker.com/reference/compose-file/merge/) previous configs). Unknown/Non-existing files get skipped.                                                                                                                                                                                                                           | `["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"]`                                         |
-| `environment`      | map of strings    | A map of environment variables to use for [variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation) in the compose files. Overwrites entries from `env_files` with the same key/name.                                                                                                                                                                                                                                           | `null` (No environment variables)                                                                                      |
-| `env_files`        | array of strings  | List of dotenv files to use for [variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation). Subsequent .env files overwrite each other. If the default `.env` file does not exist, it will be ignored.<br>If `repository_url` is also specified to deploy from a different repo, you can use the `remote:<filepath>` syntax to specify, that the dotenv file is located in the remote repository and should be loaded from there | `[".env"]`                                                                                                             |
-| `profiles`         | array of strings  | List of [compose profiles](https://docs.docker.com/compose/how-tos/profiles/) to use for the deployment, e.g., `#!yaml ["prod", "debug"]`.                                                                                                                                                                                                                                                                                                                                           | `[]`                                                                                                                   |
-| `webhook_filter`   | string            | A regular expression to whitelist deployment triggers based on the webhook event payload. See the [Webhook Filter](#webhook-filter) Section below.                                                                                                                                                                                                                                                                                                                                   | ` ` (Ignored when not specified)                                                                                       |
-| `remove_orphans`   | boolean           | Remove/Prune containers/services that are not (or no longer) defined in the Compose file.                                                                                                                                                                                                                                                                                                                                                                                            | `true`                                                                                                                 |
-| `prune_images`     | boolean           | Prune images that are no longer in use after a deployment. If the image is still used by any other container, it won't get deleted.                                                                                                                                                                                                                                                                                                                                                  | `true`                                                                                                                 |
-| `force_recreate`   | boolean           | Forces the recreation/redeployment of containers even if the configuration has not changed.                                                                                                                                                                                                                                                                                                                                                                                          | `false`                                                                                                                |
-| `force_image_pull` | boolean           | Always pulls the latest version of the image tags you've specified if a newer version is available.                                                                                                                                                                                                                                                                                                                                                                                  | `false`                                                                                                                |
-| `timeout`          | number            | The time in seconds to wait for the deployment to finish before timing out.                                                                                                                                                                                                                                                                                                                                                                                                          | `180`                                                                                                                  |
-| `git_depth`        | number            | Limits the number of commits fetched during clone/fetch (shallow clone). `0` means use the global [`GIT_CLONE_DEPTH`](App-Settings.md) value. A positive integer overrides the global setting for this deployment. When a requested ref (tag/SHA) is outside the shallow depth, doco-cd automatically deepens incrementally before falling back to a full fetch. Changing this value on an existing repo triggers an automatic re-clone.                                             | `0` (use global)                                                                                                       |
-| `destroy`          | boolean \| object | (⚠️ Destructive) Configure stack/project destruction behavior. Use `destroy: true` as shorthand to enable destruction with default options, or use `destroy.enabled: true` inside the object form to customize removal behavior. See [Destroy settings](#destroy-settings).                                                                                                                                                                                                          | see [Destroy settings](#destroy-settings)                                                                              |
-| `auto_discovery`   | boolean \| object | Enables [autodiscovery](#auto-discovery) of services to deploy in the working directory by scanning for subdirectories with Docker Compose files (see the `compose_files` setting). Use `auto_discovery: true` as shorthand to enable it with default options, or use the object form to customize settings such as `depth` and `delete`. See [Auto-Discovery Settings](#auto-discovery-settings).                                                                                   | see [Auto-Discovery Settings](#auto-discovery-settings)                                                                |
-| `reconciliation`   | boolean \| object | Enables event-driven reconciliation for deployments. Use `reconciliation: true` as shorthand to enable reconciliation with default options, or use the object form to customize settings. See [reconciliation settings](#reconciliation-settings).                                                                                                                                                                                                                                   | see [Reconciliation Settings](#reconciliation-settings)                                                                |
+| Key                 | Type              | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                          | Default value                                                                                                          |
+|---------------------|-------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| `name`              | string            | Name of the deployed stack / project / application.                                                                                                                                                                                                                                                                                                                                                                                                                                  |                                                                                                                        |
+| `version`           | string            | Optional deployment config/artifact version for OCI-backed deployments. Currently only `doco.v1` is supported.                                                                                                                                                                                                                                                                                                                                                                       | `doco.v1`                                                                                                              |
+| `reference`         | string            | Git reference to deploy from, must be either a branch (e.g. `main` or `refs/heads/main`) or tag (e.g. `v1.0.0.` or `refs/tags/v1.0.0`)                                                                                                                                                                                                                                                                                                                                               | - Polling: the reference from the [Poll Config](Poll-Settings.md)<br/>- Webhooks: the reference of the webhook payload |
+| `repository_url`    | string            | HTTP clone URL of another repository that contains the docker compose files to be deployed. If specified, the deployment runs from there. Also set `reference` to specify the branch.                                                                                                                                                                                                                                                                                                | ` ` (Ignored when not specified)                                                                                       |
+| `working_dir`       | string            | The working directory for the deployment.                                                                                                                                                                                                                                                                                                                                                                                                                                            | `.` (Root/base directory of cloned repository)                                                                         |
+| `compose_files`     | array of strings  | List of docker-compose and overwrite files to use (in descending order, first file gets read first and following files [overwrite/merge](https://docs.docker.com/reference/compose-file/merge/) previous configs). Unknown/Non-existing files get skipped.                                                                                                                                                                                                                           | `["compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"]`                                         |
+| `environment`       | map of strings    | A map of environment variables to use for [variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation) in the compose files. Overwrites entries from `env_files` with the same key/name.                                                                                                                                                                                                                                           | `null` (No environment variables)                                                                                      |
+| `env_files`         | array of strings  | List of dotenv files to use for [variable interpolation](https://docs.docker.com/compose/how-tos/environment-variables/variable-interpolation). Subsequent .env files overwrite each other. If the default `.env` file does not exist, it will be ignored.<br>If `repository_url` is also specified to deploy from a different repo, you can use the `remote:<filepath>` syntax to specify, that the dotenv file is located in the remote repository and should be loaded from there | `[".env"]`                                                                                                             |
+| `profiles`          | array of strings  | List of [compose profiles](https://docs.docker.com/compose/how-tos/profiles/) to use for the deployment, e.g., `#!yaml ["prod", "debug"]`.                                                                                                                                                                                                                                                                                                                                           | `[]`                                                                                                                   |
+| `webhook_filter`    | string            | A regular expression to whitelist deployment triggers based on the webhook event payload. See the [Webhook Filter](#webhook-filter) Section below.                                                                                                                                                                                                                                                                                                                                   | ` ` (Ignored when not specified)                                                                                       |
+| `remove_orphans`    | boolean           | Remove/Prune containers/services that are not (or no longer) defined in the Compose file.                                                                                                                                                                                                                                                                                                                                                                                            | `true`                                                                                                                 |
+| `prune_images`      | boolean           | Prune images that are no longer in use after a deployment. If the image is still used by any other container, it won't get deleted.                                                                                                                                                                                                                                                                                                                                                  | `true`                                                                                                                 |
+| `force_recreate`    | boolean           | Forces the recreation/redeployment of containers even if the configuration has not changed.                                                                                                                                                                                                                                                                                                                                                                                          | `false`                                                                                                                |
+| `wait_running_jobs` | boolean           | Wait for currently running [scheduled jobs](Advanced/Job-Scheduling.md) to finish before deployment starts.                                                                                                                                                                                                                                                                                                                                                                          | `true`                                                                                                                 |
+| `force_image_pull`  | boolean           | Always pulls the latest version of the image tags you've specified if a newer version is available.                                                                                                                                                                                                                                                                                                                                                                                  | `false`                                                                                                                |
+| `timeout`           | number            | The time in seconds to wait for the deployment to finish before timing out.                                                                                                                                                                                                                                                                                                                                                                                                          | `180`                                                                                                                  |
+| `git_depth`         | number            | Limits the number of commits fetched during clone/fetch (shallow clone). `0` means use the global [`GIT_CLONE_DEPTH`](App-Settings.md) value. A positive integer overrides the global setting for this deployment. When a requested ref (tag/SHA) is outside the shallow depth, doco-cd automatically deepens incrementally before falling back to a full fetch. Changing this value on an existing repo triggers an automatic re-clone.                                             | `0` (use global)                                                                                                       |
+| `destroy`           | boolean \| object | (⚠️ Destructive) Configure stack/project destruction behavior. Use `destroy: true` as shorthand to enable destruction with default options, or use `destroy.enabled: true` inside the object form to customize removal behavior. See [Destroy settings](#destroy-settings).                                                                                                                                                                                                          | see [Destroy settings](#destroy-settings)                                                                              |
+| `auto_discovery`    | boolean \| object | Enables [autodiscovery](#auto-discovery) of services to deploy in the working directory by scanning for subdirectories with Docker Compose files (see the `compose_files` setting). Use `auto_discovery: true` as shorthand to enable it with default options, or use the object form to customize settings such as `depth` and `delete`. See [Auto-Discovery Settings](#auto-discovery-settings).                                                                                   | see [Auto-Discovery Settings](#auto-discovery-settings)                                                                |
+| `reconciliation`    | boolean \| object | Enables event-driven reconciliation for deployments. Use `reconciliation: true` as shorthand to enable reconciliation with default options, or use the object form to customize settings. See [reconciliation settings](#reconciliation-settings).                                                                                                                                                                                                                                   | see [Reconciliation Settings](#reconciliation-settings)                                                                |
 
 
 !!! example
@@ -129,21 +141,29 @@ The docker compose deployment can be configured inside the [deployment configura
 
 ### Auto-Discovery
 
-If `auto_discovery` is enabled, doco-cd will try to find projects/stacks to deploy by searching for docker compose files (see the `compose_files` setting) in subdirectories in the working directory (`working_dir`). 
-Doco-cd will internally generate new deploy configs based on the directory name and inherits all other settings from the base deploy config inside the `.doco-cd.yml` file or the inline deployment config inside the poll config.
-When an app is no longer available in the `working_dir` (e.g. deleted or moved to another directory outside the working dir), doco-cd will automatically remove the deployed project/stack from the docker host.
+If `auto_discovery` is enabled, doco-cd will try to find projects/stacks to deploy by searching for docker compose files 
+(see the `compose_files` setting) in subdirectories in the working directory (`working_dir`). 
+
+Doco-cd will internally generate new deploy configs based on the directory name and inherits all other settings from the 
+base deploy config inside the `.doco-cd.yml` file or the inline deployment config inside the poll config.
+
+When an app is no longer available in the `working_dir` (e.g. deleted or moved to another directory outside the working dir), 
+doco-cd will automatically remove the deployed project/stack from the docker host.
 
 #### Auto-Discovery settings
 
-`auto_discovery` accepts either a boolean or a nested object in the deployment configuration file. Use `auto_discovery: true` to enable it with defaults, or use the object form below to customize `depth` and `delete`.
+`auto_discovery` accepts either a boolean or a nested object in the deployment configuration file. 
+Use `auto_discovery: true` to enable it with defaults, or use the object form below to customize the settings.
 
-| Key       | Type    | Description                                                                                          | Default value |
-|-----------|---------|------------------------------------------------------------------------------------------------------|---------------|
-| `enabled` | boolean | Enables auto-discovery of services to deploy in the working directory                                | `false`       |
-| `depth`   | number  | Maximum depth of subdirectories to scan for docker-compose files, set to `0` for no limit            | `0`           |
-| `delete`  | boolean | Auto-remove obsolete auto-discovered deployments that are no longer present in the working directory | `true`        |
+| Key              | Type    | Description                                                                                          | Default value |
+|------------------|---------|------------------------------------------------------------------------------------------------------|---------------|
+| `enabled`        | boolean | Enables auto-discovery of services to deploy in the working directory                                | `false`       |
+| `depth`          | number  | Maximum depth of subdirectories to scan for docker-compose files, set to `0` for no limit            | `0`           |
+| `delete`         | boolean | Auto-remove obsolete auto-discovered deployments that are no longer present in the working directory | `true`        |
+| `remove_volumes` | boolean | Remove volumes of auto-discovered deployments when they are deleted                                  | `false`       |
+| `remove_images`  | boolean | Remove images of auto-discovered deployments when they are deleted                                   | `true`        |
 
-!!! example
+??? example "Auto-discovery Setup Example"
     <div class="grid cards" markdown>
 
     - With a file structure like this
@@ -181,11 +201,34 @@ When an app is no longer available in the `working_dir` (e.g. deleted or moved t
 
     Doco-cd would deploy 2 stacks to the docker host: `wordpress` and `nginx`
 
+#### Controlling resource cleanup on stack deletion
+
+When auto-discovered stacks are deleted (e.g., because the compose file was removed from the repository), 
+you can control whether volumes and images are removed using the `remove_volumes` and `remove_images` settings
+in the `auto_discovery` configuration:
+
+```yaml title=".doco-cd.yml"
+working_dir: apps/
+auto_discovery:
+  enabled: true
+  delete: true
+  remove_volumes: false # (1)!
+  remove_images: true # (2)!
+```
+
+1. Keep volumes when stacks are auto-deleted
+2. Remove images when stacks are auto-deleted
+
+??? note "Default behavior"
+    By default, `remove_volumes` is set to `false`, meaning volumes are **preserved** when auto-discovered stacks are deleted.
+    This is a safer default to prevent accidental data loss (e.g., databases). Set `remove_volumes: true` if you want volumes to be removed when stacks are auto-deleted.
+
 #### Nested config overrides
 
 For each auto-discovered compose directory, doco-cd also checks for a local [deployment config file](#deployment-configuration-file) in that directory.
 
 If a nested config file exists, doco-cd merges it on top of the discovered deployment config.
+When using [custom webhook targets](Endpoints/Webhook-Listener.md#with-custom-target), nested config files always use the standard [naming convention](#deployment-configuration-file) (`.doco-cd.y(a)ml`), not the custom target name.
 
 !!! warning "Nested `.doco-cd.yml` files must contain exactly one YAML document."
     If a nested file contains multiple documents (`#!yaml ---`), auto-discovery fails for that run with an error.
@@ -250,6 +293,8 @@ The following fields are always inherited from the base/root deployment config:
 ### Build settings
 
 The following settings can be used to build docker images during a deployment (Like `docker compose build` or `docker compose up --build`).
+
+See also the [Compose Build Specification](https://docs.docker.com/reference/compose-file/build/) for more information on building docker images with compose.
 
 Specify all build-settings in a nested `build` object in the deployment configuration file (See example below).
 
@@ -498,6 +543,25 @@ services:
     cap_add:
       - NET_BIND_SERVICE
 ```
+
+### Wait for running scheduled jobs before deployment
+
+By default, deployments wait for currently running [scheduled jobs](Advanced/Job-Scheduling.md) to finish before recreating/updating containers.
+This helps prevent long-running jobs from being interrupted by a deployment.
+
+Use `wait_running_jobs` (default: `true`) in the deployment config to control the default behavior for that deployment target.
+
+```yaml title=".doco-cd.yml"
+name: some-project
+wait_running_jobs: true
+```
+
+You can override this per scheduled job service with the `cd.doco.job.wait_running_jobs` label (see [Job Scheduling](Advanced/Job-Scheduling.md#configuration)).
+
+Precedence:
+
+- Service label `cd.doco.job.wait_running_jobs` (if set)
+- Deployment default `wait_running_jobs`
 
 ## Multiple service deployments
 
