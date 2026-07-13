@@ -4,9 +4,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BRANCH="origin/renovate/kimdre-doco-cd-0.x"
 
-CLAUDE_MODEL="claude-opus-4-7"
+CLAUDE_MODEL="claude-fable-5"
 CLAUDE_EFFORT="xhigh"
-CODEX_MODEL="gpt-5.5"
+CODEX_MODEL="gpt-5.6-sol"
 CODEX_EFFORT="xhigh"
 
 # --- Terminal formatting ---
@@ -19,12 +19,15 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 RESET='\033[0m'
 
-info()    { printf "${CYAN}▸${RESET} %s\n" "$*"; }
+info() { printf "${CYAN}▸${RESET} %s\n" "$*"; }
 success() { printf "${GREEN}✔${RESET} %s\n" "$*"; }
-warn()    { printf "${YELLOW}▲${RESET} %s\n" "$*" >&2; }
-fatal()   { printf "${RED}✘${RESET} ${BOLD}%s${RESET}\n" "$*" >&2; }
-header()  { printf "\n${BOLD}%s${RESET}\n" "$*"; }
-divider() { printf "${DIM}%.0s─${RESET}" {1..60}; printf "\n"; }
+warn() { printf "${YELLOW}▲${RESET} %s\n" "$*" >&2; }
+fatal() { printf "${RED}✘${RESET} ${BOLD}%s${RESET}\n" "$*" >&2; }
+header() { printf "\n${BOLD}%s${RESET}\n" "$*"; }
+divider() {
+  printf "${DIM}%.0s─${RESET}" {1..60}
+  printf "\n"
+}
 
 CLAUDE_CODE_VERSION="$(claude --version 2>/dev/null || echo unknown)"
 CODEX_VERSION="$(codex --version 2>/dev/null || echo unknown)"
@@ -88,20 +91,25 @@ CODEX_OUT="$TMPDIR_BASE/codex-review.md"
 CODEX_ERR="$TMPDIR_BASE/codex-review.err"
 
 PROMPT_FILE="$TMPDIR_BASE/review-prompt.txt"
-printf '%s' "$PROMPT" > "$PROMPT_FILE"
+printf '%s' "$PROMPT" >"$PROMPT_FILE"
 
 info "Starting Claude Code review..."
-safehouse --workdir="$WORKTREE" -- \
-  claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --dangerously-skip-permissions \
-  < "$PROMPT_FILE" > "$CLAUDE_OUT" 2>"$CLAUDE_ERR" &
+(
+  cd "$WORKTREE"
+  nono run --silent --profile claude-code --allow-cwd --read "$SCRIPT_DIR/.git" -- \
+    claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --dangerously-skip-permissions
+) <"$PROMPT_FILE" >"$CLAUDE_OUT" 2>"$CLAUDE_ERR" &
 CLAUDE_PID=$!
 
 info "Starting Codex review..."
-safehouse --workdir="$WORKTREE" -- \
-  codex exec -m "$CODEX_MODEL" \
-  -c "model_reasoning_effort=$CODEX_EFFORT" \
-  --dangerously-bypass-approvals-and-sandbox \
-  -C "$WORKTREE" - < "$PROMPT_FILE" >"$CODEX_OUT" 2>"$CODEX_ERR" &
+(
+  cd "$WORKTREE"
+  nono run --silent --profile codex-cli --allow-cwd --read "$SCRIPT_DIR/.git" -- \
+    codex exec -m "$CODEX_MODEL" \
+    -c "model_reasoning_effort=$CODEX_EFFORT" \
+    --dangerously-bypass-approvals-and-sandbox \
+    -C "$WORKTREE" -
+) <"$PROMPT_FILE" >"$CODEX_OUT" 2>"$CODEX_ERR" &
 CODEX_PID=$!
 
 SPINNER_FRAMES=("⠋" "⠙" "⠹" "⠸" "⠼" "⠴" "⠦" "⠧" "⠇" "⠏")
@@ -114,12 +122,12 @@ START_TIME=$SECONDS
 FRAME=0
 
 while [[ -z "$CLAUDE_EXIT" || -z "$CODEX_EXIT" ]]; do
-  ELAPSED=$(( SECONDS - START_TIME ))
-  MINS=$(( ELAPSED / 60 ))
-  SECS=$(( ELAPSED % 60 ))
+  ELAPSED=$((SECONDS - START_TIME))
+  MINS=$((ELAPSED / 60))
+  SECS=$((ELAPSED % 60))
   TIMESTAMP=$(printf "%d:%02d" "$MINS" "$SECS")
   SPIN="${SPINNER_FRAMES[$((FRAME % ${#SPINNER_FRAMES[@]}))]}"
-  FRAME=$(( FRAME + 1 ))
+  FRAME=$((FRAME + 1))
 
   if [[ -z "$CLAUDE_EXIT" ]] && ! kill -0 "$CLAUDE_PID" 2>/dev/null; then
     wait "$CLAUDE_PID" 2>/dev/null && CLAUDE_EXIT=0 || CLAUDE_EXIT=$?
@@ -248,12 +256,14 @@ A single bolded verdict: **SAFE**, **SAFE WITH NOTES**, or **UNSAFE**, followed 
 FINAL_OUT="$TMPDIR_BASE/final-review.md"
 COMBINE_ERR="$TMPDIR_BASE/combine-review.err"
 COMBINE_PROMPT_FILE="$TMPDIR_BASE/combine-prompt.txt"
-printf '%s' "$COMBINE_PROMPT" > "$COMBINE_PROMPT_FILE"
+printf '%s' "$COMBINE_PROMPT" >"$COMBINE_PROMPT_FILE"
 
 COMBINE_EXIT=0
-safehouse --workdir="$WORKTREE" -- \
-  claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --dangerously-skip-permissions \
-  < "$COMBINE_PROMPT_FILE" > "$FINAL_OUT" 2>"$COMBINE_ERR" \
+(
+  cd "$WORKTREE"
+  nono run --silent --profile claude-code --allow-cwd -- \
+    claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --dangerously-skip-permissions
+) <"$COMBINE_PROMPT_FILE" >"$FINAL_OUT" 2>"$COMBINE_ERR" \
   || COMBINE_EXIT=$?
 
 if [[ $COMBINE_EXIT -ne 0 ]]; then
