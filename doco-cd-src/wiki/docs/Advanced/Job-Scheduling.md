@@ -11,6 +11,12 @@ tags:
 The built-in job scheduler allows you to run containers/services defined in your docker compose files as scheduled jobs based on cron-like schedules or predefined intervals.
 This is useful for running periodic tasks such as backups, maintenance scripts, or any recurring workloads without needing an external scheduler.
 
+!!! warning "Multiple doco-cd instances on the same Docker host"
+    The scheduler discovers runnable jobs from Docker labels and is not scoped by deployment target or by a specific `.doco-cd.*.yaml` file.
+    If you run multiple doco-cd instances against the same Docker socket, each instance can discover and trigger the same scheduled jobs.
+
+    To avoid duplicate runs, enable the scheduler only on the instance that should own scheduled jobs and set [`SCHEDULER_ENABLED`](../App-Settings.md#:~:text=when%20not%20specified-,SCHEDULER_ENABLED,-boolean) to `false` on secondary or self-updater instances.
+
 ## Schedule formats
 
 - [Cron expressions](https://pkg.go.dev/github.com/robfig/cron#hdr-CRON_Expression_Format) **without** seconds (`minute hour day-of-month month day-of-week`)
@@ -85,10 +91,22 @@ This is useful for running periodic tasks such as backups, maintenance scripts, 
 
 The execution mode determines how scheduled jobs are run and managed by doco-cd and can be configured using the `cd.doco.job.execution_mode` label on the service.
 
+!!! info "Scheduled jobs never run on deployment"
+    Scheduled jobs only run when their [schedule](#schedule-formats) fires, never as a side effect of a (re)deployment.
+    On deployment the job's service/container is prepared but left idle:
+
+    - Docker (Standalone): the container is created but not started.
+    - Docker Swarm: the service is deployed with `0` replicas (see the limitation for `global` restart-mode jobs below).
+
 ### `restart`
 
 By default, scheduled jobs will be executed in `restart` mode, which means the service will be created on deployment 
 and then re-/started at the scheduled time without being removed after completion.
+
+!!! warning "Docker Swarm `global` + `restart` limitation"
+    In Docker Swarm, restart-mode scheduled jobs are deployed with `0` replicas so they do not run on deployment.
+    `global` services cannot be scaled to `0` (a global service always runs one task per node), so a `global` service
+    combined with `restart` mode **will** run on deployment. Use [`one_off`](#one_off) mode for global scheduled jobs instead.
 
 ### `one_off`
 
@@ -153,6 +171,12 @@ Use the following service labels to configure scheduled jobs:
 | `cd.doco.job.notify_on`         | string  | [Notification](Notifications.md) behavior for scheduled runs: `none`, `success`, `failure`, `all`                                                                           | `all`     |
 | `cd.doco.job.swarm.replicas`    | integer | Number of completions/concurrency for swarm one-off jobs in `replicated` [deploy mode](#swarm-deploymode)                                                                   | `1`       |
 
+!!! note "Using scheduled jobs with multiple doco-cd instances"
+    `cd.doco.job.skip_running` only prevents overlapping runs within the same doco-cd process.
+    It does not coordinate scheduled runs across multiple doco-cd instances that share the same Docker host.
+
+    For multi-instance setups, prefer a single scheduler owner by disabling the scheduler on the other instances with [`SCHEDULER_ENABLED`](../App-Settings.md#:~:text=when%20not%20specified-,SCHEDULER_ENABLED,-boolean).
+
 ### Swarm `deploy.mode`
 
 When using Docker Swarm, you can configure the deploy mode for scheduled jobs using the `deploy.mode` field in your docker compose file.
@@ -204,7 +228,7 @@ The following mapping applies to scheduled runs in `one_off` mode:
 ## Timezone
 
 Scheduled jobs are triggered based on the timezone of the doco-cd instance, which is determined by the `TZ` environment variable or defaults to UTC if not set.
-You can find a list of all possible timezone values on [wikipedia](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
+You can find a list of all possible timezone values on [timeie](https://timeie.com/) and [wikipedia](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).
 
 ## Daylight saving time (DST)
 
@@ -212,3 +236,7 @@ When DST changes occur in the configured [timezone](#timezone), scheduled jobs w
 
 - If a scheduled time is skipped due to DST (e.g., clocks move forward), the job will not run at that time.
 - If a scheduled time occurs twice due to DST (e.g., clocks move backward), the job will run at both occurrences of that time.
+
+## Manual execution via Job API
+
+Configured jobs can also be triggered manually outside their scheduled intervals by using the [Run Job API endpoint](../Endpoints/REST-API.md#scheduled-jobs).

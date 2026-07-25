@@ -16,9 +16,11 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
+	dockerSwarm "github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/logger"
@@ -31,6 +33,36 @@ import (
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
+func TestDeploy_RejectsUnverifiedOCIArtifact(t *testing.T) {
+	t.Parallel()
+
+	err := deploy(
+		t.Context(),
+		logger.New(logger.LevelCritical).Logger,
+		nil,
+		container.MountPoint{},
+		nil,
+		nil,
+		notification.Metadata{},
+		stages.JobTriggerWebhook,
+		stages.RepositoryData{
+			Source:     config.SourceTypeOCI,
+			SourceUrl:  "ghcr.io/example/repo:latest",
+			OCITrusted: false,
+		},
+		nil,
+		nil,
+		"",
+	)
+	if err == nil {
+		t.Fatal("expected deploy to fail for unverified OCI artifact")
+	}
+
+	if !errors.Is(err, ErrOCIArtifactNotVerified) {
+		t.Fatalf("expected ErrOCIArtifactNotVerified, got %v", err)
+	}
+}
+
 func TestDeploy(t *testing.T) {
 	encryption.SetupAgeKeyEnvVar(t)
 
@@ -40,6 +72,8 @@ func TestDeploy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	c.GitCommitStatus = false
 
 	log := logger.New(logger.LevelCritical).Logger
 
@@ -304,7 +338,7 @@ func destroyTestStack(ctx context.Context, cli client.APIClient, stackName strin
 		}
 	}
 
-	if err := docker.RemoveLabeledVolumes(ctx, cli, stackName); err != nil {
+	if err := docker.RemoveLabeledVolumes(ctx, cli, dockerSwarm.GetModeEnabled(), stackName); err != nil {
 		return err
 	}
 

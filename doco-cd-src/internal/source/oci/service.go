@@ -20,11 +20,29 @@ import (
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
+const (
+	// maxExtractedBytes caps the total uncompressed size written to disk across all
+	// artifact layers to protect against decompression bombs / disk-fill DoS.
+	maxExtractedBytes int64 = 1 << 30 // 1 GiB
+	// maxExtractedEntries caps the total number of files/directories extracted from
+	// an artifact to protect against archives with an excessive number of entries.
+	maxExtractedEntries = 100_000
+)
+
 var (
 	ErrDigestMismatch        = errors.New("artifact digest does not match expected digest")
 	ErrUnsupportedLayout     = errors.New("unsupported OCI layout")
 	ErrInvalidArtifactLayout = errors.New("invalid OCI artifact layout")
+	ErrArtifactTooLarge      = errors.New("artifact exceeds maximum allowed extraction size")
+	ErrTooManyArtifactFiles  = errors.New("artifact exceeds maximum allowed number of entries")
 )
+
+// extractionBudget tracks the remaining extraction allowance shared across all
+// layers of a single artifact.
+type extractionBudget struct {
+	remainingBytes   int64
+	remainingEntries int
+}
 
 type PullResult struct {
 	Digest string
@@ -57,22 +75,28 @@ func TagFromArtifact(artifact string) string {
 	return tag
 }
 
+func ResolveDigest(ctx context.Context, artifactRef, expectedDigest string) (string, error) {
+	_, desc, err := resolveDescriptor(ctx, artifactRef)
+	if err != nil {
+		return "", err
+	}
+
+	digest := desc.Digest.String()
+	if strings.TrimSpace(expectedDigest) != "" && strings.TrimSpace(expectedDigest) != digest {
+		return "", fmt.Errorf("%w: expected %s got %s", ErrDigestMismatch, expectedDigest, digest)
+	}
+
+	return digest, nil
+}
+
 func PullAndExtract(ctx context.Context, artifactRef, expectedDigest, layout, destination, customTarget string) (PullResult, error) {
 	if strings.TrimSpace(layout) != config.OciArtifactLayoutV1 {
 		return PullResult{}, fmt.Errorf("%w: %s", ErrUnsupportedLayout, layout)
 	}
 
-	ref, err := name.ParseReference(strings.TrimSpace(artifactRef), name.WeakValidation)
+	_, desc, err := resolveDescriptor(ctx, artifactRef)
 	if err != nil {
-		return PullResult{}, fmt.Errorf("failed to parse OCI artifact reference: %w", err)
-	}
-
-	desc, err := remote.Get(ref,
-		remote.WithContext(ctx),
-		remote.WithAuthFromKeychain(authn.DefaultKeychain),
-	)
-	if err != nil {
-		return PullResult{}, fmt.Errorf("failed to resolve OCI artifact: %w", err)
+		return PullResult{}, err
 	}
 
 	digest := desc.Digest.String()
@@ -94,12 +118,23 @@ func PullAndExtract(ctx context.Context, artifactRef, expectedDigest, layout, de
 		return PullResult{}, fmt.Errorf("%w: no layers in artifact", ErrInvalidArtifactLayout)
 	}
 
-	if err := os.RemoveAll(destination); err != nil {
-		return PullResult{}, fmt.Errorf("failed to reset artifact destination: %w", err)
+	// Extract into a sibling temp directory so that validation can run before
+	// touching the live destination. Using the same parent ensures src and dst
+	// are on the same filesystem, which allows cheap os.Rename moves.
+	if err := os.MkdirAll(filepath.Dir(destination), filesystem.PermDir); err != nil {
+		return PullResult{}, fmt.Errorf("failed to create extraction parent directory: %w", err)
 	}
 
-	if err := os.MkdirAll(destination, filesystem.PermDir); err != nil {
-		return PullResult{}, fmt.Errorf("failed to create artifact destination: %w", err)
+	tmpDir, err := os.MkdirTemp(filepath.Dir(destination), ".oci-extract-*")
+	if err != nil {
+		return PullResult{}, fmt.Errorf("failed to create temp extraction directory: %w", err)
+	}
+
+	defer func() { _ = os.RemoveAll(tmpDir) }()
+
+	budget := &extractionBudget{
+		remainingBytes:   maxExtractedBytes,
+		remainingEntries: maxExtractedEntries,
 	}
 
 	for _, layer := range layers {
@@ -108,7 +143,7 @@ func PullAndExtract(ctx context.Context, artifactRef, expectedDigest, layout, de
 			return PullResult{}, fmt.Errorf("failed to read artifact layer stream: %w", err)
 		}
 
-		err = extractTarStream(destination, r)
+		err = extractTarStream(tmpDir, r, budget)
 		_ = r.Close()
 
 		if err != nil {
@@ -116,14 +151,76 @@ func PullAndExtract(ctx context.Context, artifactRef, expectedDigest, layout, de
 		}
 	}
 
-	if err := validateDocoLayoutV1(destination, customTarget); err != nil {
+	if err := validateDocoLayoutV1(tmpDir, customTarget); err != nil {
 		return PullResult{}, err
+	}
+
+	// Sync contents into the existing destination directory without removing
+	// the directory itself. Preserving the directory inode ensures that Docker
+	// bind mounts referencing destination remain valid across syncs.
+	if err := syncDirectoryContents(tmpDir, destination); err != nil {
+		return PullResult{}, fmt.Errorf("failed to sync artifact to destination: %w", err)
 	}
 
 	return PullResult{Digest: digest}, nil
 }
 
-func extractTarStream(destination string, reader io.Reader) error {
+func resolveDescriptor(ctx context.Context, artifactRef string) (name.Reference, *remote.Descriptor, error) {
+	ref, err := name.ParseReference(strings.TrimSpace(artifactRef), name.WeakValidation)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse OCI artifact reference: %w", err)
+	}
+
+	desc, err := remote.Get(ref,
+		remote.WithContext(ctx),
+		remote.WithAuthFromKeychain(authn.DefaultKeychain),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to resolve OCI artifact: %w", err)
+	}
+
+	return ref, desc, nil
+}
+
+// syncDirectoryContents replaces the contents of dst with those from src
+// without removing dst itself. This keeps the dst inode stable so that Docker
+// bind mounts that reference dst are not orphaned.
+func syncDirectoryContents(src, dst string) error {
+	if err := os.MkdirAll(dst, filesystem.PermDir); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	// Remove all existing entries in dst.
+	existing, err := os.ReadDir(dst)
+	if err != nil {
+		return fmt.Errorf("failed to read destination directory: %w", err)
+	}
+
+	for _, entry := range existing {
+		if err := os.RemoveAll(filepath.Join(dst, entry.Name())); err != nil {
+			return fmt.Errorf("failed to remove %q from destination: %w", entry.Name(), err)
+		}
+	}
+
+	// Move each entry from src into dst.
+	incoming, err := os.ReadDir(src)
+	if err != nil {
+		return fmt.Errorf("failed to read source directory: %w", err)
+	}
+
+	for _, entry := range incoming {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+
+		if err := os.Rename(srcPath, dstPath); err != nil {
+			return fmt.Errorf("failed to move %q to destination: %w", entry.Name(), err)
+		}
+	}
+
+	return nil
+}
+
+func extractTarStream(destination string, reader io.Reader, budget *extractionBudget) error {
 	tr := tar.NewReader(reader)
 
 	for {
@@ -143,12 +240,24 @@ func extractTarStream(destination string, reader io.Reader) error {
 			return fmt.Errorf("%w: %s", filesystem.ErrPathTraversal, h.Name)
 		}
 
+		if h.Typeflag == tar.TypeDir || h.Typeflag == tar.TypeReg {
+			if budget.remainingEntries <= 0 {
+				return fmt.Errorf("%w: limit %d", ErrTooManyArtifactFiles, maxExtractedEntries)
+			}
+
+			budget.remainingEntries--
+		}
+
 		switch h.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, os.FileMode(uint32(h.Mode&0o777))); err != nil {
 				return fmt.Errorf("failed to create directory %s: %w", target, err)
 			}
 		case tar.TypeReg:
+			if h.Size < 0 || h.Size > budget.remainingBytes {
+				return fmt.Errorf("%w: limit %d bytes", ErrArtifactTooLarge, maxExtractedBytes)
+			}
+
 			if err := os.MkdirAll(filepath.Dir(target), filesystem.PermDir); err != nil {
 				return fmt.Errorf("failed to create parent directory for %s: %w", target, err)
 			}
@@ -158,7 +267,10 @@ func extractTarStream(destination string, reader io.Reader) error {
 				return fmt.Errorf("failed to create file %s: %w", target, err)
 			}
 
-			if _, err = io.CopyN(f, tr, h.Size); err != nil {
+			written, err := io.CopyN(f, tr, h.Size)
+			budget.remainingBytes -= written
+
+			if err != nil {
 				if !errors.Is(err, io.EOF) {
 					_ = f.Close()
 					return fmt.Errorf("failed to extract file %s: %w", target, err)

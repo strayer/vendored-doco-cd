@@ -49,6 +49,7 @@ type Config struct {
 	WebhookEventFilter string                                   `yaml:"webhook_filter" json:"webhook_filter" default:"" doco:"allowOverride"`                                                                                   // WebhookEventFilter is a regular expression to whitelist deployment triggers based on the webhook event payload (e.g., branch like "^refs/heads/main$" or "main", tag like "^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$" or "v[0-9]+\.[0-9]+\.[0-9]+")
 	Reference          string                                   `yaml:"reference" json:"reference" default:""`                                                                                                                  // Reference is the Git reference to the deployment, e.g., refs/heads/main, main, refs/tags/v1.0.0 or v1.0.0
 	WorkingDirectory   string                                   `yaml:"working_dir" json:"working_dir" default:"." doco:"allowOverride"`                                                                                        // WorkingDirectory is the working directory for the deployment
+	Context            string                                   `yaml:"context" json:"context" default:"" doco:"allowOverride"`                                                                                                 // Context is the Docker context to use for this deployment (empty uses the default Docker context)
 	ComposeFiles       []string                                 `yaml:"compose_files" json:"compose_files" default:"[\"compose.yaml\", \"compose.yml\", \"docker-compose.yml\", \"docker-compose.yaml\"]" doco:"allowOverride"` // ComposeFiles is the list of docker-compose files to use
 	Environment        map[string]string                        `yaml:"environment" json:"environment" doco:"allowOverride"`                                                                                                    // Environment is a map of environment variables to use for variable interpolation in the compose files
 	EnvFiles           []string                                 `yaml:"env_files" json:"env_files" default:"[\".env\"]" doco:"allowOverride"`                                                                                   // EnvFiles is the list of dotenv files to use for variable interpolation
@@ -68,6 +69,7 @@ type Config struct {
 	Oci                config.OciTrustPolicyOverride            `yaml:"oci" json:"oci" doco:"allowOverride"`                                                                                                                    // Oci allows per-target overrides for OCI signature verification policy
 	Internal           struct {
 		File                          string            `yaml:"-"` // File is the path to the deployment configuration file
+		ConfigTarget                  string            `yaml:"-"` // ConfigTarget is the target suffix from the deployment config filename (e.g., "nas" for .doco-cd.nas.yml)
 		Environment                   map[string]string // Environment stores environment variables for variable interpolation in the compose project
 		Hash                          string            `yaml:"-"`          // Hash is a hash of the Config struct
 		OciTrustPolicyOverrideTrusted bool              `yaml:"-" json:"-"` // true only for trusted config sources (e.g. POLL_CONFIG inline deployments)
@@ -146,6 +148,8 @@ func (c *Config) Validate() error {
 	if !filepath.IsLocal(c.WorkingDirectory) {
 		c.WorkingDirectory = filepath.Join(".", c.WorkingDirectory)
 	}
+
+	c.Context = strings.TrimSpace(c.Context)
 
 	if len(c.ComposeFiles) == 0 {
 		return fmt.Errorf("%w: compose_files", ErrKeyNotFound)
