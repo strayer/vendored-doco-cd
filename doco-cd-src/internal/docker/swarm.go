@@ -93,6 +93,7 @@ func addSwarmServiceLabels(stack *composetypes.Config, deployConfig *deploy.Conf
 		DocoCDLabels.Deployment.Timestamp:           timestamp,
 		DocoCDLabels.Deployment.ComposeHash:         projectHash,
 		DocoCDLabels.Deployment.WorkingDir:          repoDir,
+		DocoCDLabels.Deployment.ConfigTarget:        deployConfig.Internal.ConfigTarget,
 		DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
 		DocoCDLabels.Deployment.CommitSHA:           latestCommit,
 		DocoCDLabels.Deployment.TargetRef:           ExtractOciArtifactTag(deployConfig.Reference),
@@ -107,10 +108,11 @@ func addSwarmServiceLabels(stack *composetypes.Config, deployConfig *deploy.Conf
 	// Service-level labels (ServiceSpec.Annotations.Labels) are required for Docker
 	// service events to be filterable by label. These are set via Deploy.Labels.
 	serviceLevelLabels := map[string]string{
-		DocoCDLabels.Metadata.Manager: app.Name,
-		DocoCDLabels.Deployment.Name:  deployConfig.Name,
-		DocoCDLabels.Source.Type:      SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
-		DocoCDLabels.Source.Name:      payload.FullName,
+		DocoCDLabels.Metadata.Manager:        app.Name,
+		DocoCDLabels.Deployment.Name:         deployConfig.Name,
+		DocoCDLabels.Deployment.ConfigTarget: deployConfig.Internal.ConfigTarget,
+		DocoCDLabels.Source.Type:             SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
+		DocoCDLabels.Source.Name:             payload.FullName,
 	}
 
 	for i, s := range stack.Services {
@@ -135,17 +137,18 @@ func addSwarmVolumeLabels(stack *composetypes.Config, deployConfig *deploy.Confi
 	repoDir, appVersion, timestamp, latestCommit string,
 ) {
 	customLabels := map[string]string{
-		DocoCDLabels.Metadata.Manager:      app.Name,
-		DocoCDLabels.Metadata.Version:      appVersion,
-		DocoCDLabels.Deployment.Name:       deployConfig.Name,
-		DocoCDLabels.Deployment.Timestamp:  timestamp,
-		DocoCDLabels.Deployment.WorkingDir: repoDir,
-		DocoCDLabels.Deployment.Trigger:    payload.CommitSHA,
-		DocoCDLabels.Deployment.CommitSHA:  latestCommit,
-		DocoCDLabels.Deployment.TargetRef:  ExtractOciArtifactTag(deployConfig.Reference),
-		DocoCDLabels.Source.Type:           SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
-		DocoCDLabels.Source.Name:           payload.FullName,
-		DocoCDLabels.Source.URL:            payload.WebURL,
+		DocoCDLabels.Metadata.Manager:        app.Name,
+		DocoCDLabels.Metadata.Version:        appVersion,
+		DocoCDLabels.Deployment.Name:         deployConfig.Name,
+		DocoCDLabels.Deployment.Timestamp:    timestamp,
+		DocoCDLabels.Deployment.WorkingDir:   repoDir,
+		DocoCDLabels.Deployment.ConfigTarget: deployConfig.Internal.ConfigTarget,
+		DocoCDLabels.Deployment.Trigger:      payload.CommitSHA,
+		DocoCDLabels.Deployment.CommitSHA:    latestCommit,
+		DocoCDLabels.Deployment.TargetRef:    ExtractOciArtifactTag(deployConfig.Reference),
+		DocoCDLabels.Source.Type:             SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
+		DocoCDLabels.Source.Name:             payload.FullName,
+		DocoCDLabels.Source.URL:              payload.WebURL,
 	}
 
 	for i, v := range stack.Volumes {
@@ -436,6 +439,53 @@ func RestartService(ctx context.Context, cli dockerClient.APIClient, serviceName
 	}
 
 	return nil
+}
+
+// scheduledRestartReplicas returns the intended replica count for a restart-mode
+// scheduled Swarm service, read from the JobRestartReplicas label that is set at
+// deploy time when the service is pinned to 0 replicas. Defaults to 1.
+func scheduledRestartReplicas(spec swarmTypes.ServiceSpec) uint64 {
+	replicas := uint64(1)
+
+	if spec.TaskTemplate.ContainerSpec == nil || spec.TaskTemplate.ContainerSpec.Labels == nil {
+		return replicas
+	}
+
+	raw, ok := spec.TaskTemplate.ContainerSpec.Labels[docoCDJobLabelNames.JobRestartReplicas]
+	if !ok {
+		return replicas
+	}
+
+	if v, err := strconv.ParseUint(strings.TrimSpace(raw), 10, 64); err == nil && v > 0 {
+		replicas = v
+	}
+
+	return replicas
+}
+
+// RestartScheduledSwarmService runs a restart-mode scheduled Swarm service on its
+// schedule. Classic replicated scheduled services are deployed at 0 replicas so
+// they do not run on deployment; this scales them up to their intended replica
+// count (forcing a task re-run) when the schedule fires. Services that cannot be
+// scaled to 0 (e.g. global) fall back to a ForceUpdate bump.
+func RestartScheduledSwarmService(ctx context.Context, dockerCLI command.Cli, serviceName string) error {
+	apiClient := dockerCLI.Client()
+
+	result, err := apiClient.ServiceInspect(ctx, serviceName, dockerClient.ServiceInspectOptions{
+		InsertDefaults: true,
+	})
+	if err != nil {
+		return fmt.Errorf("inspect service %s: %w", serviceName, err)
+	}
+
+	svc := result.Service
+
+	if svc.Spec.Mode.Replicated != nil {
+		replicas := scheduledRestartReplicas(svc.Spec)
+		return swarmInternal.ScaleService(ctx, dockerCLI, serviceName, replicas, false, true)
+	}
+
+	return RestartService(ctx, apiClient, serviceName)
 }
 
 // RerunJobService attempts to retrigger a Swarm job service (`replicated-job` or `global-job`)

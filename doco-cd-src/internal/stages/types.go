@@ -1,6 +1,7 @@
 package stages
 
 import (
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	types2 "github.com/kimdre/doco-cd/internal/config"
 
+	"github.com/kimdre/doco-cd/internal/commitstatus"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -117,6 +119,7 @@ type RepositoryData struct {
 	PathExternal string            // Path to the repository on the host machine
 	Git          *git.Repository   // Git repository instance
 	Revision     string            // Resolved immutable revision (commit SHA or digest)
+	OCITrusted   bool              // True when the OCI artifact passed trust-policy verification before reconciliation/cleanup
 }
 
 // Docker holds the Docker CLI and client instances along with the data mount point.
@@ -124,6 +127,7 @@ type Docker struct {
 	Cmd            command.Cli
 	DataMountPoint container.MountPoint
 	Project        *types.Project
+	SwarmMode      bool
 }
 
 // DeploymentState holds the dynamic state information during the deployment process.
@@ -254,5 +258,146 @@ func (s *StageManager) NotifyFailure(notifyErr error) {
 		metadata.JobID = s.JobID
 
 		s.NotifyFailureFunc(s.Log, notifyErr, metadata)
+	}
+}
+
+// resolveCommitSHA returns the full commit SHA for the current deployment.
+// For webhook triggers the SHA is taken directly from the payload; for poll
+// triggers it is resolved from the cloned repository after the init stage.
+func (s *StageManager) resolveCommitSHA() string {
+	if s.Repository.Source == types2.SourceTypeOCI {
+		return "" // OCI digests are not git commit SHAs
+	}
+
+	// Prefer the full SHA from the local git repository when available.
+	if s.Repository.Git != nil {
+		sha, err := gitInternal.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
+		if err == nil && strings.TrimSpace(sha) != "" {
+			return strings.TrimSpace(sha)
+		}
+	}
+
+	// Fall back to the SHA carried in the webhook payload.
+	if s.Payload != nil {
+		sha := strings.TrimSpace(s.Payload.CommitSHA)
+		if sha != "" && sha != string(JobTriggerPoll) {
+			return sha
+		}
+	}
+
+	return strings.TrimSpace(s.Repository.Revision)
+}
+
+func (s *StageManager) resolveCommitStatusContext() string {
+	return commitstatus.ContextForStack(s.DeployConfig.Internal.ConfigTarget, s.DeployConfig.Name)
+}
+
+func (s *StageManager) resolveCommitStatusRequest() (commitstatus.Provider, string, string, string, string, string, bool) {
+	if !s.AppConfig.GitCommitStatus {
+		return commitstatus.ProviderAuto, "", "", "", "", "", false
+	}
+
+	if s.Repository.Source == types2.SourceTypeOCI {
+		return commitstatus.ProviderAuto, "", "", "", "", "", false
+	}
+
+	commitSHA := s.resolveCommitSHA()
+	if commitSHA == "" {
+		s.Log.Debug("skipping commit status: no commit SHA available")
+
+		return commitstatus.ProviderAuto, "", "", "", "", "", false
+	}
+
+	resolved := gitInternal.ResolveAuthConfig(s.Repository.SourceUrl, "", "", "")
+
+	token := resolved.GitAccessToken
+	if token == "" {
+		token = s.AppConfig.GitAccessToken
+	}
+
+	if token == "" {
+		s.Log.Debug("skipping commit status: no access token configured")
+
+		return commitstatus.ProviderAuto, "", "", "", "", "", false
+	}
+
+	repoURL := ""
+	repoFullName := ""
+
+	if s.Payload != nil {
+		repoURL = strings.TrimSpace(s.Payload.WebURL)
+		repoFullName = strings.TrimSpace(s.Payload.FullName)
+	}
+
+	if repoURL == "" {
+		repoURL = s.Repository.SourceUrl
+	}
+
+	if repoFullName == "" {
+		repoFullName = gitInternal.GetFullName(repoURL)
+	}
+
+	provider, _ := commitstatus.ParseProvider(s.AppConfig.GitScmProvider)
+
+	return provider, repoURL, repoFullName, commitSHA, token, s.resolveCommitStatusContext(), true
+}
+
+func (s *StageManager) GetCurrentCommitStatus(ctx context.Context) (commitstatus.Status, bool) {
+	provider, repoURL, repoFullName, commitSHA, token, contextName, ok := s.resolveCommitStatusRequest()
+	if !ok {
+		return commitstatus.Status{}, false
+	}
+
+	s.Log.Debug("getting commit status",
+		slog.String("provider", string(provider)),
+		slog.String("repository", repoFullName),
+		slog.String("commit_sha", commitSHA),
+		slog.String("context", contextName),
+	)
+
+	status, found, err := commitstatus.Get(ctx, provider, repoURL, repoFullName, commitSHA, token, contextName)
+	if err != nil {
+		s.Log.Warn("failed to get commit status", slog.String("error", err.Error()))
+		return commitstatus.Status{}, false
+	}
+
+	if !found {
+		s.Log.Debug("no commit status found",
+			slog.String("provider", string(provider)),
+			slog.String("repository", repoFullName),
+			slog.String("commit_sha", commitSHA),
+			slog.String("context", contextName),
+		)
+	}
+
+	return status, found
+}
+
+// PostCommitStatus posts a commit status to the source Git provider.
+// It is a no-op when GIT_COMMIT_STATUS is disabled, when the source is OCI,
+// or when no access token / commit SHA is available.
+// Errors are logged as warnings so they never block a deployment.
+func (s *StageManager) PostCommitStatus(ctx context.Context, state commitstatus.State, description string) {
+	provider, repoURL, repoFullName, commitSHA, token, contextName, ok := s.resolveCommitStatusRequest()
+	if !ok {
+		return
+	}
+
+	s.Log.Debug("posting commit status",
+		slog.String("provider", string(provider)),
+		slog.String("repository", repoFullName),
+		slog.String("commit_sha", commitSHA),
+		slog.String("context", contextName),
+		slog.String("state", string(state)),
+		slog.String("description", description),
+	)
+
+	err := commitstatus.Post(ctx, provider, repoURL, repoFullName, commitSHA, token, commitstatus.Status{
+		State:       state,
+		Description: description,
+		Context:     contextName,
+	})
+	if err != nil {
+		s.Log.Warn("failed to post commit status", slog.String("error", err.Error()))
 	}
 }

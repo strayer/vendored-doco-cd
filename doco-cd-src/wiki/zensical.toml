@@ -9,9 +9,9 @@
 [project]
 site_name = "Doco-CD Documentation"
 site_description = "Doco-CD is a lightweight, declarative GitOps continuous delivery tool for Docker and Docker Swarm"
-site_author = "doco-cd contributors"
+site_author = "Kim Oliver Drechsel"
 site_url = "https://doco.cd/"
-copyright = "&copy; 2026 Doco-CD Contributors"
+copyright = "Copyright &copy; 2026 <a href=\"https://github.com/kimdre\">Kim Oliver Drechsel</a>"
 repo_url = "https://github.com/kimdre/doco-cd"
 repo_name = "kimdre/doco-cd"
 edit_uri = "edit/main/wiki/docs/"
@@ -35,6 +35,7 @@ nav = [
     { "Poll Settings" = "Poll-Settings.md" },
   ] },
   { Advanced = [
+    { "Docker Contexts" = "Advanced/Docker-Contexts.md" },
     { Encryption = "Advanced/Encryption.md" },
     { "External Secrets" = [
       "External-Secrets/index.md",
@@ -56,6 +57,7 @@ nav = [
     ] },
     { "Pre- / Post-Deployment Scripts" = "Advanced/Pre-Post-Deployment-Scripts.md" },
     { "Private Container Registries" = "Advanced/Private-Container-Registries.md" },
+    { "Self-Updating" = "Advanced/Self-Updating.md" },
     { "Swarm Mode" = "Advanced/Swarm-Mode.md" },
     { "Tips & Tricks" = "Advanced/Tips-and-Tricks.md" },
   ] },

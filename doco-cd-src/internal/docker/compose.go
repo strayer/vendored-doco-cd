@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
@@ -69,6 +70,10 @@ func init() {
 }
 
 func CreateDockerCli(quiet bool) (command.Cli, error) {
+	return CreateDockerCliWithContext(quiet, "")
+}
+
+func CreateDockerCliWithContext(quiet bool, dockerContext string) (command.Cli, error) {
 	var (
 		outputStream io.Writer
 		errorStream  io.Writer
@@ -91,7 +96,12 @@ func CreateDockerCli(quiet bool) (command.Cli, error) {
 		return nil, fmt.Errorf("failed to create docker cli: %w", err)
 	}
 
-	opts := &flags.ClientOptions{Context: "default", LogLevel: "error"}
+	contextName := strings.TrimSpace(dockerContext)
+	if contextName == "" {
+		contextName = "default"
+	}
+
+	opts := &flags.ClientOptions{Context: contextName, LogLevel: "error"}
 
 	err = dockerCli.Initialize(opts)
 	if err != nil {
@@ -125,6 +135,7 @@ func addComposeServiceLabels(project *types.Project, deployConfig *deploy.Config
 			DocoCDLabels.Deployment.Timestamp:           timestamp,
 			DocoCDLabels.Deployment.ComposeHash:         projectHash,
 			DocoCDLabels.Deployment.WorkingDir:          workingDir,
+			DocoCDLabels.Deployment.ConfigTarget:        deployConfig.Internal.ConfigTarget,
 			DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
 			DocoCDLabels.Deployment.CommitSHA:           latestCommit,
 			DocoCDLabels.Deployment.TargetRef:           ExtractOciArtifactTag(deployConfig.Reference),
@@ -151,20 +162,21 @@ func addComposeVolumeLabels(project *types.Project, deployConfig *deploy.Config,
 ) {
 	for i, v := range project.Volumes {
 		v.CustomLabels = map[string]string{
-			DocoCDLabels.Metadata.Manager:       app.Name,
-			DocoCDLabels.Metadata.Version:       appVersion,
-			DocoCDLabels.Deployment.Name:        deployConfig.Name,
-			DocoCDLabels.Deployment.Timestamp:   timestamp,
-			DocoCDLabels.Deployment.ComposeHash: projectHash,
-			DocoCDLabels.Deployment.Trigger:     payload.CommitSHA,
-			DocoCDLabels.Deployment.TargetRef:   ExtractOciArtifactTag(deployConfig.Reference),
-			DocoCDLabels.Deployment.CommitSHA:   latestCommit,
-			DocoCDLabels.Source.Type:            SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
-			DocoCDLabels.Source.Name:            payload.FullName,
-			DocoCDLabels.Source.URL:             payload.WebURL,
-			api.ProjectLabel:                    project.Name,
-			api.VolumeLabel:                     v.Name,
-			api.VersionLabel:                    composeVersion,
+			DocoCDLabels.Metadata.Manager:        app.Name,
+			DocoCDLabels.Metadata.Version:        appVersion,
+			DocoCDLabels.Deployment.Name:         deployConfig.Name,
+			DocoCDLabels.Deployment.Timestamp:    timestamp,
+			DocoCDLabels.Deployment.ComposeHash:  projectHash,
+			DocoCDLabels.Deployment.Trigger:      payload.CommitSHA,
+			DocoCDLabels.Deployment.ConfigTarget: deployConfig.Internal.ConfigTarget,
+			DocoCDLabels.Deployment.TargetRef:    ExtractOciArtifactTag(deployConfig.Reference),
+			DocoCDLabels.Deployment.CommitSHA:    latestCommit,
+			DocoCDLabels.Source.Type:             SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
+			DocoCDLabels.Source.Name:             payload.FullName,
+			DocoCDLabels.Source.URL:              payload.WebURL,
+			api.ProjectLabel:                     project.Name,
+			api.VolumeLabel:                      v.Name,
+			api.VersionLabel:                     composeVersion,
 		}
 		project.Volumes[i] = v
 	}
@@ -306,7 +318,7 @@ func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, 
 // deployCompose deploys a project as specified by the Docker Compose specification (LoadCompose).
 func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Project,
 	deployConfig *deploy.Config, recreateMode string, services []string,
-	needSignal []SignalService,
+	needSignal []SignalService, setPhase func(string),
 ) error {
 	var (
 		err          error
@@ -320,6 +332,8 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	}
 
 	if len(needSignal) > 0 {
+		setDeploymentPhase(setPhase, "signaling services")
+
 		if err := ComposeSignal(ctx, dockerCli, project, needSignal); err != nil {
 			return err
 		}
@@ -340,13 +354,16 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 			s.PullPolicy = types.PullPolicyAlways
 			project.Services[i] = s
 		}
+	}
 
-		err = service.Pull(ctx, project, api.PullOptions{
-			Quiet: true,
-		})
-		if err != nil {
-			return fmt.Errorf("failed to pull images: %w", err)
-		}
+	setDeploymentPhase(setPhase, "pulling images")
+
+	err = service.Pull(ctx, project, api.PullOptions{
+		Quiet:           true,
+		IgnoreBuildable: true,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to pull images: %w", err)
 	}
 
 	if recreateMode == "" {
@@ -366,6 +383,8 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 		Args:     buildArgs,
 		NoCache:  deployConfig.BuildOpts.NoCache,
 	}
+
+	setDeploymentPhase(setPhase, "building images")
 
 	err = service.Build(ctx, project, buildOpts)
 	if err != nil {
@@ -392,9 +411,13 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 
 	// Remove mismatched recreatable volumes (tmpfs, NFS, CIFS mounts) before create.
 	// Docker Compose then recreates them with the desired configuration during service.Create.
+	setDeploymentPhase(setPhase, "preparing deployment resources")
+
 	if err = removeMismatchedRecreatableVolumes(ctx, dockerCli.Client(), deployConfig.Name, project); err != nil {
 		return fmt.Errorf("failed to remove mismatched recreatable volumes: %w", err)
 	}
+
+	setDeploymentPhase(setPhase, "creating services")
 
 	err = service.Create(ctx, project, createOpts)
 	if err != nil {
@@ -402,18 +425,31 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	}
 
 	if len(startServices) > 0 {
+		setDeploymentPhase(setPhase, "starting services")
+
+		// Docker Compose's Start ignores StartOptions.Services and starts every
+		// service in the passed project (including containers in the "created" or
+		// "exited" state). Scheduled job services must not run at deploy time, so
+		// narrow the project to non-job services before starting.
+		startProject, err := projectForStart(project, jobServices)
+		if err != nil {
+			return err
+		}
+
 		startOpts := api.StartOptions{
-			Project:  project,
+			Project:  startProject,
 			Wait:     false,
 			Services: startServices,
 		}
 
-		err = service.Start(ctx, project.Name, startOpts)
+		err = service.Start(ctx, startProject.Name, startOpts)
 		if err != nil {
 			if !errors.Is(err, ErrNoContainerToStart) {
 				return err
 			}
 		}
+
+		setDeploymentPhase(setPhase, "waiting for services to start")
 
 		err = waitForStartedServices(ctx, dockerCli, project.Name, startServices, jobServices,
 			time.Duration(deployConfig.Timeout)*time.Second)
@@ -423,6 +459,8 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	}
 
 	if deployConfig.PruneImages {
+		setDeploymentPhase(setPhase, "pruning unused images")
+
 		afterImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
 		if err != nil {
 			// No such image error is okay since we wanted to remove the image anyway
@@ -451,11 +489,58 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 	return nil
 }
 
+type deploymentPhaseState struct {
+	mu    sync.RWMutex
+	phase string
+}
+
+func newDeploymentPhaseState(initialPhase string) *deploymentPhaseState {
+	return &deploymentPhaseState{
+		phase: normalizeDeploymentPhase(initialPhase),
+	}
+}
+
+func (s *deploymentPhaseState) Set(phase string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.phase = normalizeDeploymentPhase(phase)
+}
+
+func (s *deploymentPhaseState) Get() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.phase
+}
+
+func normalizeDeploymentPhase(phase string) string {
+	phase = strings.TrimSpace(phase)
+	if phase == "" {
+		return "unknown"
+	}
+
+	return phase
+}
+
+func setDeploymentPhase(setPhase func(string), phase string) {
+	if setPhase == nil {
+		return
+	}
+
+	setPhase(phase)
+}
+
+func logDeploymentHeartbeat(log *slog.Logger, phase string) {
+	log.Info("deployment in progress", slog.String("phase", normalizeDeploymentPhase(phase)))
+}
+
 // DeployStack deploys the stack using the provided deployment configuration.
 func DeployStack(
 	jobLog *slog.Logger, externalRepoPath string, ctx *context.Context,
 	dockerCli command.Cli, payload *webhook.ParsedPayload, deployConfig *deploy.Config,
 	detectedChanges []Change, needSignal []SignalService, latestCommit, appVersion string,
+	swarmMode bool,
 ) error {
 	startTime := time.Now()
 
@@ -469,6 +554,8 @@ func DeployStack(
 
 	stackLog.Debug("acquired scheduler/deploy lock")
 
+	deploymentPhase := newDeploymentPhaseState("resolving working directory")
+
 	// Path on the host
 	externalWorkingDir := path.Join(externalRepoPath, deployConfig.WorkingDirectory)
 
@@ -480,18 +567,22 @@ func DeployStack(
 		return fmt.Errorf("%s", errMsg)
 	}
 
+	deploymentPhase.Set("loading compose configuration")
+
 	project, err := LoadCompose(*ctx, externalRepoPath, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles,
 		deployConfig.EnvFiles, deployConfig.Profiles, deployConfig.Internal.Environment)
 	if err != nil {
 		return fmt.Errorf("failed to load compose config: %w", err)
 	}
 
-	if err = validateScheduledJobPolicies(project, swarm.GetModeEnabled()); err != nil {
+	if err = validateScheduledJobPolicies(project, swarmMode); err != nil {
 		return fmt.Errorf("invalid scheduled job restart policy: %w", err)
 	}
 
 	if deployConfig.WaitRunningJobs {
-		if err = waitForRunningJobs(*ctx, dockerCli, deployConfig, project, stackLog); err != nil {
+		deploymentPhase.Set("waiting for running scheduled jobs")
+
+		if err = waitForRunningJobs(*ctx, dockerCli, deployConfig, project, stackLog, swarmMode); err != nil {
 			return err
 		}
 	}
@@ -506,7 +597,7 @@ func DeployStack(
 		for {
 			select {
 			case <-ticker.C:
-				stackLog.Info("deployment in progress")
+				logDeploymentHeartbeat(stackLog, deploymentPhase.Get())
 			case <-done:
 				return
 			}
@@ -523,7 +614,9 @@ func DeployStack(
 	}
 
 	// When SwarmModeEnabled is true, we deploy the stack using Docker Swarm.
-	if swarm.GetModeEnabled() {
+	if swarmMode {
+		deploymentPhase.Set("deploying swarm stack")
+
 		stackLog.Info("deploying swarm stack")
 
 		cfg, opts, err := LoadSwarmStack(dockerCli, project, deployConfig, externalWorkingDir)
@@ -550,6 +643,8 @@ func DeployStack(
 			return fmt.Errorf("%s: %w", errMsg, err)
 		}
 
+		deploymentPhase.Set("pruning stack configs")
+
 		err = PruneStackConfigs(*ctx, dockerCli.Client(), deployConfig.Name)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
@@ -558,6 +653,8 @@ func DeployStack(
 
 			return fmt.Errorf("%s: %w", errMsg, err)
 		}
+
+		deploymentPhase.Set("pruning stack secrets")
 
 		err = PruneStackSecrets(*ctx, dockerCli.Client(), deployConfig.Name)
 		if err != nil {
@@ -569,6 +666,8 @@ func DeployStack(
 		}
 
 		if deployConfig.PruneImages {
+			deploymentPhase.Set("pruning images on swarm nodes")
+
 			stackLog.Info("prune images on swarm nodes")
 
 			err = RunImagePruneJob(*ctx, dockerCli)
@@ -609,13 +708,17 @@ func DeployStack(
 			slog.Any("need_signal", needSignal),
 		)
 
+		deploymentPhase.Set("deploying compose stack")
+
 		err = deployCompose(*ctx, dockerCli, project, deployConfig, recreateMode,
-			forcedServices.ToSlice(), needSignal)
+			forcedServices.ToSlice(), needSignal, deploymentPhase.Set)
 		if err != nil {
 			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
 			return fmt.Errorf("failed to deploy stack: %w", err)
 		}
 	}
+
+	deploymentPhase.Set("finalizing deployment status")
 
 	// cache the deployment status after successful deployment
 	repositoryKey := strings.TrimSpace(payload.CloneURL)
@@ -642,7 +745,14 @@ func DeployStack(
 
 // waitForRunningJobs checks if there are any running scheduled jobs that are configured to be waited for before deployment,
 // and waits until they are finished or the timeout is reached.
-func waitForRunningJobs(ctx context.Context, dockerCli command.Cli, deployConfig *deploy.Config, project *types.Project, log *slog.Logger) error {
+func waitForRunningJobs(
+	ctx context.Context,
+	dockerCli command.Cli,
+	deployConfig *deploy.Config,
+	project *types.Project,
+	log *slog.Logger,
+	swarmMode bool,
+) error {
 	jobServices, err := getScheduledJobServicesToWait(project, deployConfig.WaitRunningJobs)
 	if err != nil {
 		return err
@@ -665,7 +775,7 @@ func waitForRunningJobs(ctx context.Context, dockerCli command.Cli, deployConfig
 	lastWaitLogAt := time.Time{}
 
 	for {
-		running, err := getRunningScheduledJobServices(ctx, dockerCli, deployConfig.Name, jobServices)
+		running, err := getRunningScheduledJobServices(ctx, dockerCli, deployConfig.Name, jobServices, swarmMode)
 		if err != nil {
 			return fmt.Errorf("failed to inspect running scheduled jobs: %w", err)
 		}
@@ -732,10 +842,16 @@ func getScheduledJobServicesToWait(project *types.Project, defaultWait bool) (se
 	return ret, nil
 }
 
-func getRunningScheduledJobServices(ctx context.Context, dockerCli command.Cli, stackName string, configuredJobServices set.Set[string]) ([]string, error) {
+func getRunningScheduledJobServices(
+	ctx context.Context,
+	dockerCli command.Cli,
+	stackName string,
+	configuredJobServices set.Set[string],
+	swarmMode bool,
+) ([]string, error) {
 	runningSet := set.New[string]()
 
-	if swarm.GetModeEnabled() {
+	if swarmMode {
 		services, err := swarm.GetStackServices(ctx, dockerCli.Client(), stackName)
 		if err != nil {
 			return nil, err
@@ -792,14 +908,14 @@ func getRunningScheduledJobServices(ctx context.Context, dockerCli command.Cli, 
 // DestroyStack destroys the stack using the provided deployment configuration.
 func DestroyStack(
 	jobLog *slog.Logger, ctx *context.Context,
-	dockerCli *command.Cli, deployConfig *deploy.Config,
+	dockerCli *command.Cli, deployConfig *deploy.Config, swarmMode bool,
 ) error {
 	stackLog := jobLog.
 		With(slog.String("stack", deployConfig.Name))
 
 	stackLog.Info("destroying stack")
 
-	if swarm.GetModeEnabled() {
+	if swarmMode {
 		err := RemoveSwarmStack(*ctx, *dockerCli, deployConfig.Name)
 		if err != nil {
 			errMsg := "failed to destroy swarm stack"
@@ -1451,6 +1567,43 @@ func getNonJobServices(startServices []string, jobServices set.Set[string]) set.
 	}
 
 	return nonJobServices
+}
+
+// projectForStart returns a copy of the project containing only the services
+// that should be started at deploy time, i.e. all services except scheduled job
+// services. Docker Compose's Start starts every service present in the project
+// (ignoring StartOptions.Services), so job services must be removed from the
+// project to keep them from running on deployment.
+func projectForStart(project *types.Project, jobServices set.Set[string]) (*types.Project, error) {
+	nonJobServiceNames := make([]string, 0, len(project.Services))
+
+	for serviceName, svc := range project.Services {
+		if jobServices.Contains(serviceName) || (svc.Name != "" && jobServices.Contains(svc.Name)) {
+			continue
+		}
+
+		nonJobServiceNames = append(nonJobServiceNames, serviceName)
+	}
+
+	// WithSelectedServices treats an empty selection as "all services", which
+	// would re-include job services. Return an explicit empty-service project
+	// instead so nothing is started.
+	if len(nonJobServiceNames) == 0 {
+		emptyProject := *project
+		emptyProject.Services = types.Services{}
+
+		return &emptyProject, nil
+	}
+
+	// IgnoreDependencies keeps the selection to exactly the non-job services and
+	// strips any depends_on edges pointing at excluded (job) services, so a job
+	// service is never pulled back in as a dependency.
+	startProject, err := project.WithSelectedServices(nonJobServiceNames, types.IgnoreDependencies)
+	if err != nil {
+		return nil, fmt.Errorf("failed to select services to start: %w", err)
+	}
+
+	return startProject, nil
 }
 
 type serviceStartStatus struct {

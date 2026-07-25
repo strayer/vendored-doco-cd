@@ -6,6 +6,7 @@ import (
 	"path"
 	"strings"
 
+	"github.com/kimdre/doco-cd/internal/commitstatus"
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/git"
@@ -35,6 +36,8 @@ type Config struct {
 	WebhookSecret               string                 `env:"WEBHOOK_SECRET"`                                                         // WebhookSecret is the secret token used to authenticate the webhook
 	WebhookSecretFile           string                 `env:"WEBHOOK_SECRET_FILE,file"`                                               // WebhookSecretFile is the file containing the WebhookSecret
 	GitAccessToken              string                 `env:"GIT_ACCESS_TOKEN"`                                                       // GitAccessToken is the access token used to authenticate with the Git server (e.g. GitHub) for private repositories
+	GitCommitStatus             bool                   `env:"GIT_COMMIT_STATUS,notEmpty" envDefault:"false"`                          // GitCommitStatus controls whether doco-cd reports deployment outcomes as commit statuses to the source Git provider (requires GIT_ACCESS_TOKEN)
+	GitScmProvider              string                 `env:"GIT_SCM_PROVIDER,notEmpty" envDefault:"auto"`                            // GitScmProvider overrides automatic SCM provider detection for commit statuses. Valid values: auto, github, gitlab, gitea, azuredevops (forgejo is accepted as an alias for gitea). Useful for self-hosted instances whose hostname does not reveal the product (e.g. git.mycompany.com running GitLab).
 	GitAccessTokenFile          string                 `env:"GIT_ACCESS_TOKEN_FILE,file"`                                             // GitAccessTokenFile is the file containing the GitAccessToken
 	GitHubAppID                 string                 `env:"GITHUB_APP_ID"`                                                          // GitHubAppID is the GitHub App identifier used to mint installation access tokens
 	GitHubAppIDFile             string                 `env:"GITHUB_APP_ID_FILE,file"`                                                // GitHubAppIDFile is the file containing the GitHub App identifier
@@ -53,6 +56,7 @@ type Config struct {
 	AuthType                    string                 `env:"AUTH_TYPE,notEmpty" envDefault:"oauth2"`                                 // AuthType is the type of authentication to use when cloning repositories
 	SkipTLSVerification         bool                   `env:"SKIP_TLS_VERIFICATION,notEmpty" envDefault:"false"`                      // SkipTLSVerification skips the TLS verification when cloning repositories.
 	DockerQuietDeploy           bool                   `env:"DOCKER_QUIET_DEPLOY,notEmpty" envDefault:"true"`                         // DockerQuietDeploy suppresses the status output of dockerCli in deployments (e.g. pull, create, start)
+	SchedulerEnabled            bool                   `env:"SCHEDULER_ENABLED,notEmpty" envDefault:"true"`                           // SchedulerEnabled controls whether the built-in scheduled job runner is started in this doco-cd instance
 	DockerSwarmFeatures         bool                   `env:"DOCKER_SWARM_FEATURES,notEmpty" envDefault:"true"`                       // DockerSwarmFeatures enables the usage Docker Swarm features in the application if it has detected that it is running in a Docker Swarm environment
 	DataMountPath               string                 `env:"DATA_MOUNT_PATH" envDefault:"/data"`                                     // DataMountPath is the expected mount path inside the container for the writable deployment data volume.
 	DeployConfigBaseDir         string                 `env:"DEPLOY_CONFIG_BASE_DIR" envDefault:"/"`                                  // DeployConfigBaseDir is the base directory (relative to the repository root) where deployment configuration files will be searched for.
@@ -115,6 +119,10 @@ func GetConfig() (*Config, error) {
 	err = cfg.parseOciTrustPolicy()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse OCI_TRUST_POLICY: %w", err)
+	}
+
+	if _, err = commitstatus.ParseProvider(cfg.GitScmProvider); err != nil {
+		return nil, fmt.Errorf("invalid GIT_SCM_PROVIDER: %w", err)
 	}
 
 	for _, pollConfig := range cfg.PollConfig {

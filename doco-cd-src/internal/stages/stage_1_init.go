@@ -75,8 +75,13 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 
 		override := oci.SelectTrustPolicyOverride(s.DeployConfig.Oci, s.DeployConfig.Internal.OciTrustPolicyOverrideTrusted)
 
-		if err := oci.VerifyWithCosign(ctx, s.Repository.SourceUrl, s.Repository.Revision, s.AppConfig.OciTrustPolicy, override, s.AppConfig.OciVerifyMaxWorkers); err != nil {
-			return fmt.Errorf("failed OCI signature verification: %w", err)
+		// OCI artifacts are verified before config parsing and reconciliation cleanup.
+		// Re-verify here only when this deployment config provides a trusted override
+		// or when the repository has not been pre-verified.
+		if !s.Repository.OCITrusted || s.DeployConfig.Internal.OciTrustPolicyOverrideTrusted {
+			if err := oci.VerifyWithCosign(ctx, s.Repository.SourceUrl, s.Repository.Revision, s.AppConfig.OciTrustPolicy, override, s.AppConfig.OciVerifyMaxWorkers); err != nil {
+				return fmt.Errorf("failed OCI signature verification: %w", err)
+			}
 		}
 
 		err = deploy.LoadLocalDotEnv(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
@@ -176,7 +181,7 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		// Check if containers do not belong to this repository or if doco-cd does not manage the stack
 		correctRepo := true
 
-		serviceLabels, err := docker.GetServiceLabels(ctx, s.Docker.Cmd.Client(), s.DeployConfig.Name)
+		serviceLabels, err := docker.GetServiceLabels(ctx, s.Docker.Cmd.Client(), s.Docker.SwarmMode, s.DeployConfig.Name)
 		if err != nil {
 			return fmt.Errorf("failed to retrieve service labels: %w", err)
 		}
