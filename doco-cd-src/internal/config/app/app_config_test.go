@@ -25,7 +25,7 @@ func TestGetConfig(t *testing.T) {
 				"LOG_LEVEL":             "info",
 				"HTTP_PORT":             "8080",
 				"WEBHOOK_SECRET":        "secret",
-				"AUTH_TYPE":             "oauth2",
+				"GIT_ACCESS_TOKEN_USER": "oauth2",
 				"GIT_ACCESS_TOKEN":      "token",
 				"SKIP_TLS_VERIFICATION": "false",
 			},
@@ -47,7 +47,7 @@ func TestGetConfig(t *testing.T) {
 			envVars: map[string]string{
 				"LOG_LEVEL":             "info",
 				"HTTP_PORT":             "8080",
-				"AUTH_TYPE":             "oauth2",
+				"GIT_ACCESS_TOKEN_USER": "oauth2",
 				"SKIP_TLS_VERIFICATION": "false",
 			},
 			dockerSecrets: map[string]string{
@@ -61,7 +61,7 @@ func TestGetConfig(t *testing.T) {
 			envVars: map[string]string{
 				"LOG_LEVEL":             "info",
 				"HTTP_PORT":             "8080",
-				"AUTH_TYPE":             "oauth2",
+				"GIT_ACCESS_TOKEN_USER": "oauth2",
 				"SKIP_TLS_VERIFICATION": "false",
 				"WEBHOOK_SECRET":        "webh00k_secret",
 			},
@@ -374,5 +374,32 @@ func TestGetConfig_DataMountPathRejectsRelativePath(t *testing.T) {
 
 	if _, err := GetConfig(); err == nil {
 		t.Fatal("expected relative DATA_MOUNT_PATH to be rejected")
+	}
+}
+
+func TestGetConfig_GitScmApiUrlValidation(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("GIT_SCM_API_URL", "https://git.example.com")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if string(cfg.GitScmApiUrl) != "https://git.example.com" {
+		t.Fatalf("expected GIT_SCM_API_URL to be set, got %q", cfg.GitScmApiUrl)
+	}
+}
+
+func TestGetConfig_GitScmApiUrlRejectsNonHTTP(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("GIT_SCM_API_URL", "ssh://git.example.com:2222")
+
+	if _, err := GetConfig(); err == nil {
+		t.Fatal("expected non-http GIT_SCM_API_URL to be rejected")
 	}
 }

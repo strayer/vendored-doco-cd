@@ -128,7 +128,7 @@ func postEarlyCommitStatus(ctx context.Context, jobLog *slog.Logger, appConfig *
 		slog.String("description", description),
 	)
 
-	err := commitstatus.Post(ctx, provider, repoURL, repoFullName, commitSHA, token, commitstatus.Status{
+	err := commitstatus.Post(ctx, provider, string(appConfig.GitScmApiUrl), repoURL, repoFullName, commitSHA, token, commitstatus.Status{
 		State:       commitstatus.StateError,
 		Description: description,
 		Context:     contextName,
@@ -165,6 +165,7 @@ func handle(ctx context.Context, jobLog *slog.Logger,
 			appConfig.SSHPrivateKey,
 			appConfig.SSHPrivateKeyPassphrase,
 			appConfig.GitAccessToken,
+			appConfig.GitAccessTokenUser,
 			git.GitHubAppConfig{
 				ID:             appConfig.GitHubAppID,
 				PrivateKey:     appConfig.GitHubAppPrivateKey,
