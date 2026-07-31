@@ -10,9 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/creasty/defaults"
-	"gopkg.in/validator.v2"
-
+	"github.com/kimdre/doco-cd/internal/common/defaults"
+	"github.com/kimdre/doco-cd/internal/common/validation"
 	"github.com/kimdre/doco-cd/internal/config"
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 
@@ -126,7 +125,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	err := validator.Validate(c)
+	err := validation.Validate(c)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
 	}

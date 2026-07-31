@@ -19,12 +19,12 @@ import (
 	"github.com/docker/compose/v5/pkg/compose"
 	"github.com/moby/moby/api/types/container"
 
+	"github.com/kimdre/doco-cd/internal/common/id"
+
 	"github.com/kimdre/doco-cd/internal/config/app"
 
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
-	"github.com/kimdre/doco-cd/internal/utils/id"
-
 	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
@@ -335,6 +335,11 @@ func TestHandleEvent(t *testing.T) {
 					dockerCli,
 					&secretProvider,
 					stackName,
+					newDeploymentRunTracker(map[deploymentRunTrigger]int{
+						deploymentRunTriggerWebhook:      10,
+						deploymentRunTriggerPoll:         10,
+						deploymentRunTriggerScheduledJob: 10,
+					}),
 				)
 
 				expectedReturnMessage := fmt.Sprintf(tc.expectedResponseBody, jobID, filepath.Join(tmpDir, git.GetRepoName(tc.payload.CloneURL)), stackName) + "\n"

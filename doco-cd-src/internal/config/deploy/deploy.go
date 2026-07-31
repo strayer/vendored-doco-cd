@@ -14,14 +14,14 @@ import (
 	"strings"
 
 	"github.com/compose-spec/compose-go/v2/cli"
-	"github.com/creasty/defaults"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"go.yaml.in/yaml/v3"
-	"gopkg.in/validator.v2"
+	"go.yaml.in/yaml/v4"
+
+	"github.com/kimdre/doco-cd/internal/common/defaults"
+	"github.com/kimdre/doco-cd/internal/common/validation"
 
 	"github.com/kimdre/doco-cd/internal/config"
-
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
@@ -430,7 +430,7 @@ func GetConfigs(repoRoot, configBaseDir, customTarget, reference string, gitOpts
 			return expandedConfigs, nil
 		}
 
-		if err = validator.Validate(expandedConfigs); err != nil {
+		if err = validation.Validate(expandedConfigs); err != nil {
 			return nil, err
 		}
 

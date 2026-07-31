@@ -10,14 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/creasty/defaults"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"gopkg.in/validator.v2"
 
+	"github.com/kimdre/doco-cd/internal/common/defaults"
+	"github.com/kimdre/doco-cd/internal/common/validation"
 	"github.com/kimdre/doco-cd/internal/config"
-
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
@@ -254,7 +253,7 @@ func TestGetConfigs_RepositoryURL(t *testing.T) {
 				RepositoryUrl: tc.repoUrl,
 			}
 
-			err := validator.Validate(dc)
+			err := validation.Validate(dc)
 			if err == nil && tc.expectedErr != nil {
 				t.Fatalf("expected error %v, got nil", tc.expectedErr)
 			}
