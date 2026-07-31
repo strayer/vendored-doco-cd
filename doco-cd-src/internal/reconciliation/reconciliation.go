@@ -15,6 +15,8 @@ import (
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/id"
+
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 
@@ -23,7 +25,6 @@ import (
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/logger"
-	"github.com/kimdre/doco-cd/internal/utils/id"
 )
 
 const reconciliationTraceIDAttr = "doco_cd_reconciliation_trace_id"
@@ -386,6 +387,16 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		jobLog.Debug("suppressing reconciliation event while stack deployment is in progress",
 			slog.String("event", action),
 			slog.String("stack", stackName),
+		)
+
+		return
+	}
+
+	if reconciliationHandler.isServiceSchedulerStopHeld(event.Actor.Attributes) {
+		jobLog.Debug("suppressing reconciliation event for service intentionally held stopped by job scheduler",
+			slog.String("event", action),
+			slog.String("stack", stackName),
+			slog.String("container_name", event.Actor.Attributes["name"]),
 		)
 
 		return

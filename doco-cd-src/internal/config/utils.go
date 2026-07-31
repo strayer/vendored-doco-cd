@@ -6,8 +6,8 @@ import (
 	"strings"
 
 	"github.com/caarlos0/env/v11"
-	"gopkg.in/validator.v2"
 
+	"github.com/kimdre/doco-cd/internal/common/validation"
 	"github.com/kimdre/doco-cd/internal/encryption"
 )
 
@@ -70,7 +70,7 @@ func ParseConfigFromEnv(config any, mappings *[]EnvVarFileMapping) error {
 		return err
 	}
 
-	if err := validator.Validate(config); err != nil {
+	if err := validation.Validate(config); err != nil {
 		return err
 	}
 

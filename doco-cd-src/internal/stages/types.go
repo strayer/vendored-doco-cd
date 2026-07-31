@@ -134,6 +134,7 @@ type Docker struct {
 type DeploymentState struct {
 	changedServices []docker.Change
 	ignoredInfo     docker.IgnoredInfo
+	DeployedCommit  string // previously-deployed commit SHA, carried to post-deploy for the changelog
 }
 
 // StageManager is the main structure that holds the logger and stage data.
@@ -255,6 +256,7 @@ func (s *StageManager) NotifyFailure(notifyErr error) {
 		metadata.Repository = s.Repository.Name
 		metadata.Stack = s.DeployConfig.Name
 		metadata.Context = s.DeployConfig.Context
+		metadata.Target = s.DeployConfig.Internal.ConfigTarget
 		metadata.Revision = revision
 		metadata.JobID = s.JobID
 
