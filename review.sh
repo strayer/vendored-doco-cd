@@ -96,18 +96,16 @@ printf '%s' "$PROMPT" >"$PROMPT_FILE"
 info "Starting Claude Code review..."
 (
   cd "$WORKTREE"
-  nono run --silent --profile claude-code --allow-cwd --read "$SCRIPT_DIR/.git" -- \
-    claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --dangerously-skip-permissions
+  claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --permission-mode default
 ) <"$PROMPT_FILE" >"$CLAUDE_OUT" 2>"$CLAUDE_ERR" &
 CLAUDE_PID=$!
 
 info "Starting Codex review..."
 (
   cd "$WORKTREE"
-  nono run --silent --profile codex-cli --allow-cwd --read "$SCRIPT_DIR/.git" -- \
-    codex exec -m "$CODEX_MODEL" \
+  codex exec -m "$CODEX_MODEL" \
     -c "model_reasoning_effort=$CODEX_EFFORT" \
-    --dangerously-bypass-approvals-and-sandbox \
+    --sandbox read-only --ephemeral \
     -C "$WORKTREE" -
 ) <"$PROMPT_FILE" >"$CODEX_OUT" 2>"$CODEX_ERR" &
 CODEX_PID=$!
@@ -261,8 +259,7 @@ printf '%s' "$COMBINE_PROMPT" >"$COMBINE_PROMPT_FILE"
 COMBINE_EXIT=0
 (
   cd "$WORKTREE"
-  nono run --silent --profile claude-code --allow-cwd -- \
-    claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --dangerously-skip-permissions
+  claude -p --model "$CLAUDE_MODEL" --effort "$CLAUDE_EFFORT" --permission-mode acceptEdits
 ) <"$COMBINE_PROMPT_FILE" >"$FINAL_OUT" 2>"$COMBINE_ERR" \
   || COMBINE_EXIT=$?
 
