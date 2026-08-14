@@ -55,7 +55,7 @@ This includes, but is not limited to:
 - **Azure Container Registry** (`*.azurecr.io`)
 - **Private/Self-hosted registries** (supporting OCI Image Spec v1.0+)
 
-!!! note "See [Private Container Registries](../Private-Container-Registries.md) for authentication to private registries."
+!!! note "See [Container Registry Authentication](../Container-Registry-Authentication.md) for authentication to private registries."
 
 ---
 
@@ -72,27 +72,27 @@ The rest of the artifact can contain any files needed for deployment, as with de
 !!! example "Artifact Layout Examples"
 
     === "Single Deployment"
-        ```
+        ```tree
         artifact-root/
-        ├── .doco-cd.yaml        # Main deployment config
-        ├── docker-compose.yml    # Docker Compose configuration
-        └── (other files as needed)
+          .doco-cd.yaml         # Main deployment config
+          docker-compose.yml    # Docker Compose configuration
+          (other files as needed)
         ```
     
     === "Multiple Deployments"
-        ```
+        ```tree
         artifact-root/
-        ├── .doco-cd.yaml        # Main deployment config
-        ├── web/
-        │   ├── .doco-cd.yaml    # Extra deployment config for web service
-        │   └── docker-compose.yml
-        │   └── config/
-        │       └── nginx.conf
-        └── app/
-            └── docker-compose.yml
-            └── app.env
-            └── migrations/
-                └── 001-init.sql
+          .doco-cd.yaml        # Main deployment config
+          web/
+            .doco-cd.yaml    # Extra deployment config for web service
+            docker-compose.yml
+            config/
+              nginx.conf
+          app/
+            docker-compose.yml
+            app.env
+            migrations/
+              001-init.sql
         ```
 
 ### Required Files

@@ -1,13 +1,15 @@
 package notification
 
 import (
-	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
-	"github.com/kimdre/doco-cd/internal/test"
-	"github.com/kimdre/doco-cd/internal/utils/id"
+	"github.com/kimdre/doco-cd/internal/common/id"
 )
 
 func TestSend(t *testing.T) {
@@ -20,7 +22,7 @@ func TestSend(t *testing.T) {
 	}{
 		{
 			name:       "Valid Service URL",
-			appriseURL: "apprise://%s",
+			appriseURL: "apprise://example.test",
 			// nil means success is expected
 			expectedErr: nil,
 		},
@@ -31,7 +33,6 @@ func TestSend(t *testing.T) {
 		},
 	}
 
-	ctx := context.Background()
 	metadata := Metadata{
 		Repository: "test",
 		Stack:      "test-stack",
@@ -39,26 +40,29 @@ func TestSend(t *testing.T) {
 		JobID:      id.GenID(),
 	}
 
-	appriseComposeYAML := `services:
-  apprise:
-    image: caronc/apprise:latest
-    ports:
-      - "8000"
-    environment:
-      APPRISE_WORKER_COUNT: "1"
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8000/status >/dev/null || exit 1"]
-      interval: 2s
-      timeout: 5s
-      retries: 10
-`
-	stack := test.ComposeUp(ctx, t, test.WithYAML(appriseComposeYAML))
-	endpoint := stack.Endpoint(ctx, t, "apprise", "8000")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Fatalf("expected POST request, got %s", r.Method)
+		}
+
+		var payload appriseRequest
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Fatalf("failed to decode apprise request: %v", err)
+		}
+
+		if !strings.HasPrefix(payload.NotifyUrls, "apprise://") {
+			w.WriteHeader(http.StatusFailedDependency)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Cannot run tests in parallel because SetAppriseConfig modifies global variables
-			if err := SetAppriseConfig("http://"+endpoint+"/notify", fmt.Sprintf(tc.appriseURL, endpoint), "info", ""); err != nil {
+			if err := SetAppriseConfig(server.URL, tc.appriseURL, "info", ""); err != nil {
 				t.Fatalf("failed to set apprise config: %v", err)
 			}
 
@@ -75,6 +79,60 @@ func TestSend(t *testing.T) {
 				t.Fatalf("expected error wrapping %q, got: %v", tc.expectedErr, err)
 			}
 		})
+	}
+}
+
+func TestSendIncludesAppriseErrorDetails(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"invalid notification type","notify_url":"discord://user:pass@discord.example/abcd"}`))
+	}))
+	defer server.Close()
+
+	err := send(server.URL, "apprise://example.test", "Test Notification", "This is a test message", "info")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	got := err.Error()
+	if !strings.Contains(got, "apprise request failed with status: 400 Bad Request") {
+		t.Fatalf("expected status in error, got %q", got)
+	}
+
+	if !strings.Contains(got, "error: invalid notification type") {
+		t.Fatalf("expected parsed error in error text, got %q", got)
+	}
+
+	if !strings.Contains(got, `"notify_url":"[REDACTED]"`) {
+		t.Fatalf("expected response body to redact sensitive fields, got %q", got)
+	}
+
+	if strings.Contains(got, "discord://user:pass@discord.example/abcd") {
+		t.Fatalf("expected sensitive url to be redacted, got %q", got)
+	}
+}
+
+func TestSendIncludesTruncatedRawAppriseResponse(t *testing.T) {
+	t.Parallel()
+
+	body := strings.Repeat("x", maxAppriseErrorResponseBodyBytes+100)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	err := send(server.URL, "apprise://example.test", "Test Notification", "This is a test message", "info")
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	got := err.Error()
+	if !strings.Contains(got, "(truncated)") {
+		t.Fatalf("expected truncated marker in error text, got %q", got)
 	}
 }
 
@@ -150,6 +208,27 @@ func TestDefaultBody(t *testing.T) {
 
 		message := defaultBody("Current Version: v0.80.0\nLatest Version: v0.80.1", Metadata{})
 		expected := "Current Version: v0.80.0\nLatest Version: v0.80.1"
+
+		if message != expected {
+			t.Errorf("expected %q, got %q", expected, message)
+		}
+	})
+
+	t.Run("duration is a metadata line when set, omitted when zero", func(t *testing.T) {
+		t.Parallel()
+
+		message := defaultBody("Deployment completed", Metadata{
+			Repository: "acme/api",
+			Duration:   12483 * time.Millisecond,
+		})
+		expected := "Deployment completed\n\nduration: 12.483s\nrepository: acme/api"
+
+		if message != expected {
+			t.Errorf("expected %q, got %q", expected, message)
+		}
+
+		message = defaultBody("Deployment completed", Metadata{Repository: "acme/api"})
+		expected = "Deployment completed\n\nrepository: acme/api"
 
 		if message != expected {
 			t.Errorf("expected %q, got %q", expected, message)
@@ -255,7 +334,7 @@ func TestValidateTemplate(t *testing.T) {
 	t.Run("valid template parses", func(t *testing.T) {
 		t.Parallel()
 
-		if _, err := validateTemplate("{{.Emoji}} {{.Title}} on {{.Stack}}"); err != nil {
+		if _, err := validateTemplate("{{.Emoji}} {{.Title}} on {{.Target}}/{{.Stack}}"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -283,17 +362,18 @@ func TestRenderTemplate(t *testing.T) {
 	t.Run("renders metadata fields and trims trailing newlines", func(t *testing.T) {
 		t.Parallel()
 
-		tmpl, err := validateTemplate("{{.Emoji}} {{.Title}} — {{.Stack}} @ {{.Revision}}\n")
+		tmpl, err := validateTemplate("{{.Emoji}} {{.Title}} — {{.Target}}/{{.Stack}} @ {{.Revision}}\n")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
 		got := renderTemplate(tmpl, Success, "Deployment completed", "ignored body", Metadata{
+			Target:   "prod-vm",
 			Stack:    "app",
 			Revision: "main (abc123)",
 			JobID:    "job-1",
 		})
-		expected := "✅ Deployment completed — app @ main (abc123)"
+		expected := "✅ Deployment completed — prod-vm/app @ main (abc123)"
 
 		if got != expected {
 			t.Errorf("expected %q, got %q", expected, got)
@@ -322,6 +402,26 @@ func TestRenderTemplate(t *testing.T) {
 			JobID:      "job-99",
 		})
 		expected := "Deploy done\n\njob_id: job-99\nrepository: acme/repo"
+
+		if got != expected {
+			t.Errorf("expected %q, got %q", expected, got)
+		}
+	})
+
+	t.Run("renders duration and changed services", func(t *testing.T) {
+		t.Parallel()
+
+		tmpl, err := validateTemplate("{{.Stack}} in {{.Duration}}{{range .ChangedServices}} {{.}}{{end}}")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		got := renderTemplate(tmpl, Success, "Deployment completed", "", Metadata{
+			Stack:           "app",
+			Duration:        1500 * time.Millisecond,
+			ChangedServices: []string{"web", "worker"},
+		})
+		expected := "app in 1.5s web worker"
 
 		if got != expected {
 			t.Errorf("expected %q, got %q", expected, got)

@@ -56,6 +56,7 @@ The docker compose deployment can be configured inside the [deployment configura
 | `webhook_filter`    | string            | A regular expression to whitelist deployment triggers based on the webhook event payload. See the [Webhook Filter](#webhook-filter) Section below.                                                                                                                                                                                                                                                                                                                                   | ` ` (Ignored when not specified)                                                                                       |
 | `remove_orphans`    | boolean           | Remove/Prune containers/services that are not (or no longer) defined in the Compose file.                                                                                                                                                                                                                                                                                                                                                                                            | `true`                                                                                                                 |
 | `prune_images`      | boolean           | Prune images that are no longer in use after a deployment. If the image is still used by any other container, it won't get deleted.                                                                                                                                                                                                                                                                                                                                                  | `true`                                                                                                                 |
+| `swarm`             | object            | Docker Swarm-specific settings. See [Swarm settings](#swarm-settings). | see [Swarm settings](#swarm-settings) |
 | `force_recreate`    | boolean           | Forces the recreation/redeployment of containers even if the configuration has not changed.                                                                                                                                                                                                                                                                                                                                                                                          | `false`                                                                                                                |
 | `wait_running_jobs` | boolean           | Wait for currently running [scheduled jobs](Advanced/Job-Scheduling.md) to finish before deployment starts.                                                                                                                                                                                                                                                                                                                                                                          | `true`                                                                                                                 |
 | `force_image_pull`  | boolean           | Always pulls the latest version of the image tags you've specified if a newer version is available.                                                                                                                                                                                                                                                                                                                                                                                  | `false`                                                                                                                |
@@ -148,8 +149,8 @@ If `auto_discovery` is enabled, doco-cd will try to find projects/stacks to depl
 Doco-cd will internally generate new deploy configs based on the directory name and inherits all other settings from the 
 base deploy config inside the `.doco-cd.yml` file or the inline deployment config inside the poll config.
 
-When an app is no longer available in the `working_dir` (e.g. deleted or moved to another directory outside the working dir), 
-doco-cd will automatically remove the deployed project/stack from the docker host.
+When `auto_discovery.delete` is set to `true` and an app is no longer available in the `working_dir` (e.g. deleted or
+moved to another directory outside the working dir), doco-cd will remove the deployed project/stack from the docker host.
 
 #### Auto-Discovery settings
 
@@ -160,7 +161,7 @@ Use `auto_discovery: true` to enable it with defaults, or use the object form be
 |------------------|---------|------------------------------------------------------------------------------------------------------|---------------|
 | `enabled`        | boolean | Enables auto-discovery of services to deploy in the working directory                                | `false`       |
 | `depth`          | number  | Maximum depth of subdirectories to scan for docker-compose files, set to `0` for no limit            | `0`           |
-| `delete`         | boolean | Auto-remove obsolete auto-discovered deployments that are no longer present in the working directory | `true`        |
+| `delete`         | boolean | Auto-remove obsolete auto-discovered deployments that are no longer present in the working directory | `false`       |
 | `remove_volumes` | boolean | Remove volumes of auto-discovered deployments when they are deleted                                  | `false`       |
 | `remove_images`  | boolean | Remove images of auto-discovered deployments when they are deleted                                   | `true`        |
 
@@ -168,18 +169,18 @@ Use `auto_discovery: true` to enable it with defaults, or use the object form be
     <div class="grid cards" markdown>
 
     - With a file structure like this
-      ``` title="File structure"
+      ```tree title="File structure"
       .doco-cd.yml
       apps/
-      ├── wordpress/
-      │   ├── docker-compose.yml
-      │   └── .env
-      ├── nginx/
-      │   ├── docker-compose.yaml
-      │   └── configs/
-      │       └── nginx.conf
-      └── misc/
-          └── image.png
+        wordpress/
+          docker-compose.yml
+          .env
+        nginx/
+          docker-compose.yaml
+          configs/
+            nginx.conf
+        misc/
+          image.png
       ```
     
     - And a `.doco-cd.yml` with the following content:
@@ -254,18 +255,18 @@ The following fields are always inherited from the base/root deployment config:
 
 !!! example
 
-    ``` title="File structure"
+    ```tree title="File structure"
     .doco-cd.yml
     apps/
-    ├── wordpress/
-    │   ├── .doco-cd.yml
-    │   ├── docker-compose.yml
-    │   └── .env
-    ├── nginx/
-    │   ├── .doco-cd.yml
-    │   └── docker-compose.yaml
-    └── misc/
-        └── image.png
+      wordpress/
+        .doco-cd.yml
+        docker-compose.yml
+        .env
+      nginx/
+        .doco-cd.yml
+        docker-compose.yaml
+      misc/
+        image.png
     ```
 
     ```yaml title=".doco-cd.yml (root)"
@@ -563,6 +564,35 @@ Precedence:
 
 - Service label `cd.doco.job.wait_running_jobs` (if set)
 - Deployment default `wait_running_jobs`
+
+### Swarm settings
+
+The following settings can be configured in the nested `swarm` object:
+
+| Key                | Type   | Description                                                                                                                                                                                         | Default value     |
+|--------------------|--------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
+| `config_retention` | number | Number of old Swarm config revisions to keep per resource (excluding the active revision). `-1` disables automatic pruning. If unset, global [`DOCKER_SWARM_CONFIG_RETENTION`](Docker-Settings.md#swarm-environment-variables) is used. | unset (use global) |
+| `secret_retention` | number | Number of old Swarm secret revisions to keep per resource (excluding the active revision). `-1` disables automatic pruning. If unset, global [`DOCKER_SWARM_SECRET_RETENTION`](Docker-Settings.md#swarm-environment-variables) is used. | unset (use global) |
+
+#### Keep old Swarm configs/secrets
+
+In Swarm mode, doco-cd creates content-hashed config/secret names and rotates them when content changes.
+
+Use `swarm.config_retention` and `swarm.secret_retention` to keep old revisions:
+
+- `0` keeps no old revisions (only active ones remain)
+- `1` keeps one old revision per resource type
+- `-1` disables automatic pruning for that resource type
+- if unset, the corresponding global Docker setting is used:
+    - [`DOCKER_SWARM_CONFIG_RETENTION`](Docker-Settings.md#swarm-environment-variables)
+    - [`DOCKER_SWARM_SECRET_RETENTION`](Docker-Settings.md#swarm-environment-variables)
+
+```yaml title=".doco-cd.yml"
+name: some-project
+swarm:
+  config_retention: 2
+  secret_retention: 1
+```
 
 ## Multiple service deployments
 

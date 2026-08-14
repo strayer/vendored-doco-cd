@@ -8,6 +8,7 @@ import (
 	"maps"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,6 +44,7 @@ func autoDiscoveryConfigLabelDriftServices(deployedStatus map[docker.Service]doc
 	}
 
 	affected := make([]string, 0, len(deployedStatus))
+	expectedCfg := docker.ParseAutoDiscoveryConfig(expected)
 
 	var firstObserved string
 
@@ -50,12 +52,25 @@ func autoDiscoveryConfigLabelDriftServices(deployedStatus map[docker.Service]doc
 		actual, ok := status.Labels[docker.DocoCDLabels.Deployment.AutoDiscoveryConfig]
 
 		actual = strings.TrimSpace(actual)
-		if !ok || actual != expected {
-			affected = append(affected, string(serviceName))
+		if ok && actual == expected {
+			continue
+		}
 
-			if firstObserved == "" {
-				firstObserved = actual
-			}
+		// This label only steers the cleanup of obsolete auto-discovered stacks, and that
+		// cleanup reads containers labeled as auto-discovered. With auto-discovery off in
+		// both configs, including the legacy enabled label when the config label is absent,
+		// the config label is inert, so a changed default is no reason to recreate the stack.
+		deployedCfg := docker.ParseAutoDiscoveryConfig(actual)
+		legacyAutoDiscoveryEnabled, _ := strconv.ParseBool(status.Labels[docker.DocoCDLabels.Deployment.AutoDiscovery])
+
+		if !expectedCfg.Enabled && !deployedCfg.Enabled && (ok || !legacyAutoDiscoveryEnabled) {
+			continue
+		}
+
+		affected = append(affected, string(serviceName))
+
+		if firstObserved == "" {
+			firstObserved = actual
 		}
 	}
 
@@ -81,6 +96,13 @@ func shouldSkipOCIDeployment(forceRecreate bool, deployedDigest, resolvedDigest 
 	}
 
 	return deployedDigest == resolvedDigest
+}
+
+// shouldRecoverFromMissingDeployedCommit checks if the error indicates that the deployed commit is no longer reachable
+// in the Git history. This can happen if the commit has been removed or rewritten (e.g., due to a force push).
+// In such cases, we may want to recover by treating it as a full-change deployment.
+func shouldRecoverFromMissingDeployedCommit(err error) bool {
+	return git.IsRefUnreachableError(err)
 }
 
 func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Logger) error {
@@ -179,6 +201,8 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 	}
 
 	if deployedCommit := deployedState.GetDeploymentCommitSHA(); deployedCommit != "" {
+		s.DeployState.DeployedCommit = deployedCommit
+
 		latestCommit, err := git.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
 		if err != nil {
 			return fmt.Errorf("failed to get latest commit: %w", err)
@@ -209,7 +233,7 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		}
 
 		s.Docker.Project, err = docker.LoadCompose(
-			ctx, s.Repository.PathExternal, extAbsWorkingDir, s.DeployConfig.Name,
+			ctx, s.Docker.Cmd, s.Repository.PathExternal, extAbsWorkingDir, s.DeployConfig.Name,
 			s.DeployConfig.ComposeFiles, s.DeployConfig.EnvFiles,
 			s.DeployConfig.Profiles, s.DeployConfig.Internal.Environment)
 		if err != nil {
@@ -246,9 +270,27 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		}
 
 		// Check for file changes
-		gitChangedFiles, err := git.GetChangedFilesBetweenCommits(s.Repository.Git, plumbing.NewHash(deployedCommit), plumbing.NewHash(latestCommit))
-		if err != nil {
-			return fmt.Errorf("failed to get changed files between commits: %w", err)
+		deployedHash := plumbing.NewHash(deployedCommit)
+		latestHash := plumbing.NewHash(latestCommit)
+		gitChangedFiles := make([]git.ChangedFile, 0)
+
+		if _, err := s.Repository.Git.CommitObject(deployedHash); err != nil {
+			if shouldRecoverFromMissingDeployedCommit(err) {
+				stageLog.Warn("previous deployed commit is no longer reachable; continuing with full-change deployment comparison",
+					slog.String("deployed_commit", deployedCommit),
+					slog.String("latest_commit", latestCommit),
+					slog.String("reason", err.Error()),
+				)
+
+				composeChanged = true
+			} else {
+				return fmt.Errorf("failed to resolve deployed commit %s: %w", deployedCommit, err)
+			}
+		} else {
+			gitChangedFiles, err = git.GetChangedFilesBetweenCommits(s.Repository.Git, deployedHash, latestHash)
+			if err != nil {
+				return fmt.Errorf("failed to get changed files between commits: %w", err)
+			}
 		}
 
 		changedFiles := docker.GetPathsFromGitChangedFiles(gitChangedFiles, s.Repository.PathExternal)

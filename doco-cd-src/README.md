@@ -2,17 +2,16 @@
 
 ## GitOps for Docker Compose
 
-<img src="https://raw.githubusercontent.com/kimdre/doco-cd/main/wiki/docs/images/doco-cd_logo.svg" alt="Doco CD Logo" height="48px" />
+<img src="https://raw.githubusercontent.com/kimdre/doco-cd/main/wiki/docs/images/doco-cd_logo.svg" alt="Doco-CD Logo" height="48px" />
 
 [![GitHub Release](https://img.shields.io/github/v/release/kimdre/doco-cd?display_name=tag&label=Release&color=47c72a&labelColor=404951)](https://github.com/kimdre/doco-cd/releases)
-[![Go Report Card](https://goreportcard.com/badge/github.com/kimdre/doco-cd)](https://goreportcard.com/report/github.com/kimdre/doco-cd)
 [![CodeQL](https://github.com/kimdre/doco-cd/actions/workflows/github-code-scanning/codeql/badge.svg)](https://github.com/kimdre/doco-cd/actions/workflows/github-code-scanning/codeql)
 [![Tests](https://github.com/kimdre/doco-cd/actions/workflows/test.yaml/badge.svg)](https://github.com/kimdre/doco-cd/actions/workflows/test.yaml)
 [![Build Image](https://github.com/kimdre/doco-cd/actions/workflows/build.yaml/badge.svg)](https://github.com/kimdre/doco-cd/actions/workflows/build.yaml)
 [![Image Vulnerability Scan](https://github.com/kimdre/doco-cd/actions/workflows/image-vulnerability-scanning.yml/badge.svg?event=schedule)](https://github.com/kimdre/doco-cd/actions/workflows/image-vulnerability-scanning.yml)
 
 
-Doco CD is a lightweight, declarative GitOps continuous delivery tool that automatically deploys and updates Docker Compose projects/services and Swarm stacks using polling and webhooks.
+Doco-CD is a lightweight, declarative GitOps continuous delivery tool that automatically deploys and updates Docker Compose projects/services and Swarm stacks using polling and webhooks.
 
 You can think of it as a simple Portainer or ArgoCD alternative for Docker.
 
@@ -44,6 +43,22 @@ You can find the documentation at [doco.cd](https://doco.cd/latest/).
 ## Contributing
 
 Contributions are welcome! Please see the [contributing guidelines](https://doco.cd/latest/Contributing/) for more information.
+
+## Support the Project
+
+If you would like to support the development of Doco-CD, please consider becoming a sponsor on [GitHub Sponsors](https://github.com/sponsors/kimdre).
+
+Doco-CD is proudly supported by
+
+<a href="https://jb.gg/OpenSource">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://www.jetbrains.com/company/brand/img/logo_jb_dos_3.svg" />
+   <source media="(prefers-color-scheme: light)" srcset="https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg" />
+   <img alt="JetBrains logo" src="https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg" />
+ </picture>
+</a>
+
+[![sponsors badge](https://readme-contribs.as93.net/sponsors/kimdre?shape=circle&fontSize=14)](https://github.com/sponsors/kimdre)
 
 ## Star History
 

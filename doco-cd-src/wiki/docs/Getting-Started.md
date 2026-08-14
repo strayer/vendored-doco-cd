@@ -6,14 +6,20 @@ tags:
 
 # Getting Started
 
+If you are new to Doco-CD, follow the pages in this order:
+
+1. Set up Git authentication with either a token or an SSH key.
+2. Choose how Doco-CD should detect changes: webhooks, polling, or both.
+3. Deploy a repository using the sample `docker-compose.yml` file below.
+
 ???+ note "Use this [docker-compose.yml](https://github.com/kimdre/doco-cd/blob/main/docker-compose.yml) as your starting point"
     ```go title="docker-compose.yml"
     --8<-- "docker-compose.yml"
     ```
 
 !!! tip
-    To use a specific version, replace the `latest` tag with the desired release version without the leading `v` (e.g. `0.80.0`):
-    `ghcr.io/kimdre/doco-cd:0.80.0`
+    To use a specific version, replace the `latest` tag with the desired release version without the leading `v` (e.g. `0.103.0`):
+    `ghcr.io/kimdre/doco-cd:0.103.0`
 
     You can find the available tags/versions on the [GitHub Container Registry](https://github.com/kimdre/doco-cd/pkgs/container/doco-cd).
 
@@ -23,9 +29,10 @@ You can find all available app settings on the [App Settings](App-Settings.md) w
 
 If you run the application with Docker Swarm, see the [Swarm Mode](Advanced/Swarm-Mode.md) wiki page for more information.
 
-##  Create a Git Access Token
+## Create a Git Access Token
 
-The Git access token is used to authenticate with your Git provider (GitHub, GitLab, Gitea, etc.) and to clone or fetch your repositories via HTTP.
+Use a Git access token if your repository URL starts with `http://` or `https://`.
+It lets doco-cd authenticate with your Git provider (GitHub, GitLab, Gitea, etc.) and clone or fetch repositories over HTTP.
 
 !!! note
     If you use an SSH URL for your Git repositories, the Git access token is not required.
@@ -43,13 +50,15 @@ Doco-CD can be triggered to check for changes to deploy via webhooks or by polli
 
 ### Webhooks
 
-Webhooks are event-based triggers that notify doco-cd when there are changes in the repositories. This is the recommended way to trigger deployments as it is more efficient and faster than polling but requires doco-cd to be reachable from the internet (or local network if you self-host your Git provider) and some setup on your Git provider.
+Webhooks are event-based triggers that notify doco-cd when there are changes in a repository.
+They are the recommended trigger method because they are fast and efficient, but doco-cd must be reachable from your Git provider (for external services like GitHub this means from the internet) and you need to configure a webhook on the provider side.
 
 If you want to use webhooks, you need to set the `WEBHOOK_SECRET` environment variable to a secure secret and publish the webhook port. See [Setup Webhook](Setup-Webhook.md) for more information.
 
 ### Polling
 
-Polling is a time-based trigger that checks the repositories for changes at regular intervals. This method does not require doco-cd to be reachable from the internet but is less efficient and slower than webhooks.
+Polling is a time-based trigger that checks repositories for changes at regular intervals.
+It does not require doco-cd to be reachable from the Git provider, which makes it useful for private networks, but it is slower than webhooks.
 
 If you want to use polling, you need to set a poll configuration for each repository you want to use for deployments. See [Poll Settings](Poll-Settings.md) for more information.
 
@@ -69,6 +78,12 @@ docker compose logs -f
 
 To be able to reach the application from external Git providers like GitHub or Gitlab, you need to expose the http endpoint of the application to the internet.
 You can use a reverse proxy like [NGINX](https://www.nginx.com/), [Traefik](https://traefik.io) or [Caddy](https://caddyserver.com) for this purpose.
+
+### Restricting Docker access
+
+Mounting the Docker socket grants doco-cd full control over the Docker host.
+If you prefer to restrict this, see [Docker API Permissions](Advanced/Docker-API-Permissions.md)
+for the endpoints doco-cd uses and an example Docker socket proxy setup.
 
 ### Notes for Podman users
 
@@ -115,7 +130,7 @@ See the [External Secrets](External-Secrets/index.md) wiki page for more informa
 
 ### Pulling images from a private registry
 
-If you want to pull images from a private registry, see [Private Container Registries](Advanced/Private-Container-Registries.md) in the wiki.
+If you want to pull images from a private registry, see [Container Registry Authentication](Advanced/Container-Registry-Authentication.md) in the wiki.
 
 ### Self-updating doco-cd
 

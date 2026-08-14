@@ -23,14 +23,14 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/protocol/packp/capability"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 
+	"github.com/kimdre/doco-cd/internal/common/errdecode"
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 	"github.com/kimdre/doco-cd/internal/git/ssh"
 )
 
 const (
-	ZeroSHA               = "0000000000000000000000000000000000000000" // ZeroSHA represents a non-existent commit
-	DefaultShortSHALength = 7                                          // Default length for shortened commit SHAs
+	DefaultShortSHALength = 7 // Default length for shortened commit SHAs
 	RemoteName            = "origin"
 	TagPrefix             = "refs/tags/"
 	BranchPrefix          = "refs/heads/"
@@ -83,9 +83,21 @@ type RefSet struct {
 	RemoteHash plumbing.Hash
 }
 
-// GetReferenceSet retrieves a RefSet of local and remote references for a given reference name.
-// It also resolves the remote reference to a commit hash (when available) and fills RemoteHash.
+// GetReferenceSet resolves ref to the local and remote plumbing.ReferenceName
+// to use during checkout, along with the resolved remote commit hash.
+//
+// Resolution order (first match wins):
+//  1. Commit SHA — returned directly; no reference store lookup is performed.
+//  2. For refs/-prefixed names: the exact name, then its remote-tracking counterpart.
+//  3. For short names: refs/heads/<ref>, refs/remotes/origin/<ref>, refs/tags/<ref>,
+//     then the bare name (which only resolves for uppercase pseudo-refs like HEAD).
+//
+// Candidates whose name cannot be stored safely (see plumbing.ReferenceName.IsSafe)
+// are skipped rather than queried, so a malformed ref yields ErrInvalidReference
+// instead of a storage-layer error. Any other storage error is treated as a
+// transient failure and returned immediately.
 func GetReferenceSet(repo *git.Repository, ref string) (RefSet, error) {
+	// Commit SHAs are used directly — there is no reference name to resolve.
 	if plumbing.IsHash(ref) {
 		return RefSet{LocalRef: plumbing.ReferenceName(ref)}, nil
 	}
@@ -115,46 +127,41 @@ func GetReferenceSet(repo *git.Repository, ref string) (RefSet, error) {
 			candidate{plumbing.NewBranchReferenceName(ref), remoteRef},
 			candidate{remoteRef, remoteRef},
 			candidate{plumbing.NewTagReferenceName(ref), plumbing.NewTagReferenceName(ref)},
+			// The bare name only ever resolves for uppercase pseudo-refs such as
+			// HEAD or ORIG_HEAD; the IsSafe filter below discards it otherwise.
 			candidate{plumbing.ReferenceName(ref), plumbing.ReferenceName(ref)},
 		)
 	}
 
-	var lastErr error
-
 	for _, c := range candidates {
-		if _, err := repo.Reference(c.local, true); err == nil {
-			// try to resolve remote hash if remote ref exists
+		// go-git v5.19.2+ validates reference names at the storage layer and rejects
+		// unsafe ones (not under refs/, escaping it, or not an uppercase pseudo-ref)
+		// with an error distinct from plumbing.ErrReferenceNotFound. Such a name can
+		// never exist, so skip the lookup instead of misreporting it as transient.
+		if !c.local.IsSafe() {
+			continue
+		}
+
+		localRef, err := repo.Reference(c.local, true)
+		if err == nil {
 			remoteHash := plumbing.ZeroHash
 
-			if c.remote != "" {
+			switch {
+			case c.remote == c.local:
+				// Already resolved above; avoid a redundant store lookup.
+				remoteHash = localRef.Hash()
+			case c.remote.IsSafe():
 				if rRef, rErr := repo.Reference(c.remote, true); rErr == nil {
 					remoteHash = rRef.Hash()
 				}
 			}
 
 			return RefSet{LocalRef: c.local, RemoteRef: c.remote, RemoteHash: remoteHash}, nil
-		} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
-			lastErr = err
-		}
-	}
-
-	// If no local candidate found, but a remote exists, return the remote reference and resolved hash
-	for _, c := range candidates {
-		if c.remote == "" {
-			continue
 		}
 
-		if rRef, err := repo.Reference(c.remote, true); err == nil {
-			remoteHash := rRef.Hash()
-			// keep LocalRef equal to remote for now; CheckoutRepository will map remote/* -> refs/heads/*
-			return RefSet{LocalRef: c.remote, RemoteRef: c.remote, RemoteHash: remoteHash}, nil
-		} else if !errors.Is(err, plumbing.ErrReferenceNotFound) {
-			lastErr = err
+		if !errors.Is(err, plumbing.ErrReferenceNotFound) {
+			return RefSet{}, fmt.Errorf("failed to get reference %s: %w", ref, err)
 		}
-	}
-
-	if lastErr != nil {
-		return RefSet{}, fmt.Errorf("failed to get reference %s: %w", ref, lastErr)
 	}
 
 	return RefSet{}, fmt.Errorf("%w: %s", ErrInvalidReference, ref)
@@ -333,7 +340,7 @@ func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts trans
 				slog.Warn("failed to validate requested reference in fetched refs before repair",
 					slog.String("path", path),
 					slog.String("ref", ref),
-					slog.String("error", fetchedCheckErr.Error()))
+					slog.String("error", FormatGitErrorMessage(fetchedCheckErr)))
 			}
 
 			if fetchedCheckErr == nil && !fetchedExists {
@@ -346,7 +353,7 @@ func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts trans
 
 			slog.Warn("detected possible repository corruption during checkout",
 				slog.String("path", path),
-				slog.String("error", err.Error()))
+				slog.String("error", FormatGitErrorMessage(err)))
 
 			// Release the lock before calling RepairRepository because repair may re-clone.
 			unlock()
@@ -358,10 +365,10 @@ func UpdateRepository(path, url, ref string, skipTLSVerify bool, proxyOpts trans
 
 			slog.Error("failed to repair corrupted repository",
 				slog.String("path", path),
-				slog.String("repair_error", repairErr.Error()))
+				slog.String("repair_error", FormatGitErrorMessage(repairErr)))
 		}
 		// Attempt to deepen if the ref is unreachable in a shallow clone
-		if depth > 0 && isRefUnreachableError(err) {
+		if depth > 0 && IsRefUnreachableError(err) {
 			repo, deepenErr := deepenAndCheckout(repo, url, ref, skipTLSVerify, proxyOpts, auth, cloneSubmodules, depth)
 			if deepenErr != nil {
 				return nil, fmt.Errorf("%w: %w", ErrCheckoutFailed, deepenErr)
@@ -591,7 +598,7 @@ func CloneRepository(path, url, ref string, skipTLSVerify bool, proxyOpts transp
 	err = CheckoutRepository(repo, ref, auth, cloneSubmodules)
 	if err != nil {
 		// Attempt to deepen if the ref is unreachable in a shallow clone
-		if depth > 0 && isRefUnreachableError(err) {
+		if depth > 0 && IsRefUnreachableError(err) {
 			repo, deepenErr := deepenAndCheckout(repo, url, ref, skipTLSVerify, proxyOpts, auth, cloneSubmodules, depth)
 			if deepenErr != nil {
 				return nil, fmt.Errorf("%w: %w", ErrCheckoutFailed, deepenErr)
@@ -908,6 +915,88 @@ func GetChangedFilesBetweenCommits(repo *git.Repository, commitHash1, commitHash
 	return changedFiles, nil
 }
 
+// CommitInfo is a single commit exposed to notification templates.
+type CommitInfo struct {
+	Hash      string
+	ShortHash string
+	Subject   string
+	Author    string
+}
+
+// String renders "shortHash subject", the default when a template prints a commit directly.
+func (c CommitInfo) String() string {
+	return c.ShortHash + " " + c.Subject
+}
+
+// commitBoundary returns the hashes at which GetCommitsBetween should stop walking:
+// oldHash plus the merge-base of old and new. On a normal fast-forward the merge-base
+// is oldHash itself; after a rebase/force-push it is the point where the histories
+// diverged, so only the genuinely new commits are returned instead of the whole branch.
+func commitBoundary(repo *git.Repository, oldHash, newHash plumbing.Hash) map[plumbing.Hash]struct{} {
+	boundary := map[plumbing.Hash]struct{}{oldHash: {}}
+
+	newCommit, err := repo.CommitObject(newHash)
+	if err != nil {
+		return boundary
+	}
+
+	oldCommit, err := repo.CommitObject(oldHash)
+	if err != nil {
+		return boundary
+	}
+
+	bases, err := newCommit.MergeBase(oldCommit)
+	if err != nil {
+		return boundary
+	}
+
+	for _, b := range bases {
+		boundary[b.Hash] = struct{}{}
+	}
+
+	return boundary
+}
+
+// GetCommitsBetween returns commits reachable from newHash but not from oldHash,
+// newest first, capped at maxCommits.
+func GetCommitsBetween(repo *git.Repository, oldHash, newHash plumbing.Hash, maxCommits int) ([]CommitInfo, error) {
+	iter, err := repo.Log(&git.LogOptions{From: newHash, Order: git.LogOrderCommitterTime})
+	if err != nil {
+		return nil, fmt.Errorf("failed to read commit log from %s: %w", newHash, err)
+	}
+	defer iter.Close()
+
+	boundary := commitBoundary(repo, oldHash, newHash)
+	commits := make([]CommitInfo, 0, maxCommits)
+
+	stop := errors.New("stop")
+
+	err = iter.ForEach(func(c *object.Commit) error {
+		if _, atBoundary := boundary[c.Hash]; atBoundary || len(commits) >= maxCommits {
+			return stop
+		}
+
+		subject := c.Message
+		if i := strings.IndexByte(subject, '\n'); i >= 0 {
+			subject = subject[:i]
+		}
+
+		commits = append(commits, CommitInfo{
+			Hash:      c.Hash.String(),
+			ShortHash: c.Hash.String()[:DefaultShortSHALength],
+			Subject:   strings.TrimSpace(subject),
+			Author:    c.Author.Name,
+		})
+
+		return nil
+	})
+	if err != nil && !errors.Is(err, stop) {
+		return nil, fmt.Errorf("failed to walk commit log: %w", err)
+	}
+
+	return commits, nil
+}
+
 // shouldResetDecryptedFile determines whether a file should be reset based on its decrypted content.
 func shouldResetDecryptedFile(repo *git.Repository, repoRoot, file string) bool {
 	headRef, err := repo.Head()
@@ -1103,10 +1192,10 @@ func needsReclone(repoPath string, depth int) bool {
 	return isShallow != wantShallow
 }
 
-// isRefUnreachableError returns true when the error indicates the requested ref
+// IsRefUnreachableError returns true when the error indicates the requested ref
 // could not be found, which in a shallow clone likely means the ref is outside
 // the fetched depth.
-func isRefUnreachableError(err error) bool {
+func IsRefUnreachableError(err error) bool {
 	if err == nil {
 		return false
 	}
@@ -1198,4 +1287,15 @@ func normalizeOwnerRepo(p string) string {
 
 	// Clean path
 	return path.Clean(p)
+}
+
+// FormatGitErrorMessage formats a git operation error message by attempting to decode
+// any localized error response bodies embedded in it (e.g. from Azure DevOps Server).
+// It returns the formatted error message suitable for logging.
+func FormatGitErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+
+	return errdecode.DecodeEmbeddedJSON(err.Error())
 }

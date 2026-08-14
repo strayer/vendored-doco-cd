@@ -1,8 +1,12 @@
 package stages
 
 import (
+	"errors"
+	"fmt"
 	"slices"
 	"testing"
+
+	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/kimdre/doco-cd/internal/docker"
 )
@@ -10,8 +14,11 @@ import (
 func TestAutoDiscoveryConfigLabelDriftServices(t *testing.T) {
 	expected := "{enabled: true, depth: 0, delete: false, remove_volumes: true, remove_images: true}"
 
+	disabled := "{enabled: false, depth: 0, delete: false, remove_volumes: false, remove_images: true}"
+
 	tests := []struct {
 		name           string
+		expected       string // defaults to expected when empty
 		status         map[docker.Service]docker.ServiceStatus
 		wantServices   []string
 		wantFirstLabel string
@@ -63,10 +70,67 @@ func TestAutoDiscoveryConfigLabelDriftServices(t *testing.T) {
 			wantServices:   []string{"a-web", "z-api"},
 			wantFirstLabel: "",
 		},
+		{
+			// A changed default must not recreate the stack while auto-discovery is off,
+			// because the label steers auto-discovery cleanup only.
+			name:     "disabled on both sides, only a default differs",
+			expected: disabled,
+			status: map[docker.Service]docker.ServiceStatus{
+				"web": {
+					Labels: docker.Labels{
+						docker.DocoCDLabels.Deployment.AutoDiscoveryConfig: "{enabled: false, depth: 0, delete: true, remove_volumes: false, remove_images: true}",
+					},
+				},
+			},
+			wantServices:   nil,
+			wantFirstLabel: disabled,
+		},
+		{
+			name:     "disabled now, deployed while enabled",
+			expected: disabled,
+			status: map[docker.Service]docker.ServiceStatus{
+				"web": {
+					Labels: docker.Labels{
+						docker.DocoCDLabels.Deployment.AutoDiscoveryConfig: "{enabled: true, depth: 0, delete: true, remove_volumes: false, remove_images: true}",
+					},
+				},
+			},
+			wantServices:   []string{"web"},
+			wantFirstLabel: "{enabled: true, depth: 0, delete: true, remove_volumes: false, remove_images: true}",
+		},
+		{
+			name:     "disabled with no label yet",
+			expected: disabled,
+			status: map[docker.Service]docker.ServiceStatus{
+				"web": {
+					Labels: docker.Labels{},
+				},
+			},
+			wantServices:   nil,
+			wantFirstLabel: disabled,
+		},
+		{
+			name:     "disabled now, legacy deployment was enabled",
+			expected: disabled,
+			status: map[docker.Service]docker.ServiceStatus{
+				"web": {
+					Labels: docker.Labels{
+						docker.DocoCDLabels.Deployment.AutoDiscovery: "true",
+					},
+				},
+			},
+			wantServices:   []string{"web"},
+			wantFirstLabel: "",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			expected := expected
+			if tt.expected != "" {
+				expected = tt.expected
+			}
+
 			gotServices, gotFirst := autoDiscoveryConfigLabelDriftServices(tt.status, expected)
 			if !slices.Equal(gotServices, tt.wantServices) {
 				t.Fatalf("autoDiscoveryConfigLabelDriftServices() services = %v, want %v", gotServices, tt.wantServices)
@@ -252,6 +316,49 @@ func TestShouldSkipOCIDeployment(t *testing.T) {
 			got := shouldSkipOCIDeployment(tt.forceRecreate, tt.deployed, tt.resolved)
 			if got != tt.want {
 				t.Errorf("shouldSkipOCIDeployment() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldRecoverFromMissingDeployedCommit(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{
+			name: "object not found",
+			err:  plumbing.ErrObjectNotFound,
+			want: true,
+		},
+		{
+			name: "wrapped object not found",
+			err:  fmt.Errorf("wrapped: %w", plumbing.ErrObjectNotFound),
+			want: true,
+		},
+		{
+			name: "reference not found",
+			err:  plumbing.ErrReferenceNotFound,
+			want: true,
+		},
+		{
+			name: "generic error",
+			err:  errors.New("some other git error"),
+			want: false,
+		},
+		{
+			name: "nil error",
+			err:  nil,
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldRecoverFromMissingDeployedCommit(tt.err)
+			if got != tt.want {
+				t.Fatalf("shouldRecoverFromMissingDeployedCommit() = %v, want %v", got, tt.want)
 			}
 		})
 	}

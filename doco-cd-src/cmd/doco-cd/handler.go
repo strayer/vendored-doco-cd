@@ -80,7 +80,7 @@ func postEarlyCommitStatus(ctx context.Context, jobLog *slog.Logger, appConfig *
 
 	commitSHA = strings.TrimSpace(commitSHA)
 	if commitSHA == "" {
-		commitSHA = strings.TrimSpace(payload.CommitSHA)
+		commitSHA = strings.TrimSpace(payload.CommitSHAString())
 	}
 
 	if commitSHA == "" {
@@ -192,6 +192,7 @@ func handle(ctx context.Context, jobLog *slog.Logger,
 
 	if customTarget != "" {
 		jobLog = jobLog.With(slog.String("target", customTarget))
+		metadata.Target = strings.TrimSpace(customTarget)
 	}
 
 	if strings.Contains(repoName, "..") {
@@ -295,7 +296,7 @@ func handle(ctx context.Context, jobLog *slog.Logger,
 		payload.Artifact = sourceRef
 		payload.Digest = pullResult.Digest
 
-		payload.CommitSHA = pullResult.Digest
+		payload.Trigger = pullResult.Digest
 		if payload.FullName == "" {
 			payload.FullName = repoName
 		}

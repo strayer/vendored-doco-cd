@@ -1,5 +1,5 @@
-# syntax=docker/dockerfile:1@sha256:87999aa3d42bdc6bea60565083ee17e86d1f3339802f543c0d03998580f9cb89
-FROM golang:1.26.5@sha256:3aff6657219a4d9c14e27fb1d8976c49c29fddb70ba835014f477e1c70636647 AS prerequisites
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
+FROM golang:1.26.5@sha256:5822931cf78fe98a97edcf73a0c54c29fa2386b99c8136468e274ae9fab8cfba AS prerequisites
 
 ARG APP_VERSION=dev
 ARG DISABLE_BITWARDEN=false
@@ -63,7 +63,7 @@ RUN --mount=type=cache,target=/go/pkg/mod/ \
 
 FROM gcr.io/distroless/base-debian13@sha256:f4a335ca209e1d2ee873102c17c389ad0142e3d5b21aee2817e9cc9c01d87d20 AS distroless-base
 
-FROM debian:trixie-slim@sha256:020c0d20b9880058cbe785a9db107156c3c75c2ac944a6aa7ab59f2add76a7bd AS ssh-client
+FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS ssh-client
 
 # Copy the distroless base filesystem so we can skip libraries already present there.
 COPY --from=distroless-base / /distroless-root/
@@ -89,7 +89,7 @@ FROM distroless-base AS release
 WORKDIR /
 
 # buildx plugin so compose v5 picks BuildKit instead of the legacy `/build` endpoint
-COPY --from=docker/buildx-bin:0.35.0@sha256:917570d8d0ae91ae49251f84f848a6801eedd114554c56a4fdf7ec88cac48eeb \
+COPY --from=docker/buildx-bin:0.36.1@sha256:1f2f6b2be4a2511ada67336e76892f1a588c89746009dd4b21069e4d867465be \
     /buildx /usr/libexec/docker/cli-plugins/docker-buildx
 
 COPY --from=build /doco-cd /doco-cd

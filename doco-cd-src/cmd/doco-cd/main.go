@@ -31,6 +31,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 
 	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/docker/registryauth"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/prometheus"
@@ -80,6 +81,42 @@ func CreateMountpointSymlink(m container.MountPoint) error {
 	}
 
 	return nil
+}
+
+func resolveDataMountPoint(
+	dataHostPath string,
+	dataMountPath string,
+	detectMountPoint func() (container.MountPoint, error),
+) (container.MountPoint, error) {
+	if dataHostPath != "" {
+		return container.MountPoint{
+			Type:        "bind",
+			Source:      dataHostPath,
+			Destination: dataMountPath,
+			Mode:        "rw",
+			RW:          true,
+		}, nil
+	}
+
+	return detectMountPoint()
+}
+
+func detectDataMountPoint(
+	dataMountPath string,
+	getContainerID func() (string, error),
+	getMountPoint func(string, string) (container.MountPoint, error),
+) (container.MountPoint, error) {
+	appContainerID, err := getContainerID()
+	if err != nil {
+		return container.MountPoint{}, fmt.Errorf("failed to retrieve doco-cd container id: %w", err)
+	}
+
+	mountPoint, err := getMountPoint(appContainerID, dataMountPath)
+	if err != nil {
+		return container.MountPoint{}, fmt.Errorf("failed to retrieve %s mount point for container %s: %w", dataMountPath, appContainerID, err)
+	}
+
+	return mountPoint, nil
 }
 
 func main() {
@@ -183,6 +220,22 @@ func run() error {
 		}
 	}(dockerClient)
 
+	if err = registryauth.ValidateDockerConfig(dockerCli.ConfigFile()); err != nil {
+		log.Critical("docker config validation failed", logger.ErrAttr(err), slog.String("config_file", dockerCli.ConfigFile().Filename))
+		return err
+	}
+
+	if missing := registryauth.MissingConfiguredCredentialHelpers(dockerCli.ConfigFile()); len(missing) > 0 {
+		for _, m := range missing {
+			log.Warn("missing credential helper binary in container; image pulls from affected registries will fail",
+				slog.String("helper", m.Helper),
+				slog.String("binary", m.Binary),
+				slog.Any("affected_registries", m.Registries),
+				slog.String("config_file", dockerCli.ConfigFile().Filename),
+			)
+		}
+	}
+
 	if c.DockerSwarmFeatures {
 		if err := swarm.RefreshModeEnabled(ctx, dockerClient); err != nil {
 			log.Critical("failed to check if docker daemon is a swarm manager", logger.ErrAttr(err))
@@ -200,20 +253,28 @@ func run() error {
 			slog.Bool("swarm_mode", swarm.GetModeEnabled()),
 		))
 
-	// Get doco-cd container id
-	appContainerID, err := getAppContainerID()
+	dataMountPoint, err := resolveDataMountPoint(
+		c.DataHostPath,
+		c.DataMountPath,
+		func() (container.MountPoint, error) {
+			return detectDataMountPoint(
+				c.DataMountPath,
+				func() (string, error) {
+					appContainerID, err := getAppContainerID()
+					if err == nil {
+						log.Debug("retrieved doco-cd container id", slog.String("container_id", appContainerID))
+					}
+
+					return appContainerID, err
+				},
+				func(containerID, destination string) (container.MountPoint, error) {
+					return docker.GetMountPointByDestination(dockerClient, containerID, destination)
+				},
+			)
+		},
+	)
 	if err != nil {
-		log.Critical("failed to retrieve doco-cd container id", logger.ErrAttr(err))
-
-		return err
-	}
-
-	log.Debug("retrieved doco-cd container id", slog.String("container_id", appContainerID))
-
-	// Check if the doco-cd container has a data mount point and get the host path
-	dataMountPoint, err := docker.GetMountPointByDestination(dockerClient, appContainerID, c.DataMountPath)
-	if err != nil {
-		log.Critical(fmt.Sprintf("failed to retrieve %s mount point for container %s", c.DataMountPath, appContainerID), logger.ErrAttr(err))
+		log.Critical("failed to resolve doco-cd data mount point", logger.ErrAttr(err))
 		return err
 	}
 
@@ -248,10 +309,13 @@ func run() error {
 		},
 	)
 
-	// Initialize SSH agent if SSH private key is provided
-	if c.SSHPrivateKey != "" {
-		ssh.RegisterSSHAgent(ctx, log.Logger, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase)
+	// Initialize SSH agent with the global and domain scoped SSH keys, if any are configured
+	sshKeys := []ssh.KeyRecord{{PrivateKey: c.SSHPrivateKey, Passphrase: c.SSHPrivateKeyPassphrase}}
+	for _, scoped := range c.GitAuthDomains {
+		sshKeys = append(sshKeys, ssh.KeyRecord{PrivateKey: scoped.SSHPrivateKey, Passphrase: scoped.SSHPrivateKeyPassphrase})
 	}
+
+	ssh.RegisterSSHAgent(ctx, log.Logger, sshKeys)
 
 	// Initialize the secret provider
 	secretProvider, err := secretprovider.Initialize(ctx, c.SecretProvider, app.Version)
@@ -273,6 +337,11 @@ func run() error {
 		dataMountPoint: dataMountPoint,
 		dockerCli:      dockerCli,
 		log:            log,
+		runTracker: newDeploymentRunTracker(map[deploymentRunTrigger]int{
+			deploymentRunTriggerPoll:         50,
+			deploymentRunTriggerWebhook:      50,
+			deploymentRunTriggerScheduledJob: 50,
+		}),
 		secretProvider: &secretProvider,
 	}
 
@@ -297,7 +366,7 @@ func run() error {
 
 	if c.SchedulerEnabled {
 		graceful.SafeGo(&wg, log.Logger, func() {
-			scheduler.Start(ctx, h.dockerCli, log.Logger, &wg)
+			scheduler.Start(ctx, h.dockerCli, log.Logger, &wg, h.secretProvider)
 		})
 	} else {
 		log.Info("scheduler disabled by configuration")

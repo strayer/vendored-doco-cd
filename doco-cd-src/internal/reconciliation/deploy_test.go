@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
-	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -13,8 +12,11 @@ import (
 
 	"github.com/containerd/errdefs"
 	composeapi "github.com/docker/compose/v5/pkg/api"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
+
+	"github.com/kimdre/doco-cd/internal/common/id"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
@@ -29,7 +31,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
 	"github.com/kimdre/doco-cd/internal/stages"
 	"github.com/kimdre/doco-cd/internal/test"
-	"github.com/kimdre/doco-cd/internal/utils/id"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
@@ -111,7 +112,7 @@ func TestDeploy(t *testing.T) {
 
 	p := webhook.ParsedPayload{
 		Ref:       "7be81e788a40724cee7542eec00a2af0c4340eba",
-		CommitSHA: "7be81e788a40724cee7542eec00a2af0c4340eba",
+		CommitSHA: plumbing.NewHash("7be81e788a40724cee7542eec00a2af0c4340eba"),
 		FullName:  "kimdre/doco-cd_tests",
 		CloneURL:  "https://github.com/kimdre/doco-cd_tests.git",
 		Private:   false,
@@ -178,7 +179,7 @@ func TestDeploy(t *testing.T) {
 		notification.Metadata{
 			JobID:      jobId,
 			Repository: repoName,
-			Revision:   notification.GetRevision(p.Ref, p.CommitSHA),
+			Revision:   notification.GetRevision(p.Ref, p.CommitSHAString()),
 		},
 		stages.JobTriggerWebhook,
 		stages.RepositoryData{
@@ -204,52 +205,18 @@ func TestDeploy(t *testing.T) {
 
 	slices.Sort(wanted)
 
-	got, err := getRunningContainerNames(ctx, dockerCli.Client(), stackName)
-	if err != nil {
-		t.Fatal("get containers err:", err)
-	}
-
-	if !reflect.DeepEqual(wanted, got) {
-		t.Fatalf("first get running , expected %v, got %v", wanted, got)
-	}
-
-	// Give the reconciliation event listener a moment to subscribe before deleting containers.
-	time.Sleep(time.Second)
+	waitForRunningContainerNames(ctx, t, dockerCli.Client(), stackName, wanted, 20*time.Second)
+	waitForReconciliationJobReady(t, repoName, 5*time.Second)
 
 	if err := rmContainer(ctx, t, dockerCli.Client(), wanted); err != nil {
 		t.Fatal("rm container err:", err)
 	}
 
-	got, err = getRunningContainerNames(ctx, dockerCli.Client(), stackName)
-	if err != nil {
-		t.Fatal("get containers err:", err)
-	}
-
-	if !reflect.DeepEqual([]string{}, got) {
-		t.Fatalf("rm container, get containers, expected empty, got %v", got)
-	}
-
-	deadline := time.Now().Add(20 * time.Second)
-
-	for {
-		got, err = getRunningContainerNames(ctx, dockerCli.Client(), stackName)
-		if err != nil {
-			t.Fatal("get containers err:", err)
-		}
-
-		if reflect.DeepEqual(firstPartWanted, got) {
-			break
-		}
-
-		if time.Now().After(deadline) {
-			t.Fatalf("start +20s, get containers, expected %v, got %v", firstPartWanted, got)
-		}
-
-		time.Sleep(250 * time.Millisecond)
-	}
+	waitForRunningContainerNames(ctx, t, dockerCli.Client(), stackName, nil, 20*time.Second)
+	waitForRunningContainerNames(ctx, t, dockerCli.Client(), stackName, firstPartWanted, 20*time.Second)
 }
 
-func getRunningContainerNames(ctx context.Context, cli client.APIClient, prefix string) ([]string, error) {
+func getRunningContainerNames(ctx context.Context, cli client.APIClient, stackName string) ([]string, error) {
 	result, err := cli.ContainerList(ctx, client.ContainerListOptions{
 		All: false,
 	})
@@ -257,11 +224,13 @@ func getRunningContainerNames(ctx context.Context, cli client.APIClient, prefix 
 		return nil, err
 	}
 
+	stackContainerPrefix := stackName + "-"
+
 	got := []string{}
 
 	for _, c := range result.Items {
 		name := strings.TrimPrefix(c.Names[0], "/")
-		if strings.HasPrefix(name, prefix) {
+		if strings.HasPrefix(name, stackContainerPrefix) {
 			got = append(got, name)
 		}
 	}
@@ -308,6 +277,52 @@ func waitForStackDeploymentToFinish(t *testing.T, repository, stack string, time
 		}
 
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func waitForReconciliationJobReady(t *testing.T, repository string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		reconciliationHandler.m.Lock()
+		job := reconciliationHandler.repoJobs[repository]
+		ready := job != nil && job.contextCLIs != nil
+		reconciliationHandler.m.Unlock()
+
+		if ready {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for reconciliation job for repository %q to become ready", repository)
+		}
+
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+func waitForRunningContainerNames(ctx context.Context, t *testing.T, cli client.APIClient, stackName string, want []string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+
+	for {
+		got, err := getRunningContainerNames(ctx, cli, stackName)
+		if err != nil {
+			t.Fatal("get containers err:", err)
+		}
+
+		if slices.Equal(want, got) {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for running containers %v, got %v", want, got)
+		}
+
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 

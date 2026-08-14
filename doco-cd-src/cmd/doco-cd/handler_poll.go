@@ -9,6 +9,8 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/container"
 
+	"github.com/kimdre/doco-cd/internal/common/id"
+
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/poll"
@@ -20,7 +22,6 @@ import (
 	log "github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/prometheus"
 	"github.com/kimdre/doco-cd/internal/source/oci"
-	"github.com/kimdre/doco-cd/internal/utils/id"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
@@ -82,13 +83,28 @@ func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
 			metadata := notification.Metadata{
 				Repository: repoName,
 				Stack:      "",
+				Target:     pollJob.Config.CustomTarget,
 				Revision:   notification.GetRevision(pollJob.Config.Reference, ""),
 				JobID:      jobID,
 			}
 
 			logger.Debug("start poll job")
 
-			_ = runner(ctx, pollJob.Config, h.appConfig, h.dataMountPoint, h.dockerCli, logger, metadata, h.secretProvider)
+			if h.runTracker != nil {
+				h.runTracker.TrackAccepted(jobID, deploymentRunTriggerPoll)
+				h.runTracker.SetMetadata(jobID, repoName, "", notification.GetRevision(pollJob.Config.Reference, ""))
+				h.runTracker.MarkRunning(jobID)
+			}
+
+			err := runner(ctx, pollJob.Config, h.appConfig, h.dataMountPoint, h.dockerCli, logger, metadata, h.secretProvider)
+
+			if h.runTracker != nil {
+				if err != nil {
+					h.runTracker.MarkFailed(jobID, err.Error())
+				} else {
+					h.runTracker.MarkSucceeded(jobID, "poll completed successfully")
+				}
+			}
 
 			pollJob.NextRun = time.Now().Add(pollJob.Config.Interval).Unix()
 		} else {
@@ -146,6 +162,14 @@ func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config,
 	sourceType := config.NormalizeSourceType(pollConfig.Source)
 	sourceRef := pollConfig.SourceUrl
 	entity := logEntityForSourceType(sourceType)
+	sourceURLRewriteApplied := false
+
+	if sourceType == config.SourceTypeGit && appConfig != nil {
+		var rewritten string
+
+		rewritten, sourceURLRewriteApplied = rewriteSourceURL(sourceRef, appConfig.SourceURLRewrites)
+		sourceRef = rewritten
+	}
 
 	repoName := git.GetRepoName(sourceRef)
 	if sourceType == config.SourceTypeOCI {
@@ -155,6 +179,10 @@ func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config,
 	jobLog := logger.With(
 		slog.String("job_id", metadata.JobID),
 	)
+
+	if sourceURLRewriteApplied {
+		jobLog.Debug("using configured source URL rewrite", slog.String("source_url", sourceRef))
+	}
 
 	if pollConfig.CustomTarget != "" {
 		jobLog = jobLog.With(slog.String("target", pollConfig.CustomTarget))
