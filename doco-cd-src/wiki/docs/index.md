@@ -39,14 +39,14 @@ More resources:
 
 ## Supported Git Providers
 
-See more info here: [Setup Webhook](Setup-Access-Token.md#git-providers)
-
 - GitHub
 - GitLab
 - Gitea
 - Forgejo
 - Gogs
 - Azure DevOps* ([_Service Hooks_ not supported](Setup-Webhook.md#setup-in-git-providers-azure-devops))
+
+More info at [Setup Access Token](Setup-Access-Token.md#git-providers) and [Setup Webhook](Setup-Webhook.md)
 
 ## Releases and Changelog
 
@@ -63,10 +63,10 @@ You can find the Docker image in the [GitHub Container Registry](https://github.
 docker pull ghcr.io/kimdre/doco-cd:latest
 ```
 
-To use a specific version, replace `latest` with the desired release version without the leading `v` (e.g. `0.80.0`):
+To use a specific version, replace `latest` with the desired release version without the leading `v` (e.g. `0.103.0`):
 
 ```sh
-ghcr.io/kimdre/doco-cd:0.80.0
+ghcr.io/kimdre/doco-cd:0.103.0
 ```
 
 ## Community
@@ -74,26 +74,33 @@ ghcr.io/kimdre/doco-cd:0.80.0
 - Ask questions on [GitHub Discussions](https://github.com/kimdre/doco-cd/discussions)
 - Report bugs or suggest features by [opening an issue](https://github.com/kimdre/doco-cd/issues/new/choose)
 
+## Contributing
+
+Contributions are welcome! Please see the [Contributing Guidelines](Contributing.md) for more information.
+
 ## In the Media
 
 Doco-CD has been featured by industry media and technical publications:
 
 | Date       | Publication | Article                                                                                                                    |
 |------------|-------------|----------------------------------------------------------------------------------------------------------------------------|
+| 2026-07-30 | c't Netherlands | [(Dutch) Docker-containers updaten: drie opties voor automatisch updaten](https://www.ct.nl/workshops/docker-containers-updaten-drie-opties-voor-automatisch-updaten/)     |
 | 2026-05-01 | c't Magazin | [(German) c't 10/2026](https://www.heise.de/select/ct/2026/10/2609115553794560316)                                         |
 | 2026-04-22 | heise+      | [(German) Watchtower and alternatives: how to keep Docker containers automatically up to date](https://heise.de/-11243856) |
 | 2025-11-14 | selfh.st    | [Weekly: 2025-11-14](https://selfh.st/weekly/2025-11-14/)                                                                  |
 
-## Contributing
+## Support the Project
 
-Contributions are welcome! Please see the [Contributing Guidelines](Contributing.md) for more information.
+If you would like to support the development of Doco-CD, please consider becoming a sponsor on [GitHub Sponsors](https://github.com/sponsors/kimdre).
+
+Doco-CD is proudly supported by
+
+[![JetBrains logo](https://resources.jetbrains.com/storage/products/company/brand/logos/jetbrains.svg#only-light){ loading=lazy }](https://jb.gg/OpenSource)
+[![JetBrains logo](https://www.jetbrains.com/company/brand/img/logo_jb_dos_3.svg#only-dark){ loading=lazy }](https://jb.gg/OpenSource)
+
+<iframe style="background: transparent; border: none;" src="https://readme-contribs.as93.net/sponsors/kimdre?shape=circle&fontSize=14" title="sponsors" loading="lazy"></iframe>
 
 ## Star History
 
-<a href="https://www.star-history.com/?repos=kimdre%2Fdoco-cd&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=kimdre/doco-cd&type=date&theme=dark&legend=top-left&sealed_token=saZ0hV4u45f86P2hpUFWpOZm-TTGM2b4M-z2Ji3FRAzBKzsZ5l1JmPPstp4FYVSkLI4mqT3OqCnGxuiJEhZ1KDWZs7P39Slsvd_dIJfC1tCRRsi5HafLag" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=kimdre/doco-cd&type=date&legend=top-left&sealed_token=saZ0hV4u45f86P2hpUFWpOZm-TTGM2b4M-z2Ji3FRAzBKzsZ5l1JmPPstp4FYVSkLI4mqT3OqCnGxuiJEhZ1KDWZs7P39Slsvd_dIJfC1tCRRsi5HafLag" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=kimdre/doco-cd&type=date&legend=top-left&sealed_token=saZ0hV4u45f86P2hpUFWpOZm-TTGM2b4M-z2Ji3FRAzBKzsZ5l1JmPPstp4FYVSkLI4mqT3OqCnGxuiJEhZ1KDWZs7P39Slsvd_dIJfC1tCRRsi5HafLag" />
- </picture>
-</a>
+[![Star History Chart](https://api.star-history.com/chart?repos=kimdre/doco-cd&type=date&legend=top-left&sealed_token=saZ0hV4u45f86P2hpUFWpOZm-TTGM2b4M-z2Ji3FRAzBKzsZ5l1JmPPstp4FYVSkLI4mqT3OqCnGxuiJEhZ1KDWZs7P39Slsvd_dIJfC1tCRRsi5HafLag#only-light){ loading=lazy }](https://www.star-history.com/?repos=kimdre%2Fdoco-cd&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/chart?repos=kimdre/doco-cd&type=date&theme=dark&legend=top-left&sealed_token=saZ0hV4u45f86P2hpUFWpOZm-TTGM2b4M-z2Ji3FRAzBKzsZ5l1JmPPstp4FYVSkLI4mqT3OqCnGxuiJEhZ1KDWZs7P39Slsvd_dIJfC1tCRRsi5HafLag#only-dark){ loading=lazy }](https://www.star-history.com/?repos=kimdre%2Fdoco-cd&type=date&legend=top-left)

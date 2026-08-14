@@ -12,6 +12,7 @@ import (
 
 	"github.com/avast/retry-go/v5"
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 
@@ -534,7 +535,7 @@ services:
 
 	stackName := test.ConvertTestName(t.Name())
 
-	_, err = LoadCompose(ctx, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	_, err = LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +628,7 @@ services:
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(t.Context(), tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -651,7 +652,7 @@ services:
 
 	p := webhook.ParsedPayload{
 		Ref:       git.SwarmModeBranch,
-		CommitSHA: "244b6f9a5b3dc546ab3822d9c0744846f539c6ef",
+		CommitSHA: plumbing.NewHash("244b6f9a5b3dc546ab3822d9c0744846f539c6ef"),
 		Name:      stackName,
 		FullName:  repoName,
 		CloneURL:  cloneUrlTest,
@@ -665,10 +666,10 @@ services:
 	).Do(
 		func() error {
 			timestamp := time.Now().UTC().Format(time.RFC3339)
-			addSwarmServiceLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHA, projectHash)
-			addSwarmVolumeLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHA)
-			addSwarmConfigLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHA)
-			addSwarmSecretLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHA)
+			addSwarmServiceLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString(), projectHash)
+			addSwarmVolumeLabels(swarmStack, deployCfg, &p, tmpDir)
+			addSwarmConfigLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString())
+			addSwarmSecretLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString())
 
 			return DeploySwarmStack(ctx, dockerCli, swarmStack, opts)
 		},
@@ -720,14 +721,14 @@ services:
 	t.Cleanup(func() {
 		ctx := context.Background()
 
-		err = PruneStackConfigs(ctx, dockerClient, stackName)
+		err = PruneStackConfigs(ctx, dockerClient, stackName, 0)
 		if err != nil {
 			t.Fatalf("Failed to prune stack configs: %v", err)
 		} else {
 			t.Logf("Stack configs pruned successfully")
 		}
 
-		err = PruneStackSecrets(ctx, dockerClient, stackName)
+		err = PruneStackSecrets(ctx, dockerClient, stackName, 0)
 		if err != nil {
 			t.Fatalf("Failed to prune stack secrets: %v", err)
 		} else {
@@ -866,6 +867,18 @@ func TestCheckServiceMismatch(t *testing.T) {
 			},
 		},
 		{
+			name:            "swarmMode=false, scaled to zero for restart always may remain absent",
+			deployed:        map[Service]ServiceStatus{},
+			swarmModeEnable: false,
+			services: types.Services{
+				"foo": {
+					Restart: "always",
+					Scale:   new(0),
+				},
+			},
+			want: nil,
+		},
+		{
 			name:            "swarmMode=false, no restart policy may remain stopped",
 			deployed:        map[Service]ServiceStatus{},
 			swarmModeEnable: false,
@@ -962,6 +975,19 @@ func TestCheckServiceMismatch(t *testing.T) {
 				"replicated2": {
 					Name:   "replicated2",
 					Deploy: &types.DeployConfig{Replicas: new(1)},
+				},
+			},
+			want: nil,
+		},
+		{
+			name:            "swarmMode=true, replicated scaled to zero may remain absent",
+			deployed:        map[Service]ServiceStatus{},
+			swarmModeEnable: true,
+			services: types.Services{
+				"replicated": {
+					Name:   "replicated",
+					Scale:  new(0),
+					Deploy: &types.DeployConfig{Mode: string(swarm.DeployModeReplicated)},
 				},
 			},
 			want: nil,

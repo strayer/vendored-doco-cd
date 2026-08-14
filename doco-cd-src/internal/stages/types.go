@@ -4,17 +4,20 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/command"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/moby/moby/api/types/container"
 
 	types2 "github.com/kimdre/doco-cd/internal/config"
 
 	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/common/types/slice"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
@@ -134,6 +137,24 @@ type Docker struct {
 type DeploymentState struct {
 	changedServices []docker.Change
 	ignoredInfo     docker.IgnoredInfo
+	DeployedCommit  string // previously-deployed commit SHA, carried to post-deploy for the changelog
+}
+
+// changedServiceNames flattens the detected changes into a unique list of service names.
+func (d *DeploymentState) changedServiceNames() []string {
+	if d == nil {
+		return nil
+	}
+
+	var names []string
+	for _, change := range d.changedServices {
+		names = append(names, change.Services...)
+	}
+
+	names = slice.Unique(names)
+	slices.Sort(names)
+
+	return names
 }
 
 // StageManager is the main structure that holds the logger and stage data.
@@ -255,11 +276,57 @@ func (s *StageManager) NotifyFailure(notifyErr error) {
 		metadata.Repository = s.Repository.Name
 		metadata.Stack = s.DeployConfig.Name
 		metadata.Context = s.DeployConfig.Context
+		metadata.Target = s.DeployConfig.Internal.ConfigTarget
 		metadata.Revision = revision
 		metadata.JobID = s.JobID
+		metadata.ChangedServices = s.DeployState.changedServiceNames()
+
+		if !s.Stages.Init.StartedAt.IsZero() {
+			metadata.Duration = time.Since(s.Stages.Init.StartedAt).Truncate(time.Millisecond)
+		}
 
 		s.NotifyFailureFunc(s.Log, notifyErr, metadata)
 	}
+}
+
+func (s *StageManager) NotifyDeploymentStarted() error {
+	var (
+		latestCommit string
+		commitErr    error
+		commitSha    string
+	)
+
+	if s.Repository.Git != nil {
+		latestCommit, commitErr = gitInternal.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
+		if commitErr == nil {
+			commitSha, commitErr = gitInternal.GetShortestUniqueCommitHash(s.Repository.Git, latestCommit, gitInternal.DefaultShortSHALength)
+			if commitErr != nil {
+				commitSha = latestCommit
+			}
+		}
+	}
+
+	if s.Repository.Git == nil {
+		commitSha = strings.TrimSpace(s.Repository.Revision)
+	}
+
+	revision := notification.GetRevision(s.DeployConfig.Reference, commitSha)
+
+	metadata := s.Metadata
+	metadata.Repository = s.Repository.Name
+	metadata.Stack = s.DeployConfig.Name
+	metadata.Context = s.DeployConfig.Context
+	metadata.Target = s.DeployConfig.Internal.ConfigTarget
+	metadata.Revision = revision
+	metadata.JobID = s.JobID
+	metadata.ChangedServices = s.DeployState.changedServiceNames()
+
+	return notification.Send(
+		notification.Info,
+		"Deployment started",
+		"Starting deployment of stack "+s.DeployConfig.Name,
+		metadata,
+	)
 }
 
 // resolveCommitSHA returns the full commit SHA for the current deployment.
@@ -280,8 +347,8 @@ func (s *StageManager) resolveCommitSHA() string {
 
 	// Fall back to the SHA carried in the webhook payload.
 	if s.Payload != nil {
-		sha := strings.TrimSpace(s.Payload.CommitSHA)
-		if sha != "" && sha != string(JobTriggerPoll) {
+		sha := strings.TrimSpace(s.Payload.CommitSHAString())
+		if sha != "" && s.Payload.CommitSHA != plumbing.ZeroHash {
 			return sha
 		}
 	}

@@ -10,14 +10,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/creasty/defaults"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"gopkg.in/validator.v2"
 
+	"github.com/kimdre/doco-cd/internal/common/defaults"
+	"github.com/kimdre/doco-cd/internal/common/validation"
 	"github.com/kimdre/doco-cd/internal/config"
-
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
@@ -147,6 +146,127 @@ func TestConfig_Validate_ContextTrim(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_SwarmRetention(t *testing.T) {
+	t.Parallel()
+
+	t.Run("defaults to global when unset", func(t *testing.T) {
+		t.Parallel()
+
+		dc := Config{Name: "stack-a"}
+		if err := defaults.Set(&dc); err != nil {
+			t.Fatalf("defaults: %v", err)
+		}
+
+		if err := dc.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+
+		if dc.Swarm.ConfigRetention != nil {
+			t.Fatalf("expected default swarm.config_retention to be unset (nil), got %v", dc.Swarm.ConfigRetention)
+		}
+
+		if dc.Swarm.SecretRetention != nil {
+			t.Fatalf("expected default swarm.secret_retention to be unset (nil), got %v", dc.Swarm.SecretRetention)
+		}
+
+		if got := dc.ResolveSwarmConfigRetention(3); got != 3 {
+			t.Fatalf("expected global config retention 3, got %d", got)
+		}
+
+		if got := dc.ResolveSwarmSecretRetention(4); got != 4 {
+			t.Fatalf("expected global secret retention 4, got %d", got)
+		}
+	})
+
+	t.Run("deploy overrides take precedence including zero", func(t *testing.T) {
+		t.Parallel()
+
+		dc := Config{Name: "stack-a"}
+		if err := defaults.Set(&dc); err != nil {
+			t.Fatalf("defaults: %v", err)
+		}
+
+		dc.Swarm.ConfigRetention = new(0)
+		dc.Swarm.SecretRetention = new(2)
+
+		if err := dc.Validate(); err != nil {
+			t.Fatalf("validate: %v", err)
+		}
+
+		if got := dc.ResolveSwarmConfigRetention(5); got != 0 {
+			t.Fatalf("expected deploy config retention 0 to override global, got %d", got)
+		}
+
+		if got := dc.ResolveSwarmSecretRetention(5); got != 2 {
+			t.Fatalf("expected deploy secret retention 2 to override global, got %d", got)
+		}
+	})
+
+	t.Run("allows minus one to disable pruning", func(t *testing.T) {
+		t.Parallel()
+
+		dc := Config{Name: "stack-a"}
+		if err := defaults.Set(&dc); err != nil {
+			t.Fatalf("defaults: %v", err)
+		}
+
+		dc.Swarm.ConfigRetention = new(-1)
+		dc.Swarm.SecretRetention = new(-1)
+
+		if err := dc.Validate(); err != nil {
+			t.Fatalf("expected -1 to be valid, got %v", err)
+		}
+
+		if got := dc.ResolveSwarmConfigRetention(3); got != -1 {
+			t.Fatalf("expected deploy config retention -1 to override global, got %d", got)
+		}
+
+		if got := dc.ResolveSwarmSecretRetention(4); got != -1 {
+			t.Fatalf("expected deploy secret retention -1 to override global, got %d", got)
+		}
+	})
+
+	t.Run("rejects config retention less than minus one", func(t *testing.T) {
+		t.Parallel()
+
+		dc := Config{Name: "stack-a"}
+		if err := defaults.Set(&dc); err != nil {
+			t.Fatalf("defaults: %v", err)
+		}
+
+		dc.Swarm.ConfigRetention = new(-2)
+
+		err := dc.Validate()
+		if err == nil {
+			t.Fatal("expected validation error, got nil")
+		}
+
+		if !strings.Contains(err.Error(), "swarm.config_retention must be >= -1") {
+			t.Fatalf("expected swarm.config_retention validation error, got %v", err)
+		}
+	})
+
+	t.Run("rejects secret retention less than minus one", func(t *testing.T) {
+		t.Parallel()
+
+		dc := Config{Name: "stack-a"}
+		if err := defaults.Set(&dc); err != nil {
+			t.Fatalf("defaults: %v", err)
+		}
+
+		dc.Swarm.SecretRetention = new(-2)
+
+		err := dc.Validate()
+		if err == nil {
+			t.Fatal("expected validation error, got nil")
+		}
+
+		if !strings.Contains(err.Error(), "swarm.secret_retention must be >= -1") {
+			t.Fatalf("expected swarm.secret_retention validation error, got %v", err)
+		}
+	})
+}
+
 func TestGetConfigs_MissingDefaultConfigFile(t *testing.T) {
 	t.Parallel()
 
@@ -254,7 +374,7 @@ func TestGetConfigs_RepositoryURL(t *testing.T) {
 				RepositoryUrl: tc.repoUrl,
 			}
 
-			err := validator.Validate(dc)
+			err := validation.Validate(dc)
 			if err == nil && tc.expectedErr != nil {
 				t.Fatalf("expected error %v, got nil", tc.expectedErr)
 			}

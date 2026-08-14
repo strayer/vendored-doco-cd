@@ -17,14 +17,15 @@ import (
 	"github.com/avast/retry-go/v5"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/moby/moby/api/types/container"
+
+	"github.com/kimdre/doco-cd/internal/common/id"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
 
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
-	"github.com/kimdre/doco-cd/internal/utils/id"
-
 	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
@@ -99,7 +100,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "Successful Deployment",
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
-				CommitSHA: validCommitSHA,
+				CommitSHA: plumbing.NewHash(validCommitSHA),
 				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
@@ -114,7 +115,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "Successful Deployment with custom Target",
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
-				CommitSHA: "f291bfca73b06814293c1f9c9f3c7f95e4932564",
+				CommitSHA: plumbing.NewHash("f291bfca73b06814293c1f9c9f3c7f95e4932564"),
 				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
@@ -129,7 +130,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "Invalid Reference",
 			payload: webhook.ParsedPayload{
 				Ref:       invalidBranch,
-				CommitSHA: validCommitSHA,
+				CommitSHA: plumbing.NewHash(validCommitSHA),
 				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
@@ -144,7 +145,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "Private Repository",
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
-				CommitSHA: validCommitSHA,
+				CommitSHA: plumbing.NewHash(validCommitSHA),
 				Name:      "doco-cd",
 				FullName:  "kimdre/doco-cd",
 				CloneURL:  "https://github.com/kimdre/doco-cd",
@@ -159,7 +160,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "Missing Deployment Configuration",
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
-				CommitSHA: "efefb4111f3c363692a2526f9be9b24560e6511f",
+				CommitSHA: plumbing.NewHash("efefb4111f3c363692a2526f9be9b24560e6511f"),
 				Name:      "kimdre",
 				FullName:  "kimdre/kimdre",
 				CloneURL:  "https://github.com/kimdre/kimdre",
@@ -174,7 +175,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "With Remote Repository",
 			payload: webhook.ParsedPayload{
 				Ref:       "remote",
-				CommitSHA: "d02f87d2a886d6bae4673409f6b5108b45156f5c",
+				CommitSHA: plumbing.NewHash("d02f87d2a886d6bae4673409f6b5108b45156f5c"),
 				Name:      "doco-cd_tests",
 				FullName:  "kimdre/doco-cd_tests",
 				CloneURL:  "https://github.com/kimdre/doco-cd_tests",
@@ -189,7 +190,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "With Swarm Mode",
 			payload: webhook.ParsedPayload{
 				Ref:       git.SwarmModeBranch,
-				CommitSHA: "01435dad4e7ff8f7da70202ca1ca77bccca9eb62",
+				CommitSHA: plumbing.NewHash("01435dad4e7ff8f7da70202ca1ca77bccca9eb62"),
 				Name:      "doco-cd_tests",
 				FullName:  "kimdre/doco-cd_tests",
 				CloneURL:  "https://github.com/kimdre/doco-cd_tests",
@@ -313,7 +314,7 @@ func TestHandleEvent(t *testing.T) {
 			metadata := notification.Metadata{
 				JobID:      jobID,
 				Repository: git.GetRepoName(tc.payload.CloneURL),
-				Revision:   notification.GetRevision(tc.payload.Ref, tc.payload.CommitSHA),
+				Revision:   notification.GetRevision(tc.payload.Ref, tc.payload.CommitSHAString()),
 			}
 
 			err = retry.New(
@@ -335,6 +336,11 @@ func TestHandleEvent(t *testing.T) {
 					dockerCli,
 					&secretProvider,
 					stackName,
+					newDeploymentRunTracker(map[deploymentRunTrigger]int{
+						deploymentRunTriggerWebhook:      10,
+						deploymentRunTriggerPoll:         10,
+						deploymentRunTriggerScheduledJob: 10,
+					}),
 				)
 
 				expectedReturnMessage := fmt.Sprintf(tc.expectedResponseBody, jobID, filepath.Join(tmpDir, git.GetRepoName(tc.payload.CloneURL)), stackName) + "\n"
@@ -470,6 +476,148 @@ func TestCreateMountpointSymlink(t *testing.T) {
 
 			if link != destination {
 				t.Errorf("symlink destination: got %v, want %v", link, destination)
+			}
+		})
+	}
+}
+
+func TestResolveDataMountPointUsesExplicitHostPath(t *testing.T) {
+	detectionCalled := false
+
+	mountPoint, err := resolveDataMountPoint(
+		"/srv/doco-cd",
+		"/data",
+		func() (container.MountPoint, error) {
+			detectionCalled = true
+
+			return container.MountPoint{}, errors.New("mount point detection must not be called")
+		},
+	)
+	if err != nil {
+		t.Fatalf("expected explicit host path to resolve, got %v", err)
+	}
+
+	if detectionCalled {
+		t.Fatal("expected explicit host path to bypass mount point detection")
+	}
+
+	expected := container.MountPoint{
+		Type:        "bind",
+		Source:      "/srv/doco-cd",
+		Destination: "/data",
+		Mode:        "rw",
+		RW:          true,
+	}
+	if mountPoint != expected {
+		t.Fatalf("expected mount point %+v, got %+v", expected, mountPoint)
+	}
+}
+
+func TestResolveDataMountPointWithoutHostPath(t *testing.T) {
+	expected := container.MountPoint{
+		Type:        "volume",
+		Source:      "/var/lib/docker/volumes/doco-cd/_data",
+		Destination: "/data",
+		Mode:        "rw",
+		RW:          true,
+	}
+	testCases := []struct {
+		name         string
+		detectionErr error
+	}{
+		{name: "uses automatic detection"},
+		{name: "returns detection error", detectionErr: errors.New("container unavailable on daemon")},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			detectionCalled := false
+
+			mountPoint, err := resolveDataMountPoint(
+				"",
+				"/data",
+				func() (container.MountPoint, error) {
+					detectionCalled = true
+
+					return expected, testCase.detectionErr
+				},
+			)
+			if !errors.Is(err, testCase.detectionErr) {
+				t.Fatalf("expected error %v, got %v", testCase.detectionErr, err)
+			}
+
+			if !detectionCalled {
+				t.Fatal("expected empty host path to use automatic mount point detection")
+			}
+
+			if testCase.detectionErr == nil && mountPoint != expected {
+				t.Fatalf("expected mount point %+v, got %+v", expected, mountPoint)
+			}
+		})
+	}
+}
+
+func TestDetectDataMountPoint(t *testing.T) {
+	const containerID = "doco-cd-container"
+
+	expectedMountPoint := container.MountPoint{
+		Source:      "/srv/doco-cd-data",
+		Destination: "/data",
+		RW:          true,
+	}
+	lookupErr := errors.New("container ID unavailable")
+	inspectionErr := errors.New("container unavailable on daemon")
+	testCases := []struct {
+		name               string
+		lookupErr          error
+		inspectionErr      error
+		expectedErr        error
+		expectedErrMessage string
+	}{
+		{name: "returns detected mount point"},
+		{
+			name:               "wraps container lookup error",
+			lookupErr:          lookupErr,
+			expectedErr:        lookupErr,
+			expectedErrMessage: "failed to retrieve doco-cd container id",
+		},
+		{
+			name:               "wraps mount inspection error",
+			inspectionErr:      inspectionErr,
+			expectedErr:        inspectionErr,
+			expectedErrMessage: "failed to retrieve /data mount point for container doco-cd-container",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			mountPoint, err := detectDataMountPoint(
+				"/data",
+				func() (string, error) {
+					return containerID, testCase.lookupErr
+				},
+				func(gotContainerID, destination string) (container.MountPoint, error) {
+					if gotContainerID != containerID {
+						t.Fatalf("expected container ID %q, got %q", containerID, gotContainerID)
+					}
+
+					if destination != "/data" {
+						t.Fatalf("expected destination %q, got %q", "/data", destination)
+					}
+
+					return expectedMountPoint, testCase.inspectionErr
+				},
+			)
+			if !errors.Is(err, testCase.expectedErr) {
+				t.Fatalf("expected error %v, got %v", testCase.expectedErr, err)
+			}
+
+			if testCase.expectedErrMessage != "" && !strings.Contains(err.Error(), testCase.expectedErrMessage) {
+				t.Fatalf("expected error to contain %q, got %v", testCase.expectedErrMessage, err)
+			}
+
+			if testCase.expectedErr == nil && mountPoint != expectedMountPoint {
+				t.Fatalf("expected mount point %+v, got %+v", expectedMountPoint, mountPoint)
 			}
 		})
 	}

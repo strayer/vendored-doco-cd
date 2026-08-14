@@ -15,6 +15,8 @@ import (
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/id"
+
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 
@@ -23,7 +25,6 @@ import (
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/logger"
-	"github.com/kimdre/doco-cd/internal/utils/id"
 )
 
 const reconciliationTraceIDAttr = "doco_cd_reconciliation_trace_id"
@@ -161,15 +162,43 @@ func (j *job) run(ctx context.Context) {
 	// Fan-in Docker events from all contexts into a single channel processed serially.
 	// The buffer absorbs short bursts from multiple daemons without backpressure.
 	mergedCh := make(chan contextualEvent, 256)
+	listenerReadyCh := make(chan struct{}, len(j.contextCLIs))
+	expectedListeners := 0
 
 	for ctxName, entry := range j.contextCLIs {
+		if len(j.deployConfigsForContext(ctxName)) == 0 {
+			continue
+		}
+
+		expectedListeners++
+
 		listenerWG.Add(1)
 
 		go func(ctxName string, entry contextCLIEntry) {
 			defer listenerWG.Done()
 
-			j.runContextEventListener(ctx, jobLog, ctxName, entry, mergedCh)
+			j.runContextEventListener(ctx, jobLog, ctxName, entry, mergedCh, listenerReadyCh)
 		}(ctxName, entry)
+	}
+
+	if expectedListeners == 0 {
+		j.signalReady()
+	} else {
+		go func() {
+			ready := 0
+			for ready < expectedListeners {
+				select {
+				case <-ctx.Done():
+					return
+				case <-j.closeChan:
+					return
+				case <-listenerReadyCh:
+					ready++
+				}
+			}
+
+			j.signalReady()
+		}()
 	}
 
 	for {
@@ -190,7 +219,7 @@ func (j *job) run(ctx context.Context) {
 
 // runContextEventListener connects to the Docker daemon for entry, listens for relevant events,
 // forwards them (tagged with contextName) to out, and automatically reconnects on disconnection.
-func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, contextName string, entry contextCLIEntry, out chan<- contextualEvent) {
+func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, contextName string, entry contextCLIEntry, out chan<- contextualEvent, ready chan<- struct{}) {
 	repositoryLabelValue := gitInternal.GetFullName(j.info.repoData.SourceUrl)
 	if j.info.payload != nil && strings.TrimSpace(j.info.payload.FullName) != "" {
 		repositoryLabelValue = j.info.payload.FullName
@@ -219,6 +248,7 @@ func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, 
 	}
 
 	eventSinceCursor := time.Now().UTC().Add(-reconciliationSinceSafetySkew)
+	readySignaled := false
 
 	const reconnectDelay = 5 * time.Second
 
@@ -237,6 +267,12 @@ func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, 
 			Filters: filterArgs,
 			Since:   dockerEventsSinceValue(eventSinceCursor),
 		})
+
+		if !readySignaled {
+			readySignaled = true
+
+			ready <- struct{}{}
+		}
 
 		reconnect, newestEventTime := j.forwardEvents(ctx, jobLog, eventResult.Messages, eventResult.Err, contextName, out)
 
@@ -386,6 +422,16 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		jobLog.Debug("suppressing reconciliation event while stack deployment is in progress",
 			slog.String("event", action),
 			slog.String("stack", stackName),
+		)
+
+		return
+	}
+
+	if reconciliationHandler.isServiceSchedulerStopHeld(event.Actor.Attributes) {
+		jobLog.Debug("suppressing reconciliation event for service intentionally held stopped by job scheduler",
+			slog.String("event", action),
+			slog.String("stack", stackName),
+			slog.String("container_name", event.Actor.Attributes["name"]),
 		)
 
 		return

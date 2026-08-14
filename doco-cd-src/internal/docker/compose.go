@@ -3,6 +3,7 @@ package docker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,18 +19,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-git/go-git/v5/plumbing/format/diff"
+
+	"github.com/kimdre/doco-cd/internal/common/module"
+	"github.com/kimdre/doco-cd/internal/common/types/set"
+	"github.com/kimdre/doco-cd/internal/common/types/slice"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/docker/registryauth"
+	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 	"github.com/kimdre/doco-cd/internal/lock"
-	"github.com/kimdre/doco-cd/internal/utils/module"
-
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
-	"github.com/kimdre/doco-cd/internal/utils/set"
-	"github.com/kimdre/doco-cd/internal/utils/slice"
-
-	"github.com/go-git/go-git/v5/plumbing/format/diff"
 
 	"github.com/moby/moby/client"
 
@@ -44,6 +45,7 @@ import (
 	swarmTypes "github.com/moby/moby/api/types/swarm"
 
 	"github.com/kimdre/doco-cd/internal/prometheus"
+	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
@@ -137,7 +139,7 @@ This is required for future compose operations to work, such as finding
 containers that are part of a service.
 */
 func addComposeServiceLabels(project *types.Project, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
-	workingDir, appVersion, timestamp, composeVersion, latestCommit, projectHash string,
+	workingDir, appVersion, timestamp, composeVersion, latestCommit, projectHash, externalSecretsJSON string,
 ) {
 	for i, s := range project.Services {
 		// Extract service dependencies (depends_on)
@@ -156,7 +158,7 @@ func addComposeServiceLabels(project *types.Project, deployConfig *deploy.Config
 			DocoCDLabels.Deployment.ComposeHash:         projectHash,
 			DocoCDLabels.Deployment.WorkingDir:          workingDir,
 			DocoCDLabels.Deployment.ConfigTarget:        deployConfig.Internal.ConfigTarget,
-			DocoCDLabels.Deployment.Trigger:             payload.CommitSHA,
+			DocoCDLabels.Deployment.Trigger:             payload.TriggerString(),
 			DocoCDLabels.Deployment.CommitSHA:           latestCommit,
 			DocoCDLabels.Deployment.TargetRef:           ExtractOciArtifactTag(deployConfig.Reference),
 			DocoCDLabels.Deployment.ConfigHash:          deployConfig.Internal.Hash,
@@ -173,6 +175,11 @@ func addComposeServiceLabels(project *types.Project, deployConfig *deploy.Config
 			api.OneoffLabel:                             "False", // default, will be overridden by docker compose
 			api.DependenciesLabel:                       strings.Join(dependencies, ","),
 		}
+
+		if externalSecretsJSON != "" {
+			s.CustomLabels[DocoCDJobLabels.JobExternalSecretRefs] = externalSecretsJSON
+		}
+
 		project.Services[i] = s
 	}
 }
@@ -187,7 +194,7 @@ func addComposeVolumeLabels(project *types.Project, deployConfig *deploy.Config,
 			DocoCDLabels.Deployment.Name:         deployConfig.Name,
 			DocoCDLabels.Deployment.Timestamp:    timestamp,
 			DocoCDLabels.Deployment.ComposeHash:  projectHash,
-			DocoCDLabels.Deployment.Trigger:      payload.CommitSHA,
+			DocoCDLabels.Deployment.Trigger:      payload.TriggerString(),
 			DocoCDLabels.Deployment.ConfigTarget: deployConfig.Internal.ConfigTarget,
 			DocoCDLabels.Deployment.TargetRef:    ExtractOciArtifactTag(deployConfig.Reference),
 			DocoCDLabels.Deployment.CommitSHA:    latestCommit,
@@ -230,7 +237,8 @@ func hasIPv6NetworkWithoutExplicitSubnet(project *types.Project) bool {
 }
 
 // LoadCompose parses and loads Compose files as specified by the Docker Compose specification.
-func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, composeFiles,
+// dockerCli is required to load OCI artifact includes.
+func LoadCompose(ctx context.Context, dockerCli command.Cli, repoPath, workingDir, projectName string, composeFiles,
 	envFiles, profiles []string, environment map[string]string,
 ) (*types.Project, error) {
 	// Resolve compose file paths to absolute paths relative to workingDir.
@@ -296,14 +304,23 @@ func LoadCompose(ctx context.Context, repoPath, workingDir, projectName string, 
 		}
 	}
 
-	options, err := cli.NewProjectOptions(
-		absComposeFiles,
+	projectOptions := []cli.ProjectOptionsFn{
 		cli.WithName(projectName),
 		cli.WithWorkingDirectory(workingDir),
 		cli.WithInterpolation(true),
 		cli.WithResolvedPaths(true),
 		cli.WithEnvFiles(absEnvFiles...), // env files for variable interpolation
 		cli.WithProfiles(profiles),
+	}
+
+	// Remote include support (Git repositories and OCI artifacts).
+	for _, remoteLoader := range newRemoteResourceLoaders(c, dockerCli, repoPath) {
+		projectOptions = append(projectOptions, cli.WithResourceLoader(remoteLoader))
+	}
+
+	options, err := cli.NewProjectOptions(
+		absComposeFiles,
+		projectOptions...,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create project options: %w", err)
@@ -410,6 +427,20 @@ func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Pr
 		IgnoreBuildable: true,
 	})
 	if err != nil {
+		imageRefs := make([]string, 0, len(project.Services))
+		for _, svc := range project.Services {
+			if svc.Image == "" {
+				continue
+			}
+
+			imageRefs = append(imageRefs, svc.Image)
+		}
+
+		hint := registryauth.BuildFailureHint(dockerCli.ConfigFile(), imageRefs, err)
+		if hint != "" {
+			return fmt.Errorf("failed to pull images: %w; %s", err, hint)
+		}
+
 		return fmt.Errorf("failed to pull images: %w", err)
 	}
 
@@ -582,14 +613,48 @@ func logDeploymentHeartbeat(log *slog.Logger, phase string) {
 	log.Info("deployment in progress", slog.String("phase", normalizeDeploymentPhase(phase)))
 }
 
+func deploymentRepositoryKey(payload *webhook.ParsedPayload) string {
+	if payload == nil {
+		return ""
+	}
+
+	for _, candidate := range []string{payload.CloneURL, payload.FullName, payload.Artifact} {
+		if value := strings.TrimSpace(candidate); value != "" {
+			return value
+		}
+	}
+
+	return ""
+}
+
+func resolveDeploymentMetricsRepositoryLabel(payload *webhook.ParsedPayload) string {
+	repository := normalizeRepositoryForLabelMatch(deploymentRepositoryKey(payload))
+	if repository == "" {
+		return "unknown"
+	}
+
+	return repository
+}
+
+func resolveDeploymentMetricsDeploymentLabel(deployName string) string {
+	deployment := strings.TrimSpace(deployName)
+	if deployment == "" {
+		return "unknown"
+	}
+
+	return deployment
+}
+
 // DeployStack deploys the stack using the provided deployment configuration.
 func DeployStack(
 	jobLog *slog.Logger, externalRepoPath string, ctx *context.Context,
 	dockerCli command.Cli, payload *webhook.ParsedPayload, deployConfig *deploy.Config,
 	detectedChanges []Change, needSignal []SignalService, latestCommit, appVersion string,
-	swarmMode bool,
+	globalSwarmConfigRetention int, globalSwarmSecretRetention int, swarmMode bool,
 ) error {
 	startTime := time.Now()
+	repositoryLabel := resolveDeploymentMetricsRepositoryLabel(payload)
+	deploymentLabel := resolveDeploymentMetricsDeploymentLabel(deployConfig.Name)
 
 	stackLog := jobLog.
 		With(slog.String("stack", deployConfig.Name))
@@ -616,7 +681,7 @@ func DeployStack(
 
 	deploymentPhase.Set("loading compose configuration")
 
-	project, err := LoadCompose(*ctx, externalRepoPath, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles,
+	project, err := LoadCompose(*ctx, dockerCli, externalRepoPath, externalWorkingDir, deployConfig.Name, deployConfig.ComposeFiles,
 		deployConfig.EnvFiles, deployConfig.Profiles, deployConfig.Internal.Environment)
 	if err != nil {
 		return fmt.Errorf("failed to load compose config: %w", err)
@@ -662,6 +727,9 @@ func DeployStack(
 
 	// When SwarmModeEnabled is true, we deploy the stack using Docker Swarm.
 	if swarmMode {
+		swarmConfigRetention := deployConfig.ResolveSwarmConfigRetention(globalSwarmConfigRetention)
+		swarmSecretRetention := deployConfig.ResolveSwarmSecretRetention(globalSwarmSecretRetention)
+
 		deploymentPhase.Set("deploying swarm stack")
 
 		stackLog.Info("deploying swarm stack")
@@ -672,44 +740,52 @@ func DeployStack(
 		}
 
 		addSwarmServiceLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit, projectHash)
-		addSwarmVolumeLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
+		addSwarmVolumeLabels(cfg, deployConfig, payload, externalWorkingDir)
 		addSwarmConfigLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
 		addSwarmSecretLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
 
 		if err = removeMismatchedRecreatableVolumes(*ctx, dockerCli.Client(), deployConfig.Name, project); err != nil {
-			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
+			prometheus.DeploymentErrorsTotal.WithLabelValues(repositoryLabel, deploymentLabel).Inc()
 			return fmt.Errorf("failed to remove mismatched recreatable volumes: %w", err)
 		}
 
 		err = DeploySwarmStack(*ctx, dockerCli, cfg, opts)
 		if err != nil {
-			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
+			prometheus.DeploymentErrorsTotal.WithLabelValues(repositoryLabel, deploymentLabel).Inc()
 
 			errMsg := "failed to deploy swarm stack " + deployConfig.Name
 
 			return fmt.Errorf("%s: %w", errMsg, err)
 		}
 
-		deploymentPhase.Set("pruning stack configs")
+		if swarmConfigRetention >= 0 {
+			deploymentPhase.Set("pruning stack configs")
 
-		err = PruneStackConfigs(*ctx, dockerCli.Client(), deployConfig.Name)
-		if err != nil {
-			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
+			err = PruneStackConfigs(*ctx, dockerCli.Client(), deployConfig.Name, swarmConfigRetention)
+			if err != nil {
+				prometheus.DeploymentErrorsTotal.WithLabelValues(repositoryLabel, deploymentLabel).Inc()
 
-			errMsg := "failed to prune stack configs"
+				errMsg := "failed to prune stack configs"
 
-			return fmt.Errorf("%s: %w", errMsg, err)
+				return fmt.Errorf("%s: %w", errMsg, err)
+			}
+		} else {
+			stackLog.Info("skipping swarm config prune: retention disabled", slog.Int("retention", swarmConfigRetention))
 		}
 
-		deploymentPhase.Set("pruning stack secrets")
+		if swarmSecretRetention >= 0 {
+			deploymentPhase.Set("pruning stack secrets")
 
-		err = PruneStackSecrets(*ctx, dockerCli.Client(), deployConfig.Name)
-		if err != nil {
-			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
+			err = PruneStackSecrets(*ctx, dockerCli.Client(), deployConfig.Name, swarmSecretRetention)
+			if err != nil {
+				prometheus.DeploymentErrorsTotal.WithLabelValues(repositoryLabel, deploymentLabel).Inc()
 
-			errMsg := "failed to prune stack secrets"
+				errMsg := "failed to prune stack secrets"
 
-			return fmt.Errorf("%s: %w", errMsg, err)
+				return fmt.Errorf("%s: %w", errMsg, err)
+			}
+		} else {
+			stackLog.Info("skipping swarm secret prune: retention disabled", slog.Int("retention", swarmSecretRetention))
 		}
 
 		if deployConfig.PruneImages {
@@ -719,7 +795,7 @@ func DeployStack(
 
 			err = RunImagePruneJob(*ctx, dockerCli)
 			if err != nil {
-				prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
+				prometheus.DeploymentErrorsTotal.WithLabelValues(repositoryLabel, deploymentLabel).Inc()
 
 				errMsg := "failed to run image prune job"
 
@@ -727,7 +803,25 @@ func DeployStack(
 			}
 		}
 	} else {
-		addComposeServiceLabels(project, deployConfig, payload, externalWorkingDir, appVersion, timestamp, ComposeVersion, latestCommit, projectHash)
+		// Encode external secret refs (just the references, not resolved values) into a JSON label
+		// so the scheduler can re-resolve them at run time for environment-backed compose secrets.
+		var externalSecretsJSON string
+
+		if len(deployConfig.ExternalSecrets) > 0 {
+			encodedRefs, encErr := secrettypes.EncodeExternalSecretRefs(deployConfig.ExternalSecrets)
+			if encErr != nil {
+				return fmt.Errorf("failed to encode external secret refs for label: %w", encErr)
+			}
+
+			b, marshalErr := json.Marshal(encodedRefs)
+			if marshalErr != nil {
+				return fmt.Errorf("failed to marshal external secret refs label: %w", marshalErr)
+			}
+
+			externalSecretsJSON = string(b)
+		}
+
+		addComposeServiceLabels(project, deployConfig, payload, externalWorkingDir, appVersion, timestamp, ComposeVersion, latestCommit, projectHash, externalSecretsJSON)
 		addComposeVolumeLabels(project, deployConfig, payload, appVersion, timestamp, ComposeVersion, latestCommit, projectHash)
 
 		forcedServices := set.New[string]() // services to recreate if project files changed
@@ -766,7 +860,7 @@ func DeployStack(
 		err = deployCompose(*ctx, dockerCli, project, deployConfig, recreateMode,
 			forcedServices.ToSlice(), needSignal, deploymentPhase.Set)
 		if err != nil {
-			prometheus.DeploymentErrorsTotal.WithLabelValues(deployConfig.Name).Inc()
+			prometheus.DeploymentErrorsTotal.WithLabelValues(repositoryLabel, deploymentLabel).Inc()
 			return fmt.Errorf("failed to deploy stack: %w", err)
 		}
 	}
@@ -774,14 +868,7 @@ func DeployStack(
 	deploymentPhase.Set("finalizing deployment status")
 
 	// cache the deployment status after successful deployment
-	repositoryKey := strings.TrimSpace(payload.CloneURL)
-	if repositoryKey == "" {
-		repositoryKey = strings.TrimSpace(payload.FullName)
-	}
-
-	if repositoryKey == "" {
-		repositoryKey = strings.TrimSpace(payload.Artifact)
-	}
+	repositoryKey := deploymentRepositoryKey(payload)
 
 	setDeployStatusToCache(gitInternal.GetRepoName(repositoryKey), deployConfig.Name,
 		deployStatus{
@@ -790,8 +877,8 @@ func DeployStack(
 		},
 	)
 
-	prometheus.DeploymentsTotal.WithLabelValues(deployConfig.Name).Inc()
-	prometheus.DeploymentDuration.WithLabelValues(deployConfig.Name).Observe(time.Since(startTime).Seconds())
+	prometheus.DeploymentsTotal.WithLabelValues(repositoryLabel, deploymentLabel).Inc()
+	prometheus.DeploymentDuration.WithLabelValues(repositoryLabel, deploymentLabel).Observe(time.Since(startTime).Seconds())
 
 	return nil
 }
@@ -1339,6 +1426,109 @@ func StopProject(ctx context.Context, dockerCli command.Cli, projectName string,
 	})
 }
 
+// StopProjectServices stops specific named services within a compose project.
+// Services are identified by their service name as declared in the compose file
+// (the map key under `services:`), not by container_name.
+//
+// Containers are stopped directly via the Docker API (instead of compose Stop
+// with a services filter) to ensure only explicitly targeted services are
+// affected, without implicit dependency traversal.
+//
+// This is best-effort: if stopping one container fails, the remaining
+// containers are still attempted, and all failures are aggregated into the
+// returned error.
+func StopProjectServices(ctx context.Context, dockerCli command.Cli, projectName string, services []string, timeout time.Duration) error {
+	if len(services) == 0 {
+		return nil
+	}
+
+	serviceSet := make(map[string]struct{}, len(services))
+	for _, s := range services {
+		serviceSet[s] = struct{}{}
+	}
+
+	containers, err := GetLabeledContainers(ctx, dockerCli.Client(), api.ProjectLabel, projectName, true)
+	if err != nil {
+		return fmt.Errorf("failed to list containers for project %q: %w", projectName, err)
+	}
+
+	timeoutSecs := int(timeout.Seconds())
+
+	stopOpts := client.ContainerStopOptions{}
+	if timeoutSecs > 0 {
+		stopOpts.Timeout = &timeoutSecs
+	}
+
+	var errs []string
+
+	for _, c := range containers {
+		svcName := c.Labels[api.ServiceLabel]
+		if _, ok := serviceSet[svcName]; !ok {
+			continue
+		}
+
+		if string(c.State) != "running" {
+			continue
+		}
+
+		if _, err := dockerCli.Client().ContainerStop(ctx, c.ID, stopOpts); err != nil {
+			errs = append(errs, fmt.Sprintf("container %s (service %q): %v", c.ID[:12], svcName, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to stop %d container(s): %s", len(errs), strings.Join(errs, "; "))
+	}
+
+	return nil
+}
+
+// StartProjectServices starts specific named services within a compose project.
+// Services are identified by their service name as declared in the compose file
+// (the map key under `services:`), not by container_name.
+//
+// Note: the compose Start API ignores StartOptions.Services, so containers are
+// looked up directly by the com.docker.compose.project and com.docker.compose.service
+// labels and started individually.
+//
+// This is best-effort: if starting one container fails, the remaining
+// containers are still attempted, and all failures are aggregated into the
+// returned error.
+func StartProjectServices(ctx context.Context, dockerCli command.Cli, projectName string, services []string) error {
+	if len(services) == 0 {
+		return nil
+	}
+
+	serviceSet := make(map[string]struct{}, len(services))
+	for _, s := range services {
+		serviceSet[s] = struct{}{}
+	}
+
+	containers, err := GetLabeledContainers(ctx, dockerCli.Client(), api.ProjectLabel, projectName, true)
+	if err != nil {
+		return fmt.Errorf("failed to list containers for project %q: %w", projectName, err)
+	}
+
+	var errs []string
+
+	for _, c := range containers {
+		svcName := c.Labels[api.ServiceLabel]
+		if _, ok := serviceSet[svcName]; !ok {
+			continue
+		}
+
+		if _, err := dockerCli.Client().ContainerStart(ctx, c.ID, client.ContainerStartOptions{}); err != nil {
+			errs = append(errs, fmt.Sprintf("container %s (service %q): %v", c.ID[:12], svcName, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("failed to start %d container(s): %s", len(errs), strings.Join(errs, "; "))
+	}
+
+	return nil
+}
+
 // StartProject starts all services in the specified project.
 func StartProject(ctx context.Context, dockerCli command.Cli, projectName string, timeout time.Duration) error {
 	service, err := compose.NewComposeService(dockerCli)
@@ -1766,7 +1956,7 @@ func getServiceSchedulerLabels(svc types.ServiceConfig) map[string]string {
 		return svc.Labels
 	}
 
-	labels := make(map[string]string, len(svc.Labels)+len(svc.CustomLabels))
+	labels := make(map[string]string, len(svc.Labels))
 	maps.Copy(labels, svc.Labels)
 
 	maps.Copy(labels, svc.CustomLabels)

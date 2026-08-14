@@ -10,6 +10,15 @@ import (
 	"github.com/opencontainers/go-digest"
 )
 
+// isScaledToZero reports whether a service is configured to run 0 replicas
+// ("scale: 0" / "deploy.replicas: 0"). Services scaled to zero never produce
+// a container (or, in Swarm mode, never produce running tasks for
+// replicated/replicated-job services), so their absence from the deployed
+// state is expected and must not be treated as drift.
+func isScaledToZero(svc types.ServiceConfig) bool {
+	return svc.GetScale() == 0
+}
+
 // deepCopy recursively copies src into dst using reflection.
 func deepCopy(dst, src reflect.Value) {
 	switch src.Kind() {
@@ -73,7 +82,7 @@ func copyProject(orig *types.Project) *types.Project {
 // should therefore be included in the project hash for redeploy detection.
 // All other cd.doco.* labels (metadata, timestamps, …) are excluded.
 var behaviorLabelPrefixes = []string{
-	"cd.doco.job.",
+	jobLabelPrefix,
 	"cd.doco.deployment.recreate.",
 }
 
@@ -98,6 +107,13 @@ func shouldIgnoreLabelInProjectHash(label string) bool {
 // ProjectHash generates a SHA256 hash of the project configuration to be used for detecting changes in the project that may require a redeployment.
 func ProjectHash(p *types.Project) (string, error) {
 	pCopy := copyProject(p)
+
+	// Services scaled to zero never create containers, so they must not affect restart-time hash checks.
+	for name, svc := range pCopy.Services {
+		if isScaledToZero(svc) {
+			delete(pCopy.Services, name)
+		}
+	}
 
 	// Only behavior-configuring labels should impact redeploy decisions.
 	for name := range pCopy.Services {

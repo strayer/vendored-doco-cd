@@ -7,10 +7,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"text/template"
+	"time"
+
+	"github.com/kimdre/doco-cd/internal/git"
 )
 
 type level int
@@ -44,6 +48,14 @@ var (
 	appriseTemplate    *template.Template // template rendering the notification body; defaults to defaultTemplate
 )
 
+const (
+	maxAppriseErrorResponseBodyBytes = 4 * 1024
+	redactedURL                      = "[REDACTED_URL]"
+	redactedValue                    = "[REDACTED]"
+)
+
+var urlLikePattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s,"]+`)
+
 // defaultTemplate reproduces the built-in notification body (message followed by
 // sorted metadata). It is used whenever no APPRISE_NOTIFY_BODY_TEMPLATE is configured.
 // The heavy lifting lives in TemplateData.DefaultBody, which is also exposed to
@@ -68,6 +80,7 @@ type Metadata struct {
 	Repository          string
 	Stack               string
 	Context             string // Docker context the stack is deployed to (empty = default context)
+	Target              string // Custom webhook/poll target suffix (e.g., "prod-vm" for .doco-cd.prod-vm.yml)
 	Revision            string
 	JobID               string
 	TraceID             string
@@ -75,6 +88,9 @@ type Metadata struct {
 	AffectedActorKind   string
 	AffectedActorID     string
 	AffectedActorName   string
+	Commits             []git.CommitInfo // commits deployed since the last deploy; empty on first deploy/failure/OCI
+	Duration            time.Duration    // time from job start to the notification; zero when no deploy/destroy ran
+	ChangedServices     []string         // services force-recreated by this deploy; empty when the whole stack is (re)deployed
 }
 
 // TemplateData is the data exposed to a user-configured notification body template.
@@ -109,6 +125,11 @@ func validateTemplate(tmpl string) (*template.Template, error) {
 		Metadata: Metadata{
 			Repository: "github.com/acme/app", Stack: "app", Context: "default",
 			Revision: "refs/heads/main (abc123)", JobID: "sample",
+			Commits: []git.CommitInfo{
+				{Hash: "abc123", ShortHash: "abc123", Subject: "sample commit", Author: "Jane Doe"},
+			},
+			Duration:        42 * time.Second,
+			ChangedServices: []string{"app"},
 		},
 	}
 	if err := t.Execute(io.Discard, sample); err != nil {
@@ -156,11 +177,9 @@ func send(apiUrl, notifyUrls, title, message, level string) error {
 	}
 
 	defer func() {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}()
-
-	// Drain the body so the underlying transport can safely reuse the connection.
-	_, _ = io.Copy(io.Discard, resp.Body)
 
 	switch resp.StatusCode {
 	case http.StatusOK:
@@ -168,10 +187,185 @@ func send(apiUrl, notifyUrls, title, message, level string) error {
 	case http.StatusNoContent:
 		return nil
 	case http.StatusFailedDependency:
-		return ErrNotifyFailed
+		return fmt.Errorf("%w: apprise request failed with status: %s%s", ErrNotifyFailed, resp.Status, appriseResponseErrorDetails(resp))
 	default:
-		return fmt.Errorf("apprise request failed with status: %s", resp.Status)
+		return fmt.Errorf("apprise request failed with status: %s%s", resp.Status, appriseResponseErrorDetails(resp))
 	}
+}
+
+// appriseResponseErrorDetails reads the response body of an Apprise request and extracts error details, redacting sensitive information.
+// It returns a string containing the error message and the redacted response body, or an empty string if no details are available.
+func appriseResponseErrorDetails(resp *http.Response) string {
+	if resp.Body == nil {
+		return ""
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAppriseErrorResponseBodyBytes+1))
+	if err != nil {
+		return fmt.Sprintf(", failed to read response body: %v", err)
+	}
+
+	truncated := len(raw) > maxAppriseErrorResponseBodyBytes
+	if truncated {
+		raw = raw[:maxAppriseErrorResponseBodyBytes]
+	}
+
+	trimmedRaw := strings.TrimSpace(string(raw))
+	if trimmedRaw == "" {
+		return ""
+	}
+
+	parsedMessage, redactedBody := appriseErrorMessageAndBody(trimmedRaw)
+	if truncated {
+		redactedBody += " (truncated)"
+	}
+
+	if parsedMessage == "" {
+		return ", response body: " + redactedBody
+	}
+
+	return fmt.Sprintf(", error: %s, response body: %s", parsedMessage, redactedBody)
+}
+
+// appriseErrorMessageAndBody takes a raw JSON string from an Apprise response, attempts to parse it,
+// and extracts a preferred error message while redacting sensitive information.
+// It returns the extracted error message and the redacted JSON body as strings.
+// If parsing fails, it returns an empty error message and the redacted raw string.
+func appriseErrorMessageAndBody(raw string) (string, string) {
+	var payload any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return "", redactSensitiveText(raw)
+	}
+
+	redacted := redactJSONValue(payload, "")
+
+	bodyBytes, err := json.Marshal(redacted)
+	if err != nil {
+		return "", redactSensitiveText(raw)
+	}
+
+	errorMessage := strings.TrimSpace(extractAppriseErrorMessage(redacted))
+	if errorMessage != "" {
+		errorMessage = redactSensitiveText(errorMessage)
+	}
+
+	return errorMessage, string(bodyBytes)
+}
+
+func extractAppriseErrorMessage(v any) string {
+	msg := extractPreferredErrorMessage(v)
+	if msg == "" {
+		return ""
+	}
+
+	return strings.Join(strings.Fields(msg), " ")
+}
+
+// extractPreferredErrorMessage recursively traverses a JSON-like structure (maps and slices) to find the first
+// non-empty string value associated with preferred keys such as "error", "message", "detail", "description", or "reason".
+// It returns the first found message or an empty string if none are found.
+func extractPreferredErrorMessage(v any) string {
+	switch typed := v.(type) {
+	case map[string]any:
+		preferred := []string{"error", "message", "detail", "description", "reason"}
+		for _, key := range preferred {
+			val, ok := typed[key]
+			if !ok {
+				continue
+			}
+
+			if s := extractStringOrNestedMessage(val); s != "" {
+				return s
+			}
+		}
+
+		for _, val := range typed {
+			if s := extractPreferredErrorMessage(val); s != "" {
+				return s
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if s := extractPreferredErrorMessage(item); s != "" {
+				return s
+			}
+		}
+	}
+
+	return ""
+}
+
+// extractStringOrNestedMessage takes a value of any type and attempts to extract a string message from it.
+// If the value is a string, it trims whitespace and returns it. If it's a map or slice, it recursively calls
+// extractPreferredErrorMessage to find a nested message. For other types, it converts the value to a string.
+func extractStringOrNestedMessage(v any) string {
+	switch typed := v.(type) {
+	case string:
+		return strings.TrimSpace(typed)
+	case map[string]any, []any:
+		return extractPreferredErrorMessage(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprintf("%v", typed))
+	}
+}
+
+// redactJSONValue recursively traverses a JSON-like structure (maps and slices) and redacts sensitive information based on key names.
+// It returns a new structure with sensitive values replaced by redactedValue or redactedURL for URL-like strings.
+func redactJSONValue(v any, key string) any {
+	switch typed := v.(type) {
+	case map[string]any:
+		redacted := make(map[string]any, len(typed))
+		for k, val := range typed {
+			redacted[k] = redactJSONValue(val, k)
+		}
+
+		return redacted
+	case []any:
+		redacted := make([]any, len(typed))
+		for i := range typed {
+			redacted[i] = redactJSONValue(typed[i], key)
+		}
+
+		return redacted
+	case string:
+		if isSensitiveJSONKey(key) {
+			return redactedValue
+		}
+
+		return redactSensitiveText(typed)
+	default:
+		return typed
+	}
+}
+
+// isSensitiveJSONKey checks if a given JSON key is considered sensitive based on predefined keywords.
+// It returns true if the key contains any of the sensitive keywords, ignoring case and whitespace.
+func isSensitiveJSONKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	if k == "" {
+		return false
+	}
+
+	sensitiveKeys := []string{
+		"url", "urls", "uri", "token", "secret", "password", "pass", "credential",
+		"webhook", "target", "targets", "authorization", "auth", "api_key", "apikey",
+	}
+	for _, sensitive := range sensitiveKeys {
+		if strings.Contains(k, sensitive) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// redactSensitiveText takes a string and redacts any URL-like patterns, replacing them with redactedURL.
+// It also trims whitespace and normalizes spaces to a single space.
+func redactSensitiveText(s string) string {
+	redacted := urlLikePattern.ReplaceAllString(s, redactedURL)
+	redacted = strings.TrimSpace(redacted)
+
+	return strings.Join(strings.Fields(redacted), " ")
 }
 
 // SetAppriseConfig sets the configuration for the Apprise notification service.
@@ -295,6 +489,10 @@ func (d TemplateData) DefaultBody() string {
 
 	if m.JobID != "" && !isReconciliation {
 		fields["job_id"] = m.JobID
+	}
+
+	if m.Duration > 0 {
+		fields["duration"] = m.Duration.String()
 	}
 
 	if m.ReconciliationEvent != "" {

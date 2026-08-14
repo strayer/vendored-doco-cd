@@ -18,14 +18,14 @@ import (
 
 	"github.com/avast/retry-go/v5"
 
+	"github.com/kimdre/doco-cd/internal/common/id"
+
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
-	"github.com/kimdre/doco-cd/internal/test"
-	"github.com/kimdre/doco-cd/internal/utils/id"
-
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
+	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 
@@ -36,6 +36,7 @@ import (
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/filesystem"
@@ -111,7 +112,7 @@ func TestLoadCompose(t *testing.T) {
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(ctx, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +127,50 @@ func TestLoadCompose(t *testing.T) {
 	if len(project.Services) != 1 {
 		t.Fatalf("expected 1 service, got %d", len(project.Services))
 	}
+}
+
+// waitForSingleRunningProjectContainerID waits until exactly one running container
+// carrying the doco-cd deployment label for deployName exists, and returns its ID.
+//
+// This is deliberately more specific than GetContainerID, which matches by name
+// substring across *all* containers on the host, including stopped ones. During a
+// force_recreate deployment there is a brief window where the previous container is
+// still present (stopping/being removed) while the new one has already started; if
+// both match the substring, GetContainerID can non-deterministically return the
+// stale container's ID, causing intermittent failures when reading its (now-gone)
+// bind-mounted content. Filtering to running containers scoped by the deployment
+// label avoids that race.
+func waitForSingleRunningProjectContainerID(ctx context.Context, t *testing.T, cli client.APIClient, deployName string, timeout time.Duration) (string, error) {
+	t.Helper()
+
+	var containerID string
+
+	const pollInterval = 250 * time.Millisecond
+
+	attemptCount := max(timeout/pollInterval, 1)
+
+	attempts := uint(attemptCount) + 1 //nolint:gosec // attemptCount is clamped to be >= 1 and derived from a small test timeout
+
+	err := retry.New(
+		retry.Attempts(attempts),
+		retry.Delay(pollInterval),
+		retry.DelayType(retry.FixedDelay),
+	).Do(func() error {
+		containers, err := GetLabeledContainers(ctx, cli, DocoCDLabels.Deployment.Name, deployName, false)
+		if err != nil {
+			return err
+		}
+
+		if len(containers) != 1 {
+			return fmt.Errorf("expected exactly 1 running container for deployment %q, got %d", deployName, len(containers))
+		}
+
+		containerID = containers[0].ID
+
+		return nil
+	})
+
+	return containerID, err
 }
 
 func TestDeployCompose(t *testing.T) {
@@ -172,7 +217,7 @@ func TestDeployCompose(t *testing.T) {
 
 	p := webhook.ParsedPayload{
 		Ref:       git.MainBranch,
-		CommitSHA: "4d877107dfa2e3b582bd8f8f803befbd3a1d867e",
+		CommitSHA: plumbing.NewHash("4d877107dfa2e3b582bd8f8f803befbd3a1d867e"),
 		Name:      id.GenID(),
 		FullName:  "kimdre/doco-cd_tests",
 		CloneURL:  cloneUrlTest,
@@ -215,7 +260,7 @@ func TestDeployCompose(t *testing.T) {
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(ctx, tmpDir, tmpDir, stackName, []string{filePath}, []string{}, []string{}, map[string]string{})
+	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{}, []string{}, map[string]string{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +338,7 @@ compose_files:
 			}),
 		).Do(func() error {
 			return DeployStack(jobLog, repoPath, &ctx, dockerCli, &p, deployConf,
-				nil, nil, latestCommit, "dev", swarm.GetModeEnabled())
+				nil, nil, latestCommit, "dev", 0, 0, swarm.GetModeEnabled())
 		})
 		if err != nil {
 			t.Fatalf("failed to deploy stack: %v", err)
@@ -310,13 +355,15 @@ compose_files:
 			t.Fatal("expected at least one labeled container, got none")
 		}
 
-		containerID, err := GetContainerID(dockerCli.Client(), deployConf.Name)
+		// Use the compose project label (scoped to this stack) and only running
+		// containers to find the container ID. GetContainerID matches by name
+		// substring across *all* containers on the host (including stopped
+		// ones), which can race with force_recreate: a stale, exiting/removed
+		// container from the previous recreation cycle can still match and get
+		// picked, causing flaky reads of its (now-gone) mount content.
+		containerID, err := waitForSingleRunningProjectContainerID(ctx, t, dockerClient, deployConf.Name, 10*time.Second)
 		if err != nil {
 			t.Fatal(err)
-		}
-
-		if containerID == "" {
-			t.Fatal("expected container ID, got empty string")
 		}
 
 		t.Log("Finished deployment with no errors")
@@ -343,14 +390,25 @@ compose_files:
 			t.Fatalf("failed to mount: content of 'html/index.html' not equal to content of 'usr/share/nginx/html/index.html': %s", txtOutput)
 		}
 
-		// Get output of web server
-		htmlOutput, err := Exec(dockerCli.Client(), containerID, "curl", "localhost")
-		if err != nil {
-			t.Fatal(err)
-		}
+		// Get output of web server, retrying until nginx is ready to serve requests.
+		err = retry.New(
+			retry.Attempts(20),
+			retry.Delay(500*time.Millisecond),
+			retry.DelayType(retry.FixedDelay),
+		).Do(func() error {
+			out, execErr := Exec(dockerCli.Client(), containerID, "curl", "-sf", "localhost")
+			if execErr != nil {
+				return execErr
+			}
 
-		if strings.TrimSpace(htmlOutput) != expectedString {
-			t.Fatalf("failed to mount: content of 'html/index.html' not equal to content of 'usr/share/nginx/html/index.html': %s", htmlOutput)
+			if strings.TrimSpace(out) != expectedString {
+				return fmt.Errorf("unexpected curl output: %q", out)
+			}
+
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("nginx not ready after retries: %v", err)
 		}
 
 		t.Log("Destroying deployment")
@@ -389,6 +447,7 @@ compose_files:
 
 		expectedProject, err := LoadCompose(
 			ctx,
+			nil,
 			repoPath,
 			externalWorkingDir,
 			deployConf.Name,
@@ -1527,7 +1586,7 @@ func TestProjectFilesHaveChanges(t *testing.T) {
 				t.Fatalf("Failed to get changed files: %v", err)
 			}
 
-			project, err := LoadCompose(t.Context(), tmpDir, tmpDir, d.Name, d.ComposeFiles, d.EnvFiles, d.Profiles, map[string]string{})
+			project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, d.Name, d.ComposeFiles, d.EnvFiles, d.Profiles, map[string]string{})
 			if err != nil {
 				t.Fatalf("Failed to load compose file: %v", err)
 			}
@@ -1865,7 +1924,7 @@ func TestInjectSecretsToProject(t *testing.T) {
 
 			t.Log("Resolved secrets:", resolvedSecrets)
 
-			project, err := LoadCompose(ctx, tmpDir, tmpDir, test.ConvertTestName(t.Name()), []string{filePath}, []string{".env"}, []string{}, resolvedSecrets)
+			project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, test.ConvertTestName(t.Name()), []string{filePath}, []string{".env"}, []string{}, resolvedSecrets)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -1980,7 +2039,39 @@ func TestStartProject(t *testing.T) {
 		t.Fatalf("failed to stop project: %v", err)
 	}
 
-	time.Sleep(3 * time.Second)
+	assertProjectState := func(wantState string) {
+		t.Helper()
+
+		err = retry.New(
+			retry.Attempts(20),
+			retry.Delay(250*time.Millisecond),
+			retry.DelayType(retry.FixedDelay),
+		).Do(func() error {
+			containers, getErr := GetProjectContainers(ctx, dockerCli, stackName)
+			if getErr != nil {
+				return getErr
+			}
+
+			if len(containers) == 0 {
+				return fmt.Errorf("no containers found for project %q", stackName)
+			}
+
+			states := make([]string, 0, len(containers))
+			for _, cont := range containers {
+				states = append(states, fmt.Sprintf("%s:%s", cont.Labels[api.ServiceLabel], cont.State))
+				if string(cont.State) != wantState {
+					return fmt.Errorf("project %q not yet in state %q, have %v", stackName, wantState, states)
+				}
+			}
+
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	assertProjectState("exited")
 
 	t.Log("Starting project")
 
@@ -1988,6 +2079,174 @@ func TestStartProject(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start project: %v", err)
 	}
+
+	assertProjectState("running")
+}
+
+func TestStopAndStartProjectServices(t *testing.T) {
+	ctx := context.Background()
+
+	const composeYAML = `services:
+  app:
+    image: nginx:latest
+  db:
+    image: nginx:latest
+`
+
+	stack := test.ComposeUp(ctx, t, test.WithYAML(composeYAML))
+
+	c, err := app.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stackName := stack.Name
+	timeout := 30 * time.Second
+
+	assertServiceState := func(serviceName, wantState string) {
+		t.Helper()
+
+		err = retry.New(
+			retry.Attempts(20),
+			retry.Delay(500*time.Millisecond),
+			retry.DelayType(retry.FixedDelay),
+		).Do(func() error {
+			containers, getErr := GetProjectContainers(ctx, dockerCli, stackName)
+			if getErr != nil {
+				return getErr
+			}
+
+			foundServices := make([]string, 0, len(containers))
+
+			for _, cont := range containers {
+				currService := cont.Labels[api.ServiceLabel]
+
+				foundServices = append(foundServices, fmt.Sprintf("%s:%s", currService, cont.State))
+				if currService != serviceName {
+					continue
+				}
+
+				if string(cont.State) == wantState {
+					return nil
+				}
+
+				return fmt.Errorf("service %q state=%q want=%q", serviceName, cont.State, wantState)
+			}
+
+			return fmt.Errorf("service %q container not found (have: %v)", serviceName, foundServices)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, timeout); err != nil {
+		t.Fatalf("failed to stop project service: %v", err)
+	}
+
+	assertServiceState("db", "exited")
+	assertServiceState("app", "running")
+
+	if err = StartProjectServices(ctx, dockerCli, stackName, []string{"db"}); err != nil {
+		t.Fatalf("failed to start project service: %v", err)
+	}
+
+	assertServiceState("db", "running")
+	assertServiceState("app", "running")
+}
+
+func TestStopAndStartProjectServices_SchedulerSequence_WithDependsOn(t *testing.T) {
+	ctx := context.Background()
+
+	const composeYAML = `services:
+  db:
+    image: nginx:latest
+  app:
+    image: nginx:latest
+    depends_on:
+      db:
+        condition: service_started
+`
+
+	stack := test.ComposeUp(ctx, t, test.WithYAML(composeYAML))
+
+	c, err := app.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stackName := stack.Name
+	timeout := 30 * time.Second
+
+	assertServiceState := func(serviceName, wantState string) {
+		t.Helper()
+
+		err = retry.New(
+			retry.Attempts(20),
+			retry.Delay(500*time.Millisecond),
+			retry.DelayType(retry.FixedDelay),
+		).Do(func() error {
+			containers, getErr := GetProjectContainers(ctx, dockerCli, stackName)
+			if getErr != nil {
+				return getErr
+			}
+
+			foundServices := make([]string, 0, len(containers))
+
+			for _, cont := range containers {
+				currService := cont.Labels[api.ServiceLabel]
+
+				foundServices = append(foundServices, fmt.Sprintf("%s:%s", currService, cont.State))
+				if currService != serviceName {
+					continue
+				}
+
+				if string(cont.State) == wantState {
+					return nil
+				}
+
+				return fmt.Errorf("service %q state=%q want=%q", serviceName, cont.State, wantState)
+			}
+
+			return fmt.Errorf("service %q container not found (have: %v)", serviceName, foundServices)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Log("Stopping db service to simulate scheduler pre-run hook")
+
+	// 1) Scheduler pre-run hook: stop selected services (db).
+	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, timeout); err != nil {
+		t.Fatalf("failed to stop project service: %v", err)
+	}
+
+	t.Log("Check service states")
+
+	// 2) During job run: db remains stopped, dependent app remains untouched.
+	assertServiceState("db", "exited")
+	assertServiceState("app", "running")
+
+	t.Log("Restarting db service to simulate scheduler post-run hook")
+
+	// 3) Scheduler post-run hook: restart selected services.
+	if err = StartProjectServices(ctx, dockerCli, stackName, []string{"db"}); err != nil {
+		t.Fatalf("failed to start project service: %v", err)
+	}
+
+	assertServiceState("db", "running")
+	assertServiceState("app", "running")
 }
 
 func TestRemoveProject(t *testing.T) {
