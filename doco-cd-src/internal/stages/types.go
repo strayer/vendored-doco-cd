@@ -135,12 +135,13 @@ type Docker struct {
 
 // DeploymentState holds the dynamic state information during the deployment process.
 type DeploymentState struct {
-	changedServices []docker.Change
-	ignoredInfo     docker.IgnoredInfo
-	DeployedCommit  string // previously-deployed commit SHA, carried to post-deploy for the changelog
+	changedServices      []docker.Change
+	imageChangedServices []string // services whose deployed image digest drifted from the registry (force_image_pull)
+	ignoredInfo          docker.IgnoredInfo
+	DeployedCommit       string // previously-deployed commit SHA, carried to post-deploy for the changelog
 }
 
-// changedServiceNames flattens the detected changes into a unique list of service names.
+// changedServiceNames flattens the detected changes and image digest drifts into a unique list of service names.
 func (d *DeploymentState) changedServiceNames() []string {
 	if d == nil {
 		return nil
@@ -150,6 +151,8 @@ func (d *DeploymentState) changedServiceNames() []string {
 	for _, change := range d.changedServices {
 		names = append(names, change.Services...)
 	}
+
+	names = append(names, d.imageChangedServices...)
 
 	names = slice.Unique(names)
 	slices.Sort(names)
@@ -245,8 +248,11 @@ func (s *StageManager) GetStageMetaData(stageName StageName) (*MetaData, error) 
 	}
 }
 
-// NotifyFailure sends a failure notification using the provided NotifyFailureFunc.
-func (s *StageManager) NotifyFailure(notifyErr error) {
+// NotifyFailure sends a failure notification using the provided NotifyFailureFunc
+// and returns notifyErr marked as already reported, so the caller that receives
+// it does not notify about the same failure a second time. Without a
+// NotifyFailureFunc nothing is sent and the error is returned unchanged.
+func (s *StageManager) NotifyFailure(notifyErr error) error {
 	var (
 		latestCommit string
 		commitErr    error
@@ -286,7 +292,11 @@ func (s *StageManager) NotifyFailure(notifyErr error) {
 		}
 
 		s.NotifyFailureFunc(s.Log, notifyErr, metadata)
+
+		return notification.MarkNotified(notifyErr)
 	}
+
+	return notifyErr
 }
 
 func (s *StageManager) NotifyDeploymentStarted() error {
@@ -378,7 +388,11 @@ func (s *StageManager) resolveCommitStatusRequest() (commitstatus.Provider, stri
 
 	resolved := gitInternal.ResolveAuthConfig(s.Repository.SourceUrl, "", "", "")
 
-	token := resolved.GitAccessToken
+	token, err := gitInternal.ResolveHTTPToken(s.Repository.SourceUrl, resolved)
+	if err != nil {
+		s.Log.Warn("failed to resolve commit status token", slog.String("error", err.Error()))
+	}
+
 	if token == "" {
 		token = s.AppConfig.GitAccessToken
 	}

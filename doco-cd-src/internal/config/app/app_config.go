@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"path"
 	"strings"
+	"time"
 
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"go.yaml.in/yaml/v4"
@@ -30,6 +31,9 @@ var (
 type Config struct {
 	LogLevel                      string                 `env:"LOG_LEVEL,notEmpty" envDefault:"info"`                          // LogLevel is the log level for the application
 	HttpPort                      uint16                 `env:"HTTP_PORT,notEmpty" envDefault:"80" validate:"min=1,max=65535"` // HttpPort is the port the HTTP server will listen on
+	HttpTLSEnabled                bool                   `yaml:"-"`                                                            // HttpTLSEnabled indicates whether the main HTTP server serves HTTPS using the configured TLS certificate and key files.
+	HttpTLSCertFile               string                 `env:"HTTP_TLS_CERT_FILE"`                                            // HttpTLSCertFile is the path to the TLS certificate PEM file used by the main HTTP server when configured.
+	HttpTLSKeyFile                string                 `env:"HTTP_TLS_KEY_FILE"`                                             // HttpTLSKeyFile is the path to the TLS private key PEM file used by the main HTTP server when configured.
 	HttpProxyString               string                 `env:"HTTP_PROXY"`                                                    // HttpProxyString is the HTTP proxy URL as a string
 	HttpProxy                     transport.ProxyOptions // HttpProxy is the HTTP proxy configuration parsed from the HttpProxyString
 	TrustedProxyNetworksString    string                 `env:"TRUSTED_PROXY_NETWORKS" envDefault:"127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128"` // TrustedProxyNetworksString is the comma-separated list of trusted proxy CIDRs.
@@ -44,7 +48,7 @@ type Config struct {
 	SourceURLRewrites             map[string]string      `yaml:"-"`                                                                                              // SourceURLRewrites holds normalized source URL rewrite rules used by webhook and poll git sources.
 	GitAccessToken                string                 `env:"GIT_ACCESS_TOKEN"`                                                                                // GitAccessToken is the access token used to authenticate with the Git server (e.g. GitHub) for private repositories
 	GitAccessTokenUser            string                 `env:"GIT_ACCESS_TOKEN_USER,notEmpty" envDefault:"oauth2"`                                              // GitAccessTokenUser is the username paired with GitAccessToken for HTTP(S) clone/fetch. Needed by providers whose tokens have a fixed username (e.g. GitLab deploy tokens). Defaults to oauth2.
-	GitCommitStatus               bool                   `env:"GIT_COMMIT_STATUS,notEmpty" envDefault:"false"`                                                   // GitCommitStatus controls whether doco-cd reports deployment outcomes as commit statuses to the source Git provider (requires GIT_ACCESS_TOKEN)
+	GitCommitStatus               bool                   `env:"GIT_COMMIT_STATUS,notEmpty" envDefault:"false"`                                                   // GitCommitStatus controls whether doco-cd reports deployment outcomes as commit statuses to the source Git provider (requires GIT_ACCESS_TOKEN, or a configured GitHub App with "Commit statuses: Read and write" permission)
 	GitScmProvider                string                 `env:"GIT_SCM_PROVIDER,notEmpty" envDefault:"auto"`                                                     // GitScmProvider overrides automatic SCM provider detection for commit statuses. Valid values: auto, github, gitlab, gitea, azuredevops (forgejo is accepted as an alias for gitea). Useful for self-hosted instances whose hostname does not reveal the product (e.g. git.mycompany.com running GitLab).
 	GitScmApiUrl                  config.HttpUrl         `env:"GIT_SCM_API_URL" validate:"httpUrl"`                                                              // GitScmApiUrl overrides the inferred SCM API base URL for commit status calls (e.g. https://git.example.com).
 	GitAccessTokenFile            string                 `env:"GIT_ACCESS_TOKEN_FILE,file"`                                                                      // GitAccessTokenFile is the file containing the GitAccessToken
@@ -81,6 +85,7 @@ type Config struct {
 	AppriseNotifyUrls             string                 `env:"APPRISE_NOTIFY_URLS"`                                                                             // AppriseNotifyUrls is a comma-separated list of URLs to notify via the Apprise notification service
 	AppriseNotifyUrlsFile         string                 `env:"APPRISE_NOTIFY_URLS_FILE,file"`                                                                   // AppriseNotifyUrlsFile is the file containing the AppriseNotifyUrls
 	AppriseNotifyLevel            string                 `env:"APPRISE_NOTIFY_LEVEL,notEmpty" envDefault:"success"`                                              // AppriseNotifyLevel is the level of notifications to send via the Apprise notification service
+	AppriseNotifyRepeatInterval   time.Duration          `env:"APPRISE_NOTIFY_REPEAT_INTERVAL,notEmpty" envDefault:"1h"`                                         // AppriseNotifyRepeatInterval is how long an unchanged failure notification is suppressed before it is sent again as a reminder. Zero or less sends every failure.
 	AppriseNotifyBodyTemplate     string                 `env:"APPRISE_NOTIFY_BODY_TEMPLATE"`                                                                    // AppriseNotifyBodyTemplate is an optional Go text/template rendering the notification body. Empty uses the built-in format.
 	AppriseNotifyBodyTemplateFile string                 `env:"APPRISE_NOTIFY_BODY_TEMPLATE_FILE,file"`                                                          // AppriseNotifyBodyTemplateFile is the file containing the AppriseNotifyBodyTemplate
 	SecretProvider                string                 `env:"SECRET_PROVIDER"`                                                                                 // SecretProvider is the secret provider/manager to use for retrieving secrets (e.g. bitwarden secrets manager)
@@ -92,6 +97,9 @@ type Config struct {
 	OciTrustPolicy                config.OciTrustPolicy  `yaml:"-"`                                                                                              // OciTrustPolicy is the parsed app-level OCI signature trust policy
 	OciInsecureRegistriesString   string                 `env:"OCI_INSECURE_REGISTRIES"`                                                                         // OciInsecureRegistriesString is a comma-separated list of registries for OCI Compose includes with TLS verification disabled.
 	OciInsecureRegistries         []string               `yaml:"-"`                                                                                              // OciInsecureRegistries holds normalized OCI Compose include registries with TLS verification disabled.
+	CertRotationEnabled           bool                   `env:"CERT_ROTATION_ENABLED,notEmpty" envDefault:"false"`                                               // CertRotationEnabled enables the built-in watcher that automatically rotates certificates issued through rotation-capable external secret providers (e.g. OpenBao PKI roles)
+	CertRotationThreshold         time.Duration          `env:"CERT_ROTATION_THRESHOLD,notEmpty" envDefault:"72h" validate:"min=1"`                              // CertRotationThreshold is how far ahead of a certificate's expiry doco-cd triggers a rotation
+	CertRotationCheckInterval     time.Duration          `env:"CERT_ROTATION_CHECK_INTERVAL,notEmpty" envDefault:"1h" validate:"min=1"`                          // CertRotationCheckInterval is how often the certificate rotation watcher checks deployed certificates for upcoming expiry
 }
 
 // GetConfig returns the app Config.
@@ -176,6 +184,15 @@ func GetConfig() (*Config, error) {
 		return nil, fmt.Errorf("HTTP_PORT and METRICS_PORT cannot be the same port number: %d", cfg.HttpPort)
 	}
 
+	cfg.HttpTLSCertFile = strings.TrimSpace(cfg.HttpTLSCertFile)
+	cfg.HttpTLSKeyFile = strings.TrimSpace(cfg.HttpTLSKeyFile)
+
+	if (cfg.HttpTLSCertFile == "") != (cfg.HttpTLSKeyFile == "") {
+		return nil, errors.New("HTTP_TLS_CERT_FILE and HTTP_TLS_KEY_FILE must be set together")
+	}
+
+	cfg.HttpTLSEnabled = cfg.HttpTLSCertFile != "" && cfg.HttpTLSKeyFile != ""
+
 	if cfg.HttpProxyString != "" {
 		cfg.HttpProxy = transport.ProxyOptions{
 			URL: cfg.HttpProxyString,
@@ -204,6 +221,8 @@ func GetConfig() (*Config, error) {
 			return nil, fmt.Errorf("DATA_HOST_PATH must be an absolute Unix path: %q", cfg.DataHostPath)
 		}
 	}
+
+	notification.SetFailureRepeatInterval(cfg.AppriseNotifyRepeatInterval)
 
 	err = notification.SetAppriseConfig(
 		string(cfg.AppriseApiURL),

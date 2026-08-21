@@ -25,8 +25,10 @@ import (
 	"github.com/kimdre/doco-cd/internal/reconciliation"
 
 	"github.com/kimdre/doco-cd/cmd/doco-cd/healthcheck"
+	"github.com/kimdre/doco-cd/internal/certrotation"
 	"github.com/kimdre/doco-cd/internal/scheduler"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
+	"github.com/kimdre/doco-cd/internal/secretprovider/openbao"
 
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 
@@ -169,9 +171,14 @@ func run() error {
 	log = logger.New(logLevel)
 
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
-		checkUrl := fmt.Sprintf("http://localhost:%d%s", c.HttpPort, healthPath)
+		scheme := "http"
+		if c.HttpTLSEnabled {
+			scheme = "https"
+		}
 
-		err := healthcheck.Check(ctx, checkUrl)
+		checkUrl := fmt.Sprintf("%s://localhost:%d%s", scheme, c.HttpPort, healthPath)
+
+		err := healthcheck.Check(ctx, checkUrl, c.HttpTLSEnabled)
 		if err != nil {
 			log.Critical("health check failed", logger.ErrAttr(err), slog.String("url", checkUrl))
 			return err
@@ -372,8 +379,25 @@ func run() error {
 		log.Info("scheduler disabled by configuration")
 	}
 
+	if c.CertRotationEnabled {
+		if c.SecretProvider != openbao.Name {
+			log.Warn(
+				"certificate rotation is enabled but the configured secret provider does not support it, disabling",
+				slog.String("secret_provider", c.SecretProvider),
+			)
+		} else {
+			watcher := certrotation.New(h.dockerCli, log.Logger, h.secretProvider, c.CertRotationThreshold, c.CertRotationCheckInterval)
+
+			graceful.SafeGo(&wg, log.Logger, func() {
+				watcher.Start(ctx)
+			})
+		}
+	} else {
+		log.Info("certificate rotation watcher disabled by configuration")
+	}
+
 	registryApiServer(c, &h, log)
-	prometheus.RegisterServer(c.MetricsPort, log)
+	prometheus.RegisterServer(c.MetricsPort, c.HttpTLSCertFile, c.HttpTLSKeyFile, log)
 
 	if err := graceful.Serve(log.Logger); err != nil {
 		log.Critical("failed to serve", logger.ErrAttr(err))

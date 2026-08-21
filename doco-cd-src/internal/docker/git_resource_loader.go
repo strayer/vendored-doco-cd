@@ -87,7 +87,6 @@ type gitResourceLoaderConfig struct {
 // OCI includes require the Docker CLI for registry credentials.
 func newRemoteResourceLoaders(c *app.Config, dockerCli command.Cli, repoPath string) []loader.ResourceLoader {
 	cacheBase := resolveIncludeCacheBase(c, repoPath)
-	slog.Debug("configured compose include cache base", slog.String("cache_base", cacheBase), slog.String("repo_path", repoPath))
 
 	remoteLoaders := []loader.ResourceLoader{
 		newGitResourceLoader(gitResourceLoaderConfig{
@@ -168,6 +167,8 @@ func (g *gitResourceLoader) Load(ctx context.Context, resource string) (string, 
 		return "", err
 	}
 
+	slog.Debug("configured compose include cache base", slog.String("cache_base", g.cacheDirectory))
+
 	ref, _, err := dfgitutil.ParseGitRef(resource)
 	if err != nil {
 		return "", fmt.Errorf("parse git include %q: %w", resource, err)
@@ -177,8 +178,11 @@ func (g *gitResourceLoader) Load(ctx context.Context, resource string) (string, 
 		ref.Ref = "HEAD" // default branch
 	}
 
+	r := strings.Split(ref.Remote, "/")
+	repo := strings.Join(r[3:], "/")
+
 	slog.Debug("loading compose include from git repository",
-		slog.String("remote_host", gitRemoteHostForLog(ref.Remote)),
+		slog.String("remote", strings.Join([]string{gitRemoteHostForLog(ref.Remote), repo}, "/")),
 		slog.String("ref", ref.Ref),
 		slog.String("subdir", ref.SubDir),
 	)
