@@ -114,7 +114,8 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 
 	// Check for external secret changes and current deployed commit
 	var (
-		imagesChanged bool // Flag to indicate if images have changed
+		imagesChanged        bool     // Flag to indicate if images have changed
+		imageChangedServices []string // Services whose deployed image digest drifted from the registry
 	)
 
 	// Compare external secrets if a secret provider is configured
@@ -245,19 +246,28 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		} else if s.DeployConfig.ForceImagePull {
 			stageLog.Debug("force image pull enabled, checking deployed image digests against registry")
 
-			imagesChanged, err = docker.HaveDeployedServiceImageDigestsChanged(ctx, s.Docker.Cmd, s.Docker.SwarmMode, s.Docker.Project, stageLog)
+			imageChangedServices, err = docker.DeployedServicesWithChangedImageDigests(ctx, s.Docker.Cmd, s.Docker.SwarmMode, s.Docker.Project, stageLog)
 			if err != nil {
 				return fmt.Errorf("failed to compare deployed service image digests: %w", err)
 			}
 
+			imagesChanged = len(imageChangedServices) > 0
+
 			if imagesChanged {
-				stageLog.Debug("deployed image digests differ from registry, proceeding with deployment")
+				stageLog.Debug("deployed image digests differ from registry, proceeding with deployment",
+					slog.Any("services", imageChangedServices))
 			} else {
 				stageLog.Debug("deployed image digests match registry")
 			}
 		}
 
-		newHash, err := docker.ProjectHash(s.Docker.Project)
+		// pki-role external secrets issue a fresh certificate on every resolution.
+		// Substitute the resolved cert/key PEM values with a stable per-ref placeholder
+		// before hashing so the hash only changes when the ref changes, not when the
+		// cert is re-issued (which would otherwise trigger a spurious redeploy every cycle).
+		hashProject := docker.WithNormalizedEnvValues(s.Docker.Project, pkiRoleNormMap(s.DeployConfig.ExternalSecrets, s.DeployConfig.Internal.Environment))
+
+		newHash, err := docker.ProjectHash(hashProject)
 		if err != nil {
 			return fmt.Errorf("failed to get project hash: %w", err)
 		}
@@ -322,6 +332,7 @@ func (s *StageManager) RunPreDeployStage(ctx context.Context, stageLog *slog.Log
 		}
 
 		s.DeployState.changedServices = changedServices
+		s.DeployState.imageChangedServices = imageChangedServices
 		s.DeployState.ignoredInfo = ignoredInfo
 
 		stageLog.Debug("changes detected, proceeding with deployment",
@@ -349,4 +360,34 @@ func getAbsWorkingDir(repoPath, workingDir string) (string, error) {
 	}
 
 	return absPath, nil
+}
+
+// pkiRoleNormMap builds a map from resolved pki-role cert and private-key PEM
+// values to stable placeholder strings (the ref string itself), for use with
+// docker.WithNormalizedEnvValues during project hash computation.
+//
+// Certs issued by OpenBao pki-role refs are always freshly generated on every
+// ResolveSecretReferences call, so their PEM bytes differ each time even when no
+// configuration has changed. Using the ref string as a stable placeholder prevents
+// the project hash from changing on every poll cycle.
+func pkiRoleNormMap(externalSecrets map[string]secrettypes.ExternalSecretRef, env map[string]string) map[string]string {
+	norm := make(map[string]string)
+
+	for envVar, ref := range externalSecrets {
+		if !strings.HasPrefix(ref.LegacyRef, "pki-role:") {
+			continue
+		}
+
+		if v, ok := env[envVar]; ok && v != "" {
+			norm[v] = ref.LegacyRef
+		}
+
+		// The matching private-key value is stored under <NAME>_KEY.
+		keyName := envVar + secrettypes.PKIRoleKeySuffix
+		if v, ok := env[keyName]; ok && v != "" {
+			norm[v] = ref.LegacyRef + secrettypes.PKIRoleKeySuffix
+		}
+	}
+
+	return norm
 }

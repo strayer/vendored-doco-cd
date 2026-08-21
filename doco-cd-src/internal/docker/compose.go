@@ -128,7 +128,10 @@ func CreateDockerCliWithContext(quiet bool, dockerContext string) (command.Cli, 
 			contextName, strings.TrimSpace(initErrBuf.String()))
 	}
 
-	return dockerCli, nil
+	// Wrap so ConfigFile() re-reads the docker config from disk on every auth
+	// lookup — required for short-lived registry tokens (ECR etc.) that get
+	// refreshed on disk while the daemon runs. See reloadConfigCli.
+	return reloadConfigCli{dockerCli}, nil
 }
 
 /*
@@ -173,6 +176,8 @@ func addComposeServiceLabels(project *types.Project, deployConfig *deploy.Config
 			api.OneoffLabel:                             "False", // default, will be overridden by docker compose
 			api.DependenciesLabel:                       strings.Join(dependencies, ","),
 		}
+
+		applyCertRotationLabelsToService(s.CustomLabels, s, project, deployConfig)
 
 		project.Services[i] = s
 	}
@@ -645,6 +650,7 @@ func DeployStack(
 	dockerCli command.Cli, payload *webhook.ParsedPayload, deployConfig *deploy.Config,
 	detectedChanges []Change, needSignal []SignalService, latestCommit, appVersion string,
 	globalSwarmConfigRetention int, globalSwarmSecretRetention int, swarmMode bool,
+	hashNormMap map[string]string,
 ) error {
 	startTime := time.Now()
 	repositoryLabel := resolveDeploymentMetricsRepositoryLabel(payload)
@@ -714,7 +720,7 @@ func DeployStack(
 
 	// Generate project hash with doco-cd labels
 	// We don't want to compare the hashes with these labels
-	projectHash, err := ProjectHash(project)
+	projectHash, err := ProjectHash(WithNormalizedEnvValues(project, hashNormMap))
 	if err != nil {
 		return fmt.Errorf("failed to generate project hash: %w", err)
 	}
@@ -733,7 +739,7 @@ func DeployStack(
 			return fmt.Errorf("failed to load swarm stack: %w", err)
 		}
 
-		addSwarmServiceLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit, projectHash)
+		addSwarmServiceLabels(cfg, project, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit, projectHash)
 		addSwarmVolumeLabels(cfg, deployConfig, payload, externalWorkingDir)
 		addSwarmConfigLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
 		addSwarmSecretLabels(cfg, deployConfig, payload, externalWorkingDir, appVersion, timestamp, latestCommit)
@@ -1856,7 +1862,9 @@ func assessStartedServiceStates(containers []api.ContainerSummary, targetService
 			case "unhealthy":
 				status.unhealthy = true
 			}
-		case "exited", "dead":
+		// "restarting" exists only after a container died and restart policy
+		// kicked in - right after deploy that is a crash, not a slow start
+		case "restarting", "exited", "dead":
 			status.terminal = state
 		}
 
@@ -1883,7 +1891,28 @@ func assessStartedServiceStates(containers []api.ContainerSummary, targetService
 	return len(waiting) == 0, waiting, nil
 }
 
+// startReadyStableSamples is how many consecutive ready samples (1s apart)
+// services must hold before start counts as successful. A service that
+// crashes moments after start spends most of each crash cycle in a short
+// "running" window - one lucky sample used to mark the deploy successful,
+// and every following poll redeployed the crashed container as drift.
+const startReadyStableSamples = 3
+
+// projectContainerLister abstracts container listing so the wait loop can be
+// tested without a Docker daemon.
+type projectContainerLister func(ctx context.Context) ([]api.ContainerSummary, error)
+
 func waitForStartedServices(ctx context.Context, dockerCli command.Cli, projectName string,
+	startServices []string, jobServices set.Set[string], timeout time.Duration,
+) error {
+	listContainers := func(ctx context.Context) ([]api.ContainerSummary, error) {
+		return GetProjectContainers(ctx, dockerCli, projectName)
+	}
+
+	return waitForStartedServicesWith(ctx, listContainers, startServices, jobServices, timeout)
+}
+
+func waitForStartedServicesWith(ctx context.Context, listContainers projectContainerLister,
 	startServices []string, jobServices set.Set[string], timeout time.Duration,
 ) error {
 	nonJobServices := getNonJobServices(startServices, jobServices)
@@ -1900,8 +1929,10 @@ func waitForStartedServices(ctx context.Context, dockerCli command.Cli, projectN
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
+	readyStreak := 0
+
 	for {
-		containers, err := GetProjectContainers(ctx, dockerCli, projectName)
+		containers, err := listContainers(ctx)
 		if err != nil {
 			return fmt.Errorf("failed to inspect project containers: %w", err)
 		}
@@ -1912,11 +1943,16 @@ func waitForStartedServices(ctx context.Context, dockerCli command.Cli, projectN
 		}
 
 		if ready {
-			return nil
-		}
+			readyStreak++
+			if readyStreak >= startReadyStableSamples {
+				return nil
+			}
+		} else {
+			readyStreak = 0
 
-		if time.Now().After(deadline) {
-			return fmt.Errorf("timed out after %s waiting for services to start: %s", timeout, strings.Join(waiting, ", "))
+			if time.Now().After(deadline) {
+				return fmt.Errorf("timed out after %s waiting for services to start: %s", timeout, strings.Join(waiting, ", "))
+			}
 		}
 
 		select {
