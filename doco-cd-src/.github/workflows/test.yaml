@@ -74,7 +74,9 @@ jobs:
         run: |
           sudo apt install -y musl-tools
       - run: go mod download
-      - run: if [ "${{ matrix.mode }}" = "swarm" ]; then docker swarm init; fi
+      - name: Enable Swarm mode
+        if: matrix.mode == 'swarm'
+        run: docker swarm init
       - run: go test -ldflags="$BW_SDK_BUILD_FLAGS" -v -coverprofile=coverage-${{ matrix.mode }}.out -covermode=atomic -timeout 20m ./...
         timeout-minutes: 20
         env:
@@ -93,6 +95,52 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage-${{ matrix.mode }}.out
           flags: unittests
+
+  e2e:
+    name: E2E (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [standalone, swarm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+
+      # Dedicated build cache for the CGO-free, nobitwarden host build of the
+      # doco-cd binary that the e2e image is assembled from. Kept apart from
+      # the setup-go cache, which other jobs fill with a different build config.
+      - name: Restore e2e Go build cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/e2e-go-build
+          key: e2e-go-build-${{ hashFiles('go.mod', 'go.sum') }}
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Enable Swarm mode
+        if: matrix.mode == 'swarm'
+        run: docker swarm init
+
+      - name: Run e2e scenarios
+        run: go test -tags e2e ./test/e2e/... -v -timeout 25m
+        env:
+          E2E_BUILD_CACHE_SCOPE: doco-cd-e2e-${{ matrix.mode }}
+          GOCACHE: ${{ runner.temp }}/e2e-go-build
+
+      # Both matrix jobs build the identical binary, so only one of them needs
+      # to write the shared cache entry back.
+      - name: Save e2e Go build cache
+        if: always() && matrix.mode == 'standalone'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/e2e-go-build
+          key: e2e-go-build-${{ hashFiles('go.mod', 'go.sum') }}
 
   docs-validation:
     name: Validate wiki build

@@ -3,6 +3,7 @@ package stages
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -32,6 +33,12 @@ var (
 	ErrNotManagedByDocoCD = errors.New("stack is not managed by doco-cd")
 	ErrDeploymentConflict = errors.New("another stack with the same name already exists and is not managed by this repository")
 	ErrSkipDeployment     = errors.New("deployment skipped") // Special error to indicate deployment was skipped, not an actual failure/error
+
+	// ErrWebhookFilterMismatch is returned when the deployment is skipped because
+	// the webhook ref does not match the configured webhook_filter. It wraps
+	// ErrSkipDeployment so existing errors.Is checks still match, but callers can
+	// distinguish it to return an appropriate "skipped" response instead of "success".
+	ErrWebhookFilterMismatch = fmt.Errorf("webhook filter did not match: %w", ErrSkipDeployment)
 )
 
 type StageName string
@@ -136,7 +143,7 @@ type Docker struct {
 // DeploymentState holds the dynamic state information during the deployment process.
 type DeploymentState struct {
 	changedServices      []docker.Change
-	imageChangedServices []string // services whose deployed image digest drifted from the registry (force_image_pull)
+	imageChangedServices []string // services whose image moved: digest drift under force_image_pull, otherwise a changed image reference
 	ignoredInfo          docker.IgnoredInfo
 	DeployedCommit       string // previously-deployed commit SHA, carried to post-deploy for the changelog
 }
