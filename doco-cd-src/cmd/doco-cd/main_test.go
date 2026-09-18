@@ -35,15 +35,78 @@ import (
 	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/reconciliation"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
 const (
-	validCommitSHA = "26263c2b44133367927cd1423d8c8457b5befce5"
-	invalidBranch  = "refs/heads/invalid"
+	invalidBranch        = "refs/heads/invalid"
+	localFixtureCloneURL = "https://fixture.invalid/kimdre/doco-cd-fixture"
+	localFixtureRepoName = "doco-cd-fixture"
+	localFixtureFullName = "kimdre/doco-cd-fixture"
+	// remoteFixtureCommit is a self-contained commit on the "remote" branch of
+	// the external kimdre/doco-cd_tests repository, used by the "Private
+	// Repository" and "With Remote Repository" subtests below.
+	remoteFixtureCommit = "ee6dda09a7cef86ace9e5991dcf3c4b9a56716d3"
 )
 
-var WorkingDir string
+// selfDeployComposeYAML backs the local, network-independent fixture repos
+// used by the "Successful Deployment", "Successful Deployment with custom
+// Target" and "Invalid Reference" subtests of TestHandleEvent.
+const selfDeployComposeYAML = `
+services:
+  app:
+    image: nginx:latest
+    ports:
+      - "80"  # use random published port
+    depends_on:
+      - dep
+    volumes:
+      - ./:/usr/share/nginx/html
+    environment:
+      TEST_ENV_VAR: example_value
+    labels:
+      - something=${SOMETHING:-none}
+      - base=${BASE:-none}
+      - prod=${PROD:-none}
+      - remote=${REMOTE:-none}
+    env_file:
+      - test.env
+    secrets:
+      - test_secret
+    configs:
+      - test_config
+
+  dep:
+    image: nginx:latest
+
+secrets:
+  test_secret:
+    file: ./secret.txt
+
+configs:
+  test_config:
+    file: ./config.conf
+`
+
+// selfDeployFixtureFiles returns the fixture files needed to deploy
+// selfDeployComposeYAML, rooted at dir (e.g. "" or "fixture/").
+// An empty string dir means the files are in the root of the repository, while
+// "fixture/" means they are in the "fixture" subdirectory of the repository.
+func selfDeployFixtureFiles(dir string) map[string]string {
+	return map[string]string{
+		dir + "test.compose.yaml": selfDeployComposeYAML,
+		dir + "test.env":          "SOMETHING=hello\nREMOTE=remote\n",
+		dir + "config.conf":       "This is a config.",
+		dir + "secret.txt":        "This is a secret.",
+		dir + "index.html":        "It works.",
+	}
+}
+
+var (
+	WorkingDir       string
+	SwarmModeEnabled bool
+)
 
 func TestMain(m *testing.M) {
 	var err error
@@ -67,11 +130,12 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Failed to verify docker socket connection: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(ctx, dockerCli.Client()); err != nil {
+	SwarmModeEnabled, err = swarm.ResolveModeEnabled(ctx, dockerCli.Client())
+	if err != nil {
 		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
 	}
 
-	if swarm.GetModeEnabled() {
+	if SwarmModeEnabled {
 		log.Println("Testing in Docker Swarm mode")
 	} else {
 		log.Println("Testing in Docker Standalone mode")
@@ -88,6 +152,54 @@ func TestMain(m *testing.M) {
 }
 
 func TestHandleEvent(t *testing.T) {
+	// Local, network-independent fixtures backing the subtests that deploy
+	// this repository itself. "remoteTargetURL" stands in for the
+	// "repository_url" deployment target that "selfDeployURL" points at
+	// under the "test" custom target, also exercising "remote:"-prefixed
+	// env file merging (base.env/prod.env local, test.env from the target).
+	_, remoteTargetURL, _ := newLocalFixtureRepo(t, mergeFiles(
+		map[string]string{
+			".doco-cd.yaml": `
+name: test-deploy-remote-target
+reference: refs/heads/main
+working_dir: .
+compose_files:
+  - test.compose.yaml
+`,
+		},
+		selfDeployFixtureFiles(""),
+	))
+
+	_, selfDeployURL, selfDeployHash := newLocalFixtureRepo(t, mergeFiles(
+		map[string]string{
+			".doco-cd.yaml": `
+name: test-deploy
+reference: refs/heads/main
+working_dir: fixture
+compose_files:
+  - test.compose.yaml
+`,
+			// base.env and prod.env are local to this repo and get merged
+			// with test.env from the repository_url target (remoteTargetURL,
+			// via the "remote:" prefix) to exercise cross-repo env file
+			// merging entirely offline.
+			".doco-cd.test.yaml": `
+name: test-deploy-custom-target
+repository_url: ` + remoteTargetURL + `
+working_dir: .
+compose_files:
+  - test.compose.yaml
+env_files:
+  - base.env
+  - prod.env
+  - remote:test.env
+`,
+			"base.env": "SOMETHING=base\nBASE=base\n",
+			"prod.env": "SOMETHING=prod\nPROD=prod\n",
+		},
+		selfDeployFixtureFiles("fixture/"),
+	))
+
 	testCases := []struct {
 		name                 string
 		payload              webhook.ParsedPayload
@@ -100,10 +212,10 @@ func TestHandleEvent(t *testing.T) {
 			name: "Successful Deployment",
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
-				CommitSHA: plumbing.NewHash(validCommitSHA),
-				Name:      "doco-cd",
-				FullName:  "kimdre/doco-cd",
-				CloneURL:  "https://github.com/kimdre/doco-cd",
+				CommitSHA: selfDeployHash,
+				Name:      localFixtureRepoName,
+				FullName:  localFixtureFullName,
+				CloneURL:  localFixtureCloneURL,
 				Private:   false,
 			},
 			expectedStatusCode:   http.StatusCreated,
@@ -115,10 +227,10 @@ func TestHandleEvent(t *testing.T) {
 			name: "Successful Deployment with custom Target",
 			payload: webhook.ParsedPayload{
 				Ref:       git.MainBranch,
-				CommitSHA: plumbing.NewHash("f291bfca73b06814293c1f9c9f3c7f95e4932564"),
-				Name:      "doco-cd",
-				FullName:  "kimdre/doco-cd",
-				CloneURL:  "https://github.com/kimdre/doco-cd",
+				CommitSHA: selfDeployHash,
+				Name:      localFixtureRepoName,
+				FullName:  localFixtureFullName,
+				CloneURL:  localFixtureCloneURL,
 				Private:   false,
 			},
 			expectedStatusCode:   http.StatusCreated,
@@ -130,10 +242,10 @@ func TestHandleEvent(t *testing.T) {
 			name: "Invalid Reference",
 			payload: webhook.ParsedPayload{
 				Ref:       invalidBranch,
-				CommitSHA: plumbing.NewHash(validCommitSHA),
-				Name:      "doco-cd",
-				FullName:  "kimdre/doco-cd",
-				CloneURL:  "https://github.com/kimdre/doco-cd",
+				CommitSHA: selfDeployHash,
+				Name:      localFixtureRepoName,
+				FullName:  localFixtureFullName,
+				CloneURL:  localFixtureCloneURL,
 				Private:   false,
 			},
 			expectedStatusCode:   http.StatusInternalServerError,
@@ -142,13 +254,17 @@ func TestHandleEvent(t *testing.T) {
 			swarmMode:            false,
 		},
 		{
+			// Kept as a real network clone (with GIT_ACCESS_TOKEN auth) to
+			// exercise the Private-repository code path end-to-end, reusing
+			// the "remote" branch/commit already validated by the
+			// "With Remote Repository" subtest below.
 			name: "Private Repository",
 			payload: webhook.ParsedPayload{
-				Ref:       git.MainBranch,
-				CommitSHA: plumbing.NewHash(validCommitSHA),
-				Name:      "doco-cd",
-				FullName:  "kimdre/doco-cd",
-				CloneURL:  "https://github.com/kimdre/doco-cd",
+				Ref:       "remote",
+				CommitSHA: plumbing.NewHash(remoteFixtureCommit),
+				Name:      "doco-cd_tests",
+				FullName:  "kimdre/doco-cd_tests",
+				CloneURL:  "https://github.com/kimdre/doco-cd_tests",
 				Private:   true,
 			},
 			expectedStatusCode:   http.StatusCreated,
@@ -175,7 +291,7 @@ func TestHandleEvent(t *testing.T) {
 			name: "With Remote Repository",
 			payload: webhook.ParsedPayload{
 				Ref:       "remote",
-				CommitSHA: plumbing.NewHash("d02f87d2a886d6bae4673409f6b5108b45156f5c"),
+				CommitSHA: plumbing.NewHash(remoteFixtureCommit),
 				Name:      "doco-cd_tests",
 				FullName:  "kimdre/doco-cd_tests",
 				CloneURL:  "https://github.com/kimdre/doco-cd_tests",
@@ -210,6 +326,14 @@ func TestHandleEvent(t *testing.T) {
 
 	appConfig.GitCommitStatus = false
 
+	// Route the localFixtureCloneURL used by the self-referencing subtests
+	// above to the local fixture repos instead of a real network clone,
+	// exercising the same webhook clone URL rewrite feature operators use to
+	// mirror sources.
+	appConfig.SourceURLRewrites = map[string]string{
+		localFixtureCloneURL: selfDeployURL,
+	}
+
 	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy)
 	if err != nil {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
@@ -220,10 +344,6 @@ func TestHandleEvent(t *testing.T) {
 			t.Logf("Failed to close Docker client: %v", closeErr)
 		}
 	})
-
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
 
 	encryption.SetupAgeKeyEnvVar(t)
 
@@ -240,7 +360,7 @@ func TestHandleEvent(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			mode := swarm.GetModeEnabled()
+			mode := SwarmModeEnabled
 			if mode != tc.swarmMode {
 				t.Skipf("Skipping test because it requires swarm mode %v, but current mode is %v", tc.swarmMode, mode)
 			}
@@ -256,7 +376,7 @@ func TestHandleEvent(t *testing.T) {
 				t.Skip("Skipping test for private repository because GIT_ACCESS_TOKEN is not set")
 			}
 
-			jobID := id.GenID()
+			jobID := id.New()
 			jobLog := logger.New(logger.LevelCritical).With(slog.String("job_id", jobID))
 
 			ctx := context.Background()
@@ -294,7 +414,7 @@ func TestHandleEvent(t *testing.T) {
 					Volumes:       true,
 				}
 
-				if swarm.GetModeEnabled() {
+				if SwarmModeEnabled {
 					err = docker.RemoveSwarmStack(ctx, dockerCli, stackName)
 				} else if svcErr == nil && service != nil {
 					err = service.Down(ctx, stackName, downOpts)
@@ -316,6 +436,12 @@ func TestHandleEvent(t *testing.T) {
 				Repository: git.GetRepoName(tc.payload.CloneURL),
 				Revision:   notification.GetRevision(tc.payload.Ref, tc.payload.CommitSHAString()),
 			}
+			deployment := newTestDeployment(t, appConfig, testMountPoint, reconciliation.Dependencies{
+				AppConfig:      appConfig,
+				DataMountPoint: testMountPoint,
+				DockerCLI:      dockerCli,
+				SecretProvider: secretProvider,
+			})
 
 			err = retry.New(
 				retry.Attempts(3),
@@ -324,24 +450,20 @@ func TestHandleEvent(t *testing.T) {
 					return strings.Contains(strings.ToLower(err.Error()), "no such image")
 				}),
 			).Do(func() error {
-				HandleEvent(
+				if _, err := handleEvent(
 					ctx,
 					jobLog,
 					rr,
 					appConfig,
-					testMountPoint,
 					tc.payload,
 					tc.customTarget,
 					metadata,
-					dockerCli,
-					&secretProvider,
 					stackName,
-					newDeploymentRunTracker(map[deploymentRunTrigger]int{
-						deploymentRunTriggerWebhook:      10,
-						deploymentRunTriggerPoll:         10,
-						deploymentRunTriggerScheduledJob: 10,
-					}),
-				)
+					deployment,
+					newTestNotifier(t),
+				); err != nil {
+					return err
+				}
 
 				expectedReturnMessage := fmt.Sprintf(tc.expectedResponseBody, jobID, filepath.Join(tmpDir, git.GetRepoName(tc.payload.CloneURL)), stackName) + "\n"
 				if rr.Body.String() != expectedReturnMessage {

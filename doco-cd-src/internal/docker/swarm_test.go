@@ -34,11 +34,7 @@ func TestDeploySwarmStack(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if !swarm.GetModeEnabled() {
+	if !resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
@@ -75,7 +71,7 @@ func TestDeploySwarmStack(t *testing.T) {
 	repoPath := worktree.Filesystem.Root()
 	filePath := filepath.Join(repoPath, "docker-compose.yml")
 
-	project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,10 +102,10 @@ func TestDeploySwarmStack(t *testing.T) {
 	).Do(
 		func() error {
 			timestamp := time.Now().UTC().Format(time.RFC3339)
-			addSwarmServiceLabels(cfg, project, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit, projectHash)
+			addSwarmServiceLabels(cfg, project, deployConfigs[0], &p, "", tmpDir, "dev", timestamp, commit, projectHash)
 			addSwarmVolumeLabels(cfg, deployConfigs[0], &p, tmpDir)
-			addSwarmConfigLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit)
-			addSwarmSecretLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit)
+			addSwarmConfigLabels(cfg, deployConfigs[0], &p, "", tmpDir, "dev", timestamp, commit)
+			addSwarmSecretLabels(cfg, deployConfigs[0], &p, "", tmpDir, "dev", timestamp, commit)
 
 			return DeploySwarmStack(ctx, dockerCli, cfg, opts)
 		},
@@ -159,11 +155,7 @@ func TestSwarmConfigAndSecretRotationRetention(t *testing.T) {
 		t.Fatalf("failed to create Docker CLI: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if !swarm.GetModeEnabled() {
+	if !resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
@@ -469,5 +461,72 @@ func TestSetSecretHashPrefixes_NameAtLimit(t *testing.T) {
 
 	if !strings.HasPrefix(got, base+"_") {
 		t.Fatalf("expected final secret name to keep base+hash suffix, got %q", got)
+	}
+}
+
+func TestResolveSwarmStopWaitTimeout(t *testing.T) {
+	t.Parallel()
+
+	grace := func(d time.Duration) *swarmTypes.ContainerSpec {
+		return &swarmTypes.ContainerSpec{StopGracePeriod: &d}
+	}
+
+	override5s := 5 * time.Second
+	override10s := 10 * time.Second
+
+	tests := []struct {
+		name            string
+		timeoutOverride *time.Duration
+		containerSpec   *swarmTypes.ContainerSpec
+		want            time.Duration
+	}{
+		{
+			name:            "explicit override wins over configured grace period",
+			timeoutOverride: &override5s,
+			containerSpec:   grace(120 * time.Second),
+			want:            5 * time.Second,
+		},
+		{
+			name:            "explicit override wins when no grace period configured",
+			timeoutOverride: &override10s,
+			containerSpec:   nil,
+			want:            10 * time.Second,
+		},
+		{
+			name:          "long configured grace period is honoured",
+			containerSpec: grace(120 * time.Second),
+			want:          120*time.Second + swarmStopWaitBuffer,
+		},
+		{
+			name:          "short configured grace period is honoured",
+			containerSpec: grace(5 * time.Second),
+			want:          5*time.Second + swarmStopWaitBuffer,
+		},
+		{
+			name:          "zero configured grace period still gets observation buffer",
+			containerSpec: grace(0),
+			want:          swarmStopWaitBuffer,
+		},
+		{
+			name:          "no container spec falls back to default",
+			containerSpec: nil,
+			want:          DefaultStopServicesTimeout,
+		},
+		{
+			name:          "container spec with nil grace period falls back to default",
+			containerSpec: &swarmTypes.ContainerSpec{},
+			want:          DefaultStopServicesTimeout,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := resolveSwarmStopWaitTimeout(tt.timeoutOverride, tt.containerSpec)
+			if got != tt.want {
+				t.Fatalf("resolveSwarmStopWaitTimeout() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -12,30 +13,36 @@ import (
 	"sync"
 	"time"
 
+	"github.com/docker/cli/cli/command"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/git"
 
 	"github.com/kimdre/doco-cd/internal/git/ssh"
 	"github.com/kimdre/doco-cd/internal/graceful"
 
 	"github.com/kimdre/doco-cd/internal/reconciliation"
+	"github.com/kimdre/doco-cd/internal/source"
 
 	"github.com/kimdre/doco-cd/cmd/doco-cd/healthcheck"
+	"github.com/kimdre/doco-cd/internal/api"
 	"github.com/kimdre/doco-cd/internal/certrotation"
+	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/scheduler"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	"github.com/kimdre/doco-cd/internal/secretprovider/openbao"
-
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
 
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/docker/registryauth"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/mcp"
+	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/profiling"
 	"github.com/kimdre/doco-cd/internal/prometheus"
 )
 
@@ -148,6 +155,19 @@ func run() error {
 		return err
 	}
 
+	notifier, err := notification.New(notification.Config{
+		APIURL:                string(c.AppriseApiURL),
+		NotifyURLs:            c.AppriseNotifyUrls,
+		NotifyLevel:           c.AppriseNotifyLevel,
+		BodyTemplate:          c.AppriseNotifyBodyTemplate,
+		FailureRepeatInterval: c.AppriseNotifyRepeatInterval,
+	})
+	if err != nil {
+		log.Critical("failed to configure notifications", logger.ErrAttr(err))
+
+		return fmt.Errorf("failed to configure notifications: %w", err)
+	}
+
 	git.ConfigureAuthResolver(
 		c.GitAuthDomains,
 		c.SSHPrivateKey,
@@ -160,6 +180,10 @@ func run() error {
 			InstallationID: c.GitHubAppInstallationID,
 		},
 	)
+
+	if err = ssh.ConfigureKnownHostsFile(c.SSHKnownHostsFile); err != nil {
+		return fmt.Errorf("failed to configure SSH known_hosts: %w", err)
+	}
 
 	// Parse the log level from the app configuration
 	logLevel, err := logger.ParseLevel(c.LogLevel)
@@ -176,7 +200,7 @@ func run() error {
 			scheme = "https"
 		}
 
-		checkUrl := fmt.Sprintf("%s://localhost:%d%s", scheme, c.HttpPort, healthPath)
+		checkUrl := fmt.Sprintf("%s://localhost:%d%s", scheme, c.HttpPort, api.HealthPath)
 
 		err := healthcheck.Check(ctx, checkUrl, c.HttpTLSEnabled)
 		if err != nil {
@@ -243,21 +267,31 @@ func run() error {
 		}
 	}
 
-	if c.DockerSwarmFeatures {
-		if err := swarm.RefreshModeEnabled(ctx, dockerClient); err != nil {
-			log.Critical("failed to check if docker daemon is a swarm manager", logger.ErrAttr(err))
-			return err
-		}
-	} else {
-		swarm.SetDisableSwarmFeature(true)
+	if !c.DockerSwarmFeatures {
 		log.Debug("swarm features disabled by configuration")
+	}
+
+	contexts := docker.NewContextRegistry(dockerCli, docker.ContextRegistryOptions{
+		Quiet:         c.DockerQuietDeploy,
+		SwarmFeatures: c.DockerSwarmFeatures,
+	})
+	defer func() {
+		if closeErr := contexts.Close(); closeErr != nil {
+			log.Error("failed to close docker context clients", logger.ErrAttr(closeErr))
+		}
+	}()
+
+	defaultContext, err := contexts.Get(ctx, docker.DefaultContextName)
+	if err != nil {
+		log.Critical("failed to check default Docker context capabilities", logger.ErrAttr(err))
+		return err
 	}
 
 	log.Debug("negotiated docker versions to use",
 		slog.Group("versions",
 			slog.String("docker_client", dockerClient.ClientVersion()),
 			slog.String("docker_api", dockerCli.CurrentVersion()),
-			slog.Bool("swarm_mode", swarm.GetModeEnabled()),
+			slog.Bool("swarm_mode", defaultContext.SwarmMode),
 		))
 
 	dataMountPoint, err := resolveDataMountPoint(
@@ -305,14 +339,10 @@ func run() error {
 	}
 
 	var wg sync.WaitGroup
-	defer wg.Wait()
-	// cancel the root context to signal all goroutines to stop,
-	// avoid wg.wait hang infinitely.
-	defer rootCancel()
 
 	graceful.SafeGo(&wg, log.Logger,
 		func() {
-			notificationForNewAppVersion(log.Logger)
+			notificationForNewAppVersion(log.Logger, notifier)
 		},
 	)
 
@@ -338,22 +368,101 @@ func run() error {
 		log.Info("secret provider initialized", slog.String("provider", secretProvider.Name()))
 	}
 
-	h := handlerData{
-		appConfig:      c,
-		appVersion:     app.Version,
-		dataMountPoint: dataMountPoint,
-		dockerCli:      dockerCli,
-		log:            log,
-		runTracker: newDeploymentRunTracker(map[deploymentRunTrigger]int{
-			deploymentRunTriggerPoll:         50,
-			deploymentRunTriggerWebhook:      50,
-			deploymentRunTriggerScheduledJob: 50,
-		}),
-		secretProvider: &secretProvider,
+	reconciliationManager, err := reconciliation.NewManager(reconciliation.Dependencies{
+		AppConfig:                c,
+		DataMountPoint:           dataMountPoint,
+		DockerCLI:                dockerCli,
+		Contexts:                 contexts,
+		SecretProvider:           secretProvider,
+		Notifier:                 notifier,
+		MaxConcurrentDeployments: c.MaxConcurrentDeployments,
+	})
+	if err != nil {
+		log.Critical("failed to create reconciliation manager", logger.ErrAttr(err))
+
+		return err
 	}
 
-	// Initialize the deployer limiter according to configuration
-	reconciliation.InitializeDeployerLimiter(c.MaxConcurrentDeployments)
+	sourcePreparer, err := source.NewPreparer(source.Dependencies{
+		AppConfig: c,
+	})
+	if err != nil {
+		log.Critical("failed to create source preparer", logger.ErrAttr(err))
+
+		return err
+	}
+
+	deployment, err := controlplane.NewDeployment(controlplane.DeploymentDependencies{
+		SourcePreparer: sourcePreparer,
+		Reconciler:     reconciliationManager,
+		Contexts:       contexts,
+		DataMountPoint: dataMountPoint,
+	})
+	if err != nil {
+		log.Critical("failed to create deployment operation", logger.ErrAttr(err))
+
+		return err
+	}
+
+	schedulerManager := scheduler.NewManager(contexts, log.Logger, &wg, secretProvider, notifier, reconciliationManager, docker.NewScheduledComposeOptions(c))
+	controlPlaneRuns := controlplane.NewRuns(
+		ctx,
+		log.Logger,
+		controlplane.Dependencies{
+			MaxRunsPerTrigger: map[controlplane.RunTrigger]int{
+				controlplane.RunTriggerPoll:         50,
+				controlplane.RunTriggerWebhook:      50,
+				controlplane.RunTriggerScheduledJob: 50,
+			},
+			ScheduledJobs:  schedulerManager,
+			SecretProvider: secretProvider,
+			Poll: controlplane.PollDependencies{
+				AppConfig:      c,
+				DataMountPoint: dataMountPoint,
+				DockerCLI:      dockerCli,
+				Contexts:       contexts,
+				Runner: func(ctx context.Context, pollConfig poll.Config, appConfig *app.Config, _ container.MountPoint,
+					_ command.Cli, _ *docker.ContextRegistry, logger *slog.Logger, metadata notification.Metadata,
+					_ secretprovider.SecretProvider, triggerReason string,
+				) error {
+					return RunPoll(ctx, pollConfig, appConfig, logger, metadata, triggerReason, deployment, notifier)
+				},
+			},
+		},
+	)
+
+	defer reconciliationManager.Close()
+	defer wg.Wait()
+	defer controlPlaneRuns.CloseAndWait()
+	// Cancel lifecycle work before waiting, then close shared resources after all jobs stop.
+	defer rootCancel()
+
+	h := orchestrationHandler{
+		appConfig:        c,
+		controlPlaneRuns: controlPlaneRuns,
+		contexts:         contexts,
+		log:              log,
+		secretProvider:   secretProvider,
+		deployment:       deployment,
+		notifier:         notifier,
+	}
+
+	apiHandler, err := api.NewHandler(api.Dependencies{
+		AppConfig:      c,
+		Logger:         log,
+		DockerCLI:      dockerCli,
+		Contexts:       contexts,
+		Runs:           controlPlaneRuns,
+		SecretProvider: secretProvider,
+		HealthFailureReporter: func(w http.ResponseWriter, log *slog.Logger, jobID string, failureType, cause error) {
+			reportHealthFailure(w, log, jobID, failureType, cause, notifier)
+		},
+	})
+	if err != nil {
+		log.Critical("failed to create API handler", logger.ErrAttr(err))
+
+		return err
+	}
 
 	if len(c.PollConfig) > 0 {
 		log.Info(
@@ -373,7 +482,7 @@ func run() error {
 
 	if c.SchedulerEnabled {
 		graceful.SafeGo(&wg, log.Logger, func() {
-			scheduler.Start(ctx, h.dockerCli, log.Logger, &wg, h.secretProvider)
+			schedulerManager.Start(ctx)
 		})
 	} else {
 		log.Info("scheduler disabled by configuration")
@@ -386,18 +495,52 @@ func run() error {
 				slog.String("secret_provider", c.SecretProvider),
 			)
 		} else {
-			watcher := certrotation.New(h.dockerCli, log.Logger, h.secretProvider, c.CertRotationThreshold, c.CertRotationCheckInterval)
+			watcher := certrotation.New(contexts, log.Logger, h.secretProvider, c.CertRotationThreshold, c.CertRotationCheckInterval, docker.NewCertificateRotationOptions(c))
 
 			graceful.SafeGo(&wg, log.Logger, func() {
 				watcher.Start(ctx)
 			})
 		}
-	} else {
+	} else if c.SecretProvider == openbao.Name {
 		log.Info("certificate rotation watcher disabled by configuration")
 	}
 
-	registryApiServer(c, &h, log)
+	apiMounts := api.Mounts{
+		Webhook: http.HandlerFunc(h.WebhookHandler),
+	}
+
+	if c.McpEnabled && c.ApiSecret != "" {
+		mcpHandler, err := mcp.NewHandler(mcp.Dependencies{
+			Version:              app.Version,
+			APISecret:            c.ApiSecret,
+			MaxPayloadSize:       c.MaxPayloadSize,
+			TrustedProxyHeader:   c.TrustedProxyHeader,
+			TrustedProxyNetworks: c.TrustedProxyNetworks,
+			Logger:               log,
+			DockerCLI:            dockerCli,
+			Contexts:             contexts,
+			Runs:                 controlPlaneRuns,
+		})
+		if err != nil {
+			log.Critical("failed to create MCP handler", logger.ErrAttr(err))
+
+			return err
+		}
+
+		apiMounts.MCP = mcpHandler
+	}
+
+	if err := registryApiServer(c, apiHandler, apiMounts, log); err != nil {
+		log.Critical("failed to register API server", logger.ErrAttr(err))
+
+		return err
+	}
+
 	prometheus.RegisterServer(c.MetricsPort, c.HttpTLSCertFile, c.HttpTLSKeyFile, log)
+
+	if c.PprofEnabled {
+		profiling.RegisterServer(c.PprofPort, log)
+	}
 
 	if err := graceful.Serve(log.Logger); err != nil {
 		log.Critical("failed to serve", logger.ErrAttr(err))

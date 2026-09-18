@@ -10,6 +10,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 
 	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
@@ -53,11 +54,29 @@ func (s *StageManager) RunPostDeployStage(_ context.Context, stageLog *slog.Logg
 	metadata.ChangedServices = s.DeployState.changedServiceNames()
 
 	if s.DeployState.DeployedCommit != "" && latestCommit != "" {
+		// Only commits that touch the files of this stack belong in its changelog, so a
+		// repository with several stacks does not report the changes of all of them.
+		// A nil filter walks the log unfiltered, which is what a project without any
+		// resolvable path in the repository falls back to.
+		// The deployment configuration is passed alongside the project because it is not
+		// part of it: it declares the stack and holds its image tags, so a commit that
+		// touches only it is precisely the commit that caused this deploy.
+		pathFilter, filterErr := docker.ProjectPathFilter(
+			s.Repository.PathExternal,
+			s.Docker.Project,
+			s.DeployConfig.Internal.File,
+		)
+		if filterErr != nil {
+			stageLog.Warn("failed to build changelog path filter, listing all commits", logger.ErrAttr(filterErr))
+		}
+
 		metadata.Commits, err = git.GetCommitsBetween(
+			stageLog,
 			s.Repository.Git,
 			plumbing.NewHash(s.DeployState.DeployedCommit),
 			plumbing.NewHash(latestCommit),
 			maxChangelogCommits,
+			pathFilter,
 		)
 		if err != nil {
 			// changelog is best-effort, never block the notification
@@ -65,7 +84,7 @@ func (s *StageManager) RunPostDeployStage(_ context.Context, stageLog *slog.Logg
 		}
 	}
 
-	err = notification.Send(notification.Success, "Deployment completed", "Successfully deployed stack "+s.DeployConfig.Name, metadata)
+	err = s.Notifier.Send(notification.Success, "Deployment completed", "Successfully deployed stack "+s.DeployConfig.Name, metadata)
 	if err != nil {
 		stageLog.Error("failed to send notification", logger.ErrAttr(err))
 	}

@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/filesystem"
@@ -234,6 +235,209 @@ func TestGetConfig_SchedulerEnabled(t *testing.T) {
 
 	if cfg.SchedulerEnabled {
 		t.Fatal("expected SchedulerEnabled to be false")
+	}
+}
+
+func TestGetConfig_McpEnabled(t *testing.T) {
+	tests := []struct {
+		name        string
+		mcpEnabled  string
+		apiSecret   string
+		wantEnabled bool
+		wantErr     string
+	}{
+		{
+			name: "disabled by default",
+		},
+		{
+			name:        "enabled with API secret",
+			mcpEnabled:  "true",
+			apiSecret:   "x",
+			wantEnabled: true,
+		},
+		{
+			name:       "enabled without API secret",
+			mcpEnabled: "true",
+			wantErr:    "MCP_ENABLED requires API_SECRET",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("HTTP_PORT", "8080")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("MCP_ENABLED", testCase.mcpEnabled)
+			t.Setenv("API_SECRET", testCase.apiSecret)
+			t.Setenv("API_SECRET_FILE", "")
+
+			cfg, err := GetConfig()
+			if testCase.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", testCase.wantErr, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected config to load, got %v", err)
+			}
+
+			if cfg.McpEnabled != testCase.wantEnabled {
+				t.Fatalf("expected McpEnabled=%v, got %v", testCase.wantEnabled, cfg.McpEnabled)
+			}
+		})
+	}
+
+	t.Run("enabled with API secret file", func(t *testing.T) {
+		const apiSecret = "file-secret"
+
+		apiSecretFile := path.Join(t.TempDir(), "api-secret")
+		if err := os.WriteFile(apiSecretFile, []byte(apiSecret), filesystem.PermOwner); err != nil {
+			t.Fatalf("failed to write API secret file: %v", err)
+		}
+
+		t.Setenv("LOG_LEVEL", "info")
+		t.Setenv("HTTP_PORT", "8080")
+		t.Setenv("WEBHOOK_SECRET", "secret")
+		t.Setenv("MCP_ENABLED", "true")
+		t.Setenv("API_SECRET", "")
+		t.Setenv("API_SECRET_FILE", apiSecretFile)
+
+		cfg, err := GetConfig()
+		if err != nil {
+			t.Fatalf("expected config to load, got %v", err)
+		}
+
+		if !cfg.McpEnabled {
+			t.Fatal("expected McpEnabled to be true")
+		}
+
+		if cfg.ApiSecret != apiSecret {
+			t.Fatalf("expected ApiSecret=%q, got %q", apiSecret, cfg.ApiSecret)
+		}
+	})
+}
+
+func TestGetConfig_OpenAPIEnabled(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		value       string
+		wantEnabled bool
+	}{
+		{
+			name: "disabled by default",
+		},
+		{
+			name:        "enabled",
+			value:       "true",
+			wantEnabled: true,
+		},
+		{
+			name:  "explicitly disabled",
+			value: "false",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("OPENAPI_ENABLED", testCase.value)
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("API_SECRET", "")
+			t.Setenv("API_SECRET_FILE", "")
+
+			cfg, err := GetConfig()
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+
+			if cfg.OpenAPIEnabled != testCase.wantEnabled {
+				t.Fatalf("OpenAPIEnabled = %v, want %v", cfg.OpenAPIEnabled, testCase.wantEnabled)
+			}
+		})
+	}
+}
+
+func TestGetConfig_Pprof(t *testing.T) {
+	tests := []struct {
+		name        string
+		enabled     string
+		port        string
+		metricsPort string
+		wantEnabled bool
+		wantPort    uint16
+		wantErr     string
+	}{
+		{
+			name:     "disabled by default",
+			wantPort: 6060,
+		},
+		{
+			name:        "enabled with custom port",
+			enabled:     "true",
+			port:        "6061",
+			wantEnabled: true,
+			wantPort:    6061,
+		},
+		{
+			name:    "rejects HTTP port conflict",
+			enabled: "true",
+			port:    "8080",
+			wantErr: "PPROF_PORT and HTTP_PORT cannot be the same",
+		},
+		{
+			name:        "rejects metrics port conflict",
+			enabled:     "true",
+			port:        "6061",
+			metricsPort: "6061",
+			wantErr:     "PPROF_PORT and METRICS_PORT cannot be the same",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("HTTP_PORT", "8080")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("PPROF_ENABLED", testCase.enabled)
+			t.Setenv("PPROF_PORT", testCase.port)
+			t.Setenv("METRICS_PORT", testCase.metricsPort)
+
+			cfg, err := GetConfig()
+			if testCase.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", testCase.wantErr, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected config to load, got %v", err)
+			}
+
+			if cfg.PprofEnabled != testCase.wantEnabled {
+				t.Fatalf("PprofEnabled = %t, want %t", cfg.PprofEnabled, testCase.wantEnabled)
+			}
+
+			if cfg.PprofPort != testCase.wantPort {
+				t.Fatalf("PprofPort = %d, want %d", cfg.PprofPort, testCase.wantPort)
+			}
+		})
+	}
+}
+
+func TestGetConfigRejectsNonPositiveMaxPayloadSize(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("MAX_PAYLOAD_SIZE", value)
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("API_SECRET", "")
+			t.Setenv("API_SECRET_FILE", "")
+
+			if _, err := GetConfig(); err == nil {
+				t.Fatalf("expected MAX_PAYLOAD_SIZE=%s to be rejected", value)
+			}
+		})
 	}
 }
 
@@ -806,5 +1010,37 @@ func TestGetConfig_PollConfigAbsolutePathNormalizedInPlace(t *testing.T) {
 	want := "file:///local-repos/my-app"
 	if got := cfg.PollConfig[0].SourceUrl; got != want {
 		t.Fatalf("expected normalized SourceUrl %q to be persisted, got %q", want, got)
+	}
+}
+
+func TestGetConfig_PollConfigExplicitZeroDisablesPolling(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("POLL_CONFIG", `
+- source: oci
+  url: ghcr.io/kimdre/doco-cd_tests:test
+  interval: 0
+- source: git
+  url: https://github.com/kimdre/doco-cd_tests.git
+  reference: main
+  interval: 10
+`)
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected poll config to be accepted, got %v", err)
+	}
+
+	if len(cfg.PollConfig) != 2 {
+		t.Fatalf("expected 2 poll configs, got %d", len(cfg.PollConfig))
+	}
+
+	if got := cfg.PollConfig[0].Interval; got != 0 {
+		t.Fatalf("expected explicit zero interval to be preserved, got %s", got)
+	}
+
+	if got := cfg.PollConfig[1].Interval; got != 10*time.Second {
+		t.Fatalf("expected Git interval to be 10s, got %s", got)
 	}
 }

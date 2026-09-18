@@ -5,6 +5,8 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 )
 
 type OciKeylessIdentity struct {
@@ -14,9 +16,9 @@ type OciKeylessIdentity struct {
 }
 
 type OciTrustPolicy struct {
-	Enabled           bool                 `yaml:"enabled" json:"enabled"`
 	KeylessIdentities []OciKeylessIdentity `yaml:"keyless_identities" json:"keyless_identities"`
 	PublicKeys        []string             `yaml:"public_keys" json:"public_keys"`
+	Enabled           bool                 `yaml:"enabled" json:"enabled"`
 	IgnoreTlog        bool                 `yaml:"ignore_tlog" json:"ignore_tlog"`
 }
 
@@ -78,7 +80,7 @@ func EffectiveOciTrustPolicy(global OciTrustPolicy, override OciTrustPolicyOverr
 // ParseOciInsecureRegistries normalizes a comma-separated list of registry host[:port] entries.
 func ParseOciInsecureRegistries(value string) ([]string, error) {
 	registries := make([]string, 0)
-	seen := map[string]struct{}{}
+	seen := set.New[string]()
 
 	for entry := range strings.SplitSeq(value, ",") {
 		entry = strings.TrimSpace(entry)
@@ -105,11 +107,11 @@ func ParseOciInsecureRegistries(value string) ([]string, error) {
 		}
 
 		normalized := strings.ToLower(entry)
-		if _, ok := seen[normalized]; ok {
+		if seen.Contains(normalized) {
 			continue
 		}
 
-		seen[normalized] = struct{}{}
+		seen.Add(normalized)
 		registries = append(registries, normalized)
 	}
 

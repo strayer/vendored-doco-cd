@@ -13,12 +13,16 @@ bin/
 *.dll
 *.so
 *.dylib
+doco-cd
 
 # Test binary, built with `go test -c`
 *.test
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+
+# Go profiling files
+*.pb.gz
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -33,6 +37,8 @@ ed25519
 
 *.env
 .env
+# examples commit their env files on purpose (cleartext non-secret config)
+!examples/**/*.env
 
 cover.out
 cover.html
@@ -43,3 +49,4 @@ git-auth-domains.yaml
 # Agents/Copilot files
 issue.md
 .github/AGENTS.md
+.github/mcp.json

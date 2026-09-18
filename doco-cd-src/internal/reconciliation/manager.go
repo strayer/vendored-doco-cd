@@ -2,6 +2,8 @@ package reconciliation
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -10,68 +12,156 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 
-	"github.com/kimdre/doco-cd/internal/graceful"
+	"github.com/kimdre/doco-cd/internal/common/validation"
+	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	"github.com/kimdre/doco-cd/internal/stages"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
-var reconciliationHandler *reconciliation
+// ErrManagerClosed indicates that a deployment was submitted after shutdown began.
+var ErrManagerClosed = errors.New("reconciliation manager is closed")
 
-func init() {
-	reconciliationHandler = newReconciliation()
+// Dependencies configures reconciliation lifecycle, deployment admission, and the stable
+// application-level services shared by every deployment the Manager runs: application
+// configuration, the data mount point, the base Docker CLI, the Docker context registry, and
+// an optional secret provider. Per-run values (trigger, repository, deploy configs, payload,
+// notification metadata) are supplied per call via DeployRequest instead.
+type Dependencies struct {
+	// MaxConcurrentDeployments controls how many deployments can run concurrently within a manager instance.
+	// It sets the capacity of a semaphore-based limiter (DeployerLimiter).
+	MaxConcurrentDeployments uint `validate:"min=1"`
+
+	AppConfig      *app.Config             `validate:"required,nostructlevel"`
+	DataMountPoint container.MountPoint    `validate:"required"`
+	DockerCLI      command.Cli             `validate:"required,nostructlevel"`
+	Contexts       *docker.ContextRegistry `validate:"required"`
+	// A nil SecretProvider means no external secret provider is configured.
+	SecretProvider secretprovider.SecretProvider
+	Notifier       notification.Sender `validate:"required,nostructlevel"`
+	RuntimeQueries RuntimeQueries
 }
 
-func init() {
-	graceful.RegistryShutdownFunc("close_reconciliation", func() {
-		reconciliationHandler.close()
-	})
+// RuntimeQueries is the read-only Docker query surface used by reconciliation.
+type RuntimeQueries interface {
+	ListManagedRepositoryContainers(ctx context.Context, apiClient client.APIClient, repository string, all bool) ([]container.Summary, error)
+	InspectContainerState(ctx context.Context, apiClient client.APIClient, containerID string) (*container.State, error)
+	ListManagedRepositoryServices(ctx context.Context, apiClient client.APIClient, repository string) ([]swarm.Service, error)
+}
+
+type dockerRuntimeQueries struct{}
+
+func (dockerRuntimeQueries) ListManagedRepositoryContainers(ctx context.Context, apiClient client.APIClient, repository string, all bool) ([]container.Summary, error) {
+	return docker.ListManagedRepositoryContainers(ctx, apiClient, repository, all)
+}
+
+func (dockerRuntimeQueries) InspectContainerState(ctx context.Context, apiClient client.APIClient, containerID string) (*container.State, error) {
+	return docker.InspectContainerState(ctx, apiClient, containerID)
+}
+
+func (dockerRuntimeQueries) ListManagedRepositoryServices(ctx context.Context, apiClient client.APIClient, repository string) ([]swarm.Service, error) {
+	return docker.ListManagedRepositoryServices(ctx, apiClient, repository)
+}
+
+// Manager owns reconciliation jobs, active-deployment tracking, scheduler
+// holds, and deployment admission state.
+type Manager struct {
+	jobs           jobRegistry
+	deployments    deploymentTracker
+	schedulerHolds schedulerHoldRegistry
+	limiter        *DeployerLimiter
+	closeOnce      sync.Once
+	lifecycleMu    sync.Mutex
+	closed         bool
+	deployWG       sync.WaitGroup
+	jobWG          sync.WaitGroup
+
+	// Stable application dependencies shared by every deployment; see Dependencies.
+	appConfig      *app.Config
+	dataMountPoint container.MountPoint
+	dockerCli      command.Cli
+	contexts       *docker.ContextRegistry
+	secretProvider secretprovider.SecretProvider
+	notifier       notification.Sender
+	runtimeQueries RuntimeQueries
+}
+
+// NewManager validates dependencies and creates an isolated reconciliation manager.
+func NewManager(dependencies Dependencies) (*Manager, error) {
+	if dependencies.MaxConcurrentDeployments == 0 {
+		dependencies.MaxConcurrentDeployments = 1
+	}
+
+	if dependencies.RuntimeQueries == nil {
+		dependencies.RuntimeQueries = dockerRuntimeQueries{}
+	}
+
+	if err := validation.Validate(dependencies); err != nil {
+		return nil, fmt.Errorf("validate reconciliation dependencies: %w", err)
+	}
+
+	return &Manager{
+		jobs:           jobRegistry{jobs: make(map[string]*job)},
+		deployments:    deploymentTracker{stacks: make(map[string]int)},
+		schedulerHolds: schedulerHoldRegistry{services: make(map[string]schedulerHoldEntry)},
+		limiter:        NewDeployerLimiter(dependencies.MaxConcurrentDeployments),
+		appConfig:      dependencies.AppConfig,
+		dataMountPoint: dependencies.DataMountPoint,
+		dockerCli:      dependencies.DockerCLI,
+		contexts:       dependencies.Contexts,
+		secretProvider: dependencies.SecretProvider,
+		notifier:       dependencies.Notifier,
+		runtimeQueries: dependencies.RuntimeQueries,
+	}, nil
 }
 
 // contextCLIEntry holds a Docker CLI and its resolved metadata for one Docker context.
 type contextCLIEntry struct {
 	cli       command.Cli
-	closeFn   func() // nil for the default context (which is always j.info.dockerCli)
 	swarmMode bool
 }
 
-type jobInfo struct {
-	appConfig      *app.Config
-	dataMountPoint container.MountPoint
-	dockerCli      command.Cli
-	secretProvider *secretprovider.SecretProvider
-
-	jobLog *slog.Logger
-
-	metadata      notification.Metadata
-	jobTrigger    stages.JobTrigger
-	repoData      stages.RepositoryData
-	deployConfigs []*deployConfig.Config
-	payload       *webhook.ParsedPayload
-	testName      string
+// DeployRequest carries the per-run input for a single reconciliation deployment: the trigger
+// metadata, source repository/payload data, resolved deploy configs, and (for test runs only) a
+// unique test name. Stable application dependencies (app config, Docker CLI, context registry,
+// secret provider) live on the Manager itself instead; see Dependencies.
+type DeployRequest struct {
+	Logger        *slog.Logger `validate:"required,nostructlevel"`
+	Metadata      notification.Metadata
+	JobTrigger    stages.JobTrigger `validate:"required,oneof=webhook poll"`
+	Repository    stages.RepositoryData
+	DeployConfigs []*deployConfig.Config `validate:"dive,required"`
+	Payload       *webhook.ParsedPayload
+	TestName      string
 }
 
 type job struct {
-	info                     jobInfo
+	manager                  *Manager
+	info                     DeployRequest
 	deployConfigGroupByEvent map[string][]*deployConfig.Config // key is the docker event action name (for example "die" or "unhealthy").
 	restartStateMu           sync.Mutex                        // guards unhealthyRestartHistory and restartSuppressUntil against concurrent access from parallel per-context startup recovery goroutines.
 	unhealthyRestartHistory  map[string][]time.Time            // key is the docker container ID, value is the list of timestamps of recent unhealthy restart events for that container.
 	restartSuppressUntil     map[string]time.Time              // key is the docker container ID that was restarted, value is the timestamp until which follow-up events from that restart should be suppressed.
 	closeChan                chan struct{}
+	cancel                   context.CancelFunc
 	readyChan                chan struct{}
 	readyOnce                sync.Once
+	closeOnce                sync.Once
 	// contextCLIs maps context name (empty string = default) to its Docker CLI and metadata.
 	// Populated at the start of run() and closed when the job exits.
 	contextCLIs map[string]contextCLIEntry
 }
 
-func newJob(info jobInfo, deployConfigGroupByEvent map[string][]*deployConfig.Config) *job {
+func newJob(manager *Manager, info DeployRequest, deployConfigGroupByEvent map[string][]*deployConfig.Config) *job {
 	return &job{
+		manager:                  manager,
 		info:                     info,
 		deployConfigGroupByEvent: deployConfigGroupByEvent,
 		unhealthyRestartHistory:  make(map[string][]time.Time),
@@ -86,7 +176,13 @@ func (j *job) close() {
 		return
 	}
 
-	close(j.closeChan)
+	j.closeOnce.Do(func() {
+		if j.cancel != nil {
+			j.cancel()
+		}
+
+		close(j.closeChan)
+	})
 }
 
 func (j *job) signalReady() {
@@ -95,6 +191,7 @@ func (j *job) signalReady() {
 	}
 
 	j.readyOnce.Do(func() {
+		j.info.Logger.Debug("reconciliation event listeners ready")
 		close(j.readyChan)
 	})
 }
@@ -116,43 +213,106 @@ type schedulerHoldEntry struct {
 // grace period ensures those stale events are still suppressed.
 const schedulerStopHoldGracePeriod = 10 * time.Second
 
-type reconciliation struct {
-	m sync.Mutex
-
-	repoJobs              map[string]*job
-	deployingStacks       map[string]int
-	schedulerHeldServices map[string]schedulerHoldEntry // key = "project/service"
+type jobRegistry struct {
+	mu     sync.Mutex
+	jobs   map[string]*job
+	closed bool
 }
 
-func newReconciliation() *reconciliation {
-	return &reconciliation{
-		repoJobs:              make(map[string]*job),
-		deployingStacks:       make(map[string]int),
-		schedulerHeldServices: make(map[string]schedulerHoldEntry),
-		m:                     sync.Mutex{},
-	}
+// deploymentTracker records active stack deployments so matching Docker
+// events do not start duplicate reconciliation work.
+type deploymentTracker struct {
+	mu     sync.Mutex
+	stacks map[string]int
 }
 
-func (r *reconciliation) close() {
-	r.m.Lock()
-	defer r.m.Unlock()
+// schedulerHoldRegistry records Compose services intentionally stopped by
+// scheduled jobs, including the post-release event grace period.
+type schedulerHoldRegistry struct {
+	mu       sync.Mutex
+	services map[string]schedulerHoldEntry
+}
 
-	for _, job := range r.repoJobs {
-		job.close()
+// Close stops reconciliation jobs, waits for them to release Docker resources,
+// and stops limiter cleanup. It is safe to call more than once.
+func (m *Manager) Close() {
+	if m == nil {
+		return
 	}
 
-	r.repoJobs = make(map[string]*job)
-	r.deployingStacks = make(map[string]int)
-	r.schedulerHeldServices = make(map[string]schedulerHoldEntry)
+	m.closeOnce.Do(func() {
+		m.lifecycleMu.Lock()
+		m.closed = true
+		m.lifecycleMu.Unlock()
+		m.deployWG.Wait()
+
+		jobs := m.jobs.removeAll()
+		for _, job := range jobs {
+			job.close()
+		}
+
+		m.jobWG.Wait()
+
+		m.deployments.clear()
+		m.schedulerHolds.clear()
+		m.limiter.Close()
+	})
+}
+
+func (r *jobRegistry) removeAll() []*job {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	jobs := make([]*job, 0, len(r.jobs))
+	for _, job := range r.jobs {
+		jobs = append(jobs, job)
+	}
+
+	r.jobs = make(map[string]*job)
+	r.closed = true
+
+	return jobs
+}
+
+func (m *Manager) beginDeploy() error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	if m.closed {
+		return ErrManagerClosed
+	}
+
+	m.deployWG.Add(1)
+
+	return nil
+}
+
+// clear resets deployment state after all admitted work has drained.
+func (r *deploymentTracker) clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.stacks = make(map[string]int)
+}
+
+// clear releases scheduler hold state after scheduler workers have stopped.
+func (r *schedulerHoldRegistry) clear() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	r.services = make(map[string]schedulerHoldEntry)
 }
 
 // MarkSchedulerStopHeld records that the scheduler has intentionally stopped the
-// given compose service (identified by its compose project and service name) so
-// that the reconciliation event listener does not try to restart it while the
-// scheduled job is running. The hold is refcounted to handle concurrent jobs
-// that stop the same service.
-func MarkSchedulerStopHeld(project, service string) {
-	reconciliationHandler.markSchedulerStopHeld(project, service)
+// given compose service (identified by its Docker context, compose project, and
+// service name) so that the reconciliation event listener does not try to
+// restart it while the scheduled job is running. The hold is refcounted to
+// handle concurrent jobs that stop the same service. contextName is the
+// normalized Docker context name (empty string = default context) the
+// service lives on; the same project/service name on two different contexts
+// are tracked independently.
+func (m *Manager) MarkSchedulerStopHeld(contextName, project, service string) {
+	m.schedulerHolds.mark(contextName, project, service)
 }
 
 // UnmarkSchedulerStopHeld releases a hold previously registered via
@@ -160,76 +320,98 @@ func MarkSchedulerStopHeld(project, service string) {
 // grace period (see schedulerStopHoldGracePeriod) so that any Docker stop
 // event still buffered in the reconciliation channel does not trigger a
 // spurious restart.
-func UnmarkSchedulerStopHeld(project, service string) {
-	reconciliationHandler.unmarkSchedulerStopHeld(project, service)
+func (m *Manager) UnmarkSchedulerStopHeld(contextName, project, service string) {
+	m.schedulerHolds.unmark(contextName, project, service)
 }
 
-func schedulerHeldServiceKey(project, service string) string {
-	return project + "/" + service
+// IsSchedulerStopHeld reports whether the given Compose service is currently
+// held stopped by the job scheduler, including the post-release grace period.
+// The pre-deploy stage uses it to tell doco-cd's own stop window apart from
+// real drift, so a poll tick landing inside that window does not deploy a stack
+// that is about to be started again anyway.
+func (m *Manager) IsSchedulerStopHeld(contextName, project, service string) bool {
+	if m == nil {
+		return false
+	}
+
+	return m.schedulerHolds.isServiceHeld(contextName, project, service)
 }
 
-func (r *reconciliation) markSchedulerStopHeld(project, service string) {
+func schedulerHeldServiceKey(contextName, project, service string) string {
+	contextName = docker.NormalizeContextName(contextName)
+	return contextName + "/" + project + "/" + service
+}
+
+func (r *schedulerHoldRegistry) mark(contextName, project, service string) {
 	if project == "" || service == "" {
 		return
 	}
 
-	key := schedulerHeldServiceKey(project, service)
+	key := schedulerHeldServiceKey(contextName, project, service)
 
-	r.m.Lock()
-	entry := r.schedulerHeldServices[key]
+	r.mu.Lock()
+	entry := r.services[key]
 	entry.count++
 	entry.expiresAt = time.Time{} // clear any lingering grace period
-	r.schedulerHeldServices[key] = entry
-	r.m.Unlock()
+	r.services[key] = entry
+	r.mu.Unlock()
 }
 
-func (r *reconciliation) unmarkSchedulerStopHeld(project, service string) {
+func (r *schedulerHoldRegistry) unmark(contextName, project, service string) {
 	if project == "" || service == "" {
 		return
 	}
 
-	key := schedulerHeldServiceKey(project, service)
+	key := schedulerHeldServiceKey(contextName, project, service)
 
-	r.m.Lock()
-	defer r.m.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	entry := r.schedulerHeldServices[key]
+	entry := r.services[key]
 
 	if entry.count <= 1 {
 		// Last holder released. Keep the entry alive for the grace period so
 		// that stop events already buffered in the reconciliation channel are
 		// still suppressed after the service has been restarted.
-		r.schedulerHeldServices[key] = schedulerHoldEntry{
+		r.services[key] = schedulerHoldEntry{
 			count:     0,
 			expiresAt: time.Now().Add(schedulerStopHoldGracePeriod),
 		}
 	} else {
 		entry.count--
-		r.schedulerHeldServices[key] = entry
+		r.services[key] = entry
 	}
 }
 
 // isServiceSchedulerStopHeld reports whether the container described by attrs is
 // currently held stopped by the job scheduler (or within the post-release grace
-// period). It uses the standard Docker Compose labels to identify the service.
-func (r *reconciliation) isServiceSchedulerStopHeld(attrs map[string]string) bool {
+// period) on the given Docker context. It uses the standard Docker Compose
+// labels to identify the service.
+func (r *schedulerHoldRegistry) isHeld(contextName string, attrs map[string]string) bool {
 	if attrs == nil {
 		return false
 	}
 
-	project := strings.TrimSpace(attrs[api.ProjectLabel])
-	service := strings.TrimSpace(attrs[api.ServiceLabel])
+	return r.isServiceHeld(contextName, attrs[api.ProjectLabel], attrs[api.ServiceLabel])
+}
+
+// isServiceHeld reports whether the given Compose project/service on the given
+// Docker context is currently held stopped by the job scheduler, including the
+// post-release grace period.
+func (r *schedulerHoldRegistry) isServiceHeld(contextName, project, service string) bool {
+	project = strings.TrimSpace(project)
+	service = strings.TrimSpace(service)
 
 	if project == "" || service == "" {
 		return false
 	}
 
-	key := schedulerHeldServiceKey(project, service)
+	key := schedulerHeldServiceKey(contextName, project, service)
 
-	r.m.Lock()
-	defer r.m.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	entry, ok := r.schedulerHeldServices[key]
+	entry, ok := r.services[key]
 	if !ok {
 		return false
 	}
@@ -243,78 +425,90 @@ func (r *reconciliation) isServiceSchedulerStopHeld(attrs map[string]string) boo
 		return true
 	}
 
-	// Grace period expired — clean up lazily.
-	delete(r.schedulerHeldServices, key)
+	// Grace period expired, so clean up lazily.
+	delete(r.services, key)
 
 	return false
 }
 
-func stackDeploymentKey(repository, stack string) string {
-	return repository + "/" + stack
+// stackDeploymentKey builds the tracking key for a deployment. Stack names are
+// only guaranteed unique within a Docker context, so context is included to
+// avoid conflating same-named stacks deployed to different contexts.
+func stackDeploymentKey(repository, context, stack string) string {
+	context = docker.NormalizeContextName(context)
+	return repository + "/" + context + "/" + stack
 }
 
-func (r *reconciliation) startStackDeployment(repository, stack string) {
+func (r *deploymentTracker) start(repository, context, stack string) {
 	if repository == "" || stack == "" {
 		return
 	}
 
-	key := stackDeploymentKey(repository, stack)
+	key := stackDeploymentKey(repository, context, stack)
 
-	r.m.Lock()
-	r.deployingStacks[key]++
-	r.m.Unlock()
+	r.mu.Lock()
+	r.stacks[key]++
+	r.mu.Unlock()
 }
 
-func (r *reconciliation) finishStackDeployment(repository, stack string) {
+func (r *deploymentTracker) finish(repository, context, stack string) {
 	if repository == "" || stack == "" {
 		return
 	}
 
-	key := stackDeploymentKey(repository, stack)
+	key := stackDeploymentKey(repository, context, stack)
 
-	r.m.Lock()
-	defer r.m.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	count := r.deployingStacks[key]
+	count := r.stacks[key]
 	if count <= 1 {
-		delete(r.deployingStacks, key)
+		delete(r.stacks, key)
 		return
 	}
 
-	r.deployingStacks[key] = count - 1
+	r.stacks[key] = count - 1
 }
 
-func (r *reconciliation) isStackDeploymentInProgress(repository, stack string) bool {
+func (r *deploymentTracker) isInProgress(repository, context, stack string) bool {
 	if repository == "" || stack == "" {
 		return false
 	}
 
-	key := stackDeploymentKey(repository, stack)
+	key := stackDeploymentKey(repository, context, stack)
 
-	r.m.Lock()
-	defer r.m.Unlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 
-	return r.deployingStacks[key] > 0
+	return r.stacks[key] > 0
 }
 
-func (r *reconciliation) addJob(ctx context.Context, info jobInfo) {
-	cfg := getDeployConfigGroupByEvent(info.deployConfigs)
+func (m *Manager) addJob(ctx context.Context, req DeployRequest) {
+	cfg := getDeployConfigGroupByEvent(req.DeployConfigs)
 	if len(cfg) == 0 {
 		return
 	}
 
-	r.m.Lock()
-	defer r.m.Unlock()
+	newJob := newJob(m, req, cfg)
+	jobCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	newJob.cancel = cancel
 
-	old := r.repoJobs[info.repoData.Name]
+	m.jobs.mu.Lock()
+	if m.jobs.closed {
+		m.jobs.mu.Unlock()
+		newJob.close()
+
+		return
+	}
+
+	m.jobWG.Add(1)
+	old := m.jobs.jobs[req.Repository.Name]
+	m.jobs.jobs[req.Repository.Name] = newJob
+	m.jobs.mu.Unlock()
+
 	old.close()
 
-	// start new
-	newJob := newJob(info, cfg)
-
-	r.repoJobs[info.repoData.Name] = newJob
-
-	jobLog := info.jobLog
+	jobLog := req.Logger
 
 	go func() {
 		defer func() {
@@ -323,7 +517,9 @@ func (r *reconciliation) addJob(ctx context.Context, info jobInfo) {
 			}
 		}()
 
-		newJob.run(context.WithoutCancel(ctx))
+		defer m.jobWG.Done()
+
+		newJob.run(jobCtx)
 	}()
 }
 

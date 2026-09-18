@@ -1,12 +1,12 @@
 package stages
 
 import (
-	"errors"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
 func TestSuccessfulCommitStatusDescription(t *testing.T) {
@@ -51,6 +51,34 @@ func TestSuccessfulCommitStatusDescription(t *testing.T) {
 				t.Fatalf("successfulCommitStatusDescription() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestDeploymentMetricLabels(t *testing.T) {
+	t.Parallel()
+
+	if got := deploymentMetricsRepository(nil); got != "unknown" {
+		t.Fatalf("deploymentMetricsRepository(nil) = %q, want unknown", got)
+	}
+
+	if got := deploymentMetricsRepository(&RepositoryData{Name: " owner/repo "}); got != "owner/repo" {
+		t.Fatalf("deploymentMetricsRepository() = %q, want owner/repo", got)
+	}
+
+	if got := deploymentMetricsName(nil); got != "unknown" {
+		t.Fatalf("deploymentMetricsName(nil) = %q, want unknown", got)
+	}
+
+	if got := deploymentMetricsName(&deploy.Config{Name: " app "}); got != "app" {
+		t.Fatalf("deploymentMetricsName() = %q, want app", got)
+	}
+
+	if got := deploymentMetricsContext(nil); got != "default" {
+		t.Fatalf("deploymentMetricsContext(nil) = %q, want default", got)
+	}
+
+	if got := deploymentMetricsContext(&deploy.Config{Context: " remote "}); got != "remote" {
+		t.Fatalf("deploymentMetricsContext() = %q, want remote", got)
 	}
 }
 
@@ -138,44 +166,6 @@ func TestShouldSendDeploymentStartedNotification(t *testing.T) {
 	}
 }
 
-func TestFailureCommitStatusDescription(t *testing.T) {
-	tests := []struct {
-		name string
-		err  error
-		want string
-	}{
-		{
-			name: "nil error",
-			err:  nil,
-			want: "Failed",
-		},
-		{
-			name: "single line error",
-			err:  errors.New("compose validation failed"),
-			want: "compose validation failed",
-		},
-		{
-			name: "normalizes whitespace",
-			err:  errors.New("error from registry:\n denied"),
-			want: "error from registry: denied",
-		},
-		{
-			name: "truncates long descriptions",
-			err:  errors.New(strings.Repeat("x", 200)),
-			want: strings.Repeat("x", 137) + "...",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := failureCommitStatusDescription(tt.err)
-			if got != tt.want {
-				t.Fatalf("failureCommitStatusDescription() = %q, want %q", got, tt.want)
-			}
-		})
-	}
-}
-
 func TestShouldPostFailureCommitStatus(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -206,6 +196,61 @@ func TestShouldPostFailureCommitStatus(t *testing.T) {
 			got := shouldPostFailureCommitStatus(tt.destroyEnabled)
 			if got != tt.want {
 				t.Fatalf("shouldPostFailureCommitStatus() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestShouldPostWebhookCommitStatus(t *testing.T) {
+	tests := []struct {
+		name           string
+		jobTrigger     JobTrigger
+		destroyEnabled bool
+		want           bool
+	}{
+		{name: "webhook deployment", jobTrigger: JobTriggerWebhook, want: true},
+		{name: "poll deployment", jobTrigger: JobTriggerPoll, want: false},
+		{name: "webhook destroy", jobTrigger: JobTriggerWebhook, destroyEnabled: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := shouldPostWebhookCommitStatus(tt.jobTrigger, tt.destroyEnabled)
+			if got != tt.want {
+				t.Fatalf("shouldPostWebhookCommitStatus() = %t, want %t", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMatchesWebhookEventFilter(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		trigger JobTrigger
+		filter  string
+		ref     string
+		want    bool
+	}{
+		{name: "matching webhook", trigger: JobTriggerWebhook, filter: `^refs/heads/main$`, ref: "refs/heads/main", want: true},
+		{name: "non-matching webhook", trigger: JobTriggerWebhook, filter: `^refs/heads/main$`, ref: "refs/heads/feature", want: false},
+		{name: "webhook without filter", trigger: JobTriggerWebhook, ref: "refs/heads/feature", want: true},
+		{name: "poll ignores filter", trigger: JobTriggerPoll, filter: `^refs/heads/main$`, ref: "refs/heads/feature", want: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			sm := &StageManager{
+				JobTrigger:   tt.trigger,
+				DeployConfig: &deploy.Config{WebhookEventFilter: tt.filter},
+				Payload:      &webhook.ParsedPayload{Ref: tt.ref},
+			}
+
+			if got := sm.MatchesWebhookEventFilter(); got != tt.want {
+				t.Fatalf("MatchesWebhookEventFilter() = %t, want %t", got, tt.want)
 			}
 		})
 	}

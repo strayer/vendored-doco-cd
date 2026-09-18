@@ -10,6 +10,15 @@ tags:
 Doco-CD exposes a RESTful API at the `/v1/api` endpoint.
 Set both `HTTP_TLS_CERT_FILE` and `HTTP_TLS_KEY_FILE` if you want doco-cd itself to serve the API over HTTPS.
 
+## OpenAPI documentation
+
+Set `OPENAPI_ENABLED=true` to expose the public [OpenAPI](https://www.openapis.org/) 3.2 documentation. The feature is disabled by default.
+
+| API surface     | OpenAPI document         | Swagger UI        |
+|-----------------|--------------------------|-------------------|
+| REST and health | `/openapi/rest.json`     | `/docs/`          |
+| Webhooks        | `/openapi/webhooks.json` | `/docs/webhooks/` |
+
 ## Authentication
 
 Set the `API_SECRET` or `API_SECRET_FILE` environment variable in the container to enable the API, see [App Settings](../App-Settings.md#general-settings).
@@ -20,6 +29,27 @@ Example:
 
 ```sh
 curl -H "x-api-key: your_api_key" http://example.com/v1/api/projects
+```
+
+## Query Parameters
+
+Management endpoints support these common query parameters:
+
+| Query Parameter | Type    | Description                                                                          |
+|-----------------|---------|--------------------------------------------------------------------------------------|
+| `context`       | string  | Docker context for project, stack, and scheduled-job endpoints (default: `default`). |
+| `timeout`       | integer | Timeout in seconds (default: `30`).                                                  |
+
+## Docker context selection
+
+Project, stack, and scheduled-job endpoints accept one optional `context` query parameter. If it is omitted or set to `default`, the endpoint uses the default Docker context. 
+Named contexts must exist in the Docker CLI context store available to doco-cd.
+
+These endpoints return the selected external context name in the `X-Doco-CD-Context` response header. Their JSON response shapes do not change.
+
+```sh
+curl -i -H "x-api-key: your_api_key" \
+  "http://example.com/v1/api/projects?context=remote"
 ```
 
 ## Endpoints
@@ -48,11 +78,12 @@ If the application is not healthy, the endpoint returns a `503` status code and 
 
 The API tracks deployment-related runs (for example webhook-triggered deployments and API-triggered poll runs) in memory.
 Use these endpoints to inspect the current status and recent history by `job_id`.
+Each run's `deployments` collection reports the resolved stack and Docker context targets. A single poll or webhook run can contain targets from multiple contexts.
 
-| Endpoint              | Method | Description                           | Query Parameters                                                                                                                                                        |
-|-----------------------|--------|---------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Endpoint              | Method | Description                           | Query Parameters                                                                                                                                                                                                 |
+|-----------------------|--------|---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `/v1/api/runs`        | GET    | List recent tracked deployment runs   | - `limit` (integer, default: `50`, max: `200`)<br/>- `status` (string, optional): `accepted`, `running`, `succeeded`, `failed`, `skipped`<br/>- `trigger` (string, optional): `webhook`, `poll`, `scheduled_job` |
-| `/v1/api/run/{jobID}` | GET    | Get details for a specific run/job ID |                                                                                                                                                                         |
+| `/v1/api/run/{jobID}` | GET    | Get details for a specific run/job ID |                                                                                                                                                                                                                  |
 
 #### Example Requests
 
@@ -135,6 +166,7 @@ curl --request POST \
     You can get the `jobName` from the scheduler logs (`"job":"..."`) or from `GET /v1/api/jobs`.
 
 - If multiple jobs share the same `jobName`, provide `stack` to disambiguate for the run endpoint.
+- If the same job and stack names exist on multiple Docker contexts, provide `context`.
 - If the matched job is disabled, the run endpoint returns a conflict response.
 
 **Common run endpoint outcomes**
@@ -175,14 +207,20 @@ curl --request POST \
 !!! note
     Project management endpoints are only available for compose projects, and will not work for Swarm stacks. To manage Swarm stacks, see the [Swarm Stacks](#swarm-stacks) section below.
 
-| Endpoint                                | Method | Description                               | Query Parameters                                                                                                                                                                           |
-|-----------------------------------------|--------|-------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `/v1/api/projects`                      | GET    | List all deployed compose projects        | - `all` (boolean, default: `false`): Return all projects including inactive ones.                                                                                                          |
-| `/v1/api/project/{projectName}`         | GET    | Get details of a project                  |                                                                                                                                                                                            |
-| `/v1/api/project/{projectName}`         | DELETE | Remove a project                          | - `volumes` (boolean, default: `true`): remove all associated volumes.<br/>- `images` (boolean, default: `true`): remove all associated images.                                            |
-| `/v1/api/project/{projectName}/start`   | POST   | Start a project                           |                                                                                                                                                                                            |
-| `/v1/api/project/{projectName}/stop`    | POST   | Stop a project                            |                                                                                                                                                                                            |
-| `/v1/api/project/{projectName}/restart` | POST   | Restart a project                         |                                                                                                                                                                                            |
+| Endpoint                                 | Method | Description                         | Query Parameters                                                                                                                                           |
+|------------------------------------------|--------|-------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `/v1/api/projects`                       | GET    | List all deployed compose projects  | - `all` (boolean, default: `false`): Return all projects including inactive ones.                                                                          |
+| `/v1/api/project/{projectName}`          | GET    | Get details of a project            |                                                                                                                                                            |
+| `/v1/api/project/{projectName}`          | DELETE | Remove a project                    | - `volumes` (boolean, default: `true`): remove all associated volumes.<br/>- `images` (boolean, default: `true`): remove all associated images.            |
+| `/v1/api/project/{projectName}/start`    | POST   | Start a project                     |                                                                                                                                                            |
+| `/v1/api/project/{projectName}/stop`     | POST   | Stop a project                      |                                                                                                                                                            |
+| `/v1/api/project/{projectName}/restart`  | POST   | Restart a project                   |                                                                                                                                                            |
+| `/v1/api/project/{projectName}/recreate` | POST   | Force-recreate a project or service | - `service` (string, optional): Name of the service to recreate.<br/>- `timeout` (integer, default: `30`): Time in seconds to wait for containers to stop. |
+
+Managed recreation returns `409 Conflict` when the cached Git/OCI source cannot
+be verified against the revision recorded on the running deployment. Run a
+normal deployment to refresh the source cache and deployment metadata before
+retrying recreation.
 
 ### Swarm Stacks
 
@@ -197,14 +235,6 @@ curl --request POST \
 | `/v1/api/stack/{stackName}/scale`   | POST   | Rescale a Swarm stack or service                                                                                  | - `replicas` (integer): Scale to n replicas.<br/>- `service` (string, optional): Name of service to scale.<br/>- `wait` (boolean, default: `true`): Wait for service to be running/healthy | 
 | `/v1/api/stack/{stackName}/restart` | POST   | Restart/Redeploy a Swarm stack or service                                                                         | - `service` (string, optional): Name of service to restart.                                                                                                                                | 
 | `/v1/api/stack/{stackName}/run`     | POST   | Trigger one or all [jobs](https://docs.docker.com/reference/cli/docker/service/create/#running-as-a-job) in stack | - `service` (string, optional): Name of the job service to run.                                                                                                                            |
-
-## Query Parameters
-
-All endpoints that support query parameters accept the following common parameters:
-
-| Query Parameter | Type    | Description                         |
-|-----------------|---------|-------------------------------------|
-| `timeout`       | integer | Timeout in seconds (default: `30`). |
 
 ## Example Request
 
@@ -224,4 +254,16 @@ curl -X DELETE -H "x-api-key: your_api_key" "http://example.com/v1/api/project/m
 
 ```sh
 curl -X POST -H "x-api-key: your_api_key" "http://example.com/v1/api/project/my_project/restart?timeout=60"
+```
+
+### Force-recreate all services in a Compose project
+
+```sh
+curl -X POST -H "x-api-key: your_api_key" "http://example.com/v1/api/project/my_project/recreate"
+```
+
+### Force-recreate a specific Compose service
+
+```sh
+curl -X POST -H "x-api-key: your_api_key" "http://example.com/v1/api/project/my_project/recreate?service=web"
 ```

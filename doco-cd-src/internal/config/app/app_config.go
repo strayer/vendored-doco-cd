@@ -16,7 +16,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/git"
-	"github.com/kimdre/doco-cd/internal/notification"
 )
 
 const Name = "doco-cd" // Name of the application
@@ -66,9 +65,12 @@ type Config struct {
 	SSHPrivateKeyFile             string                 `env:"SSH_PRIVATE_KEY_FILE,file"`                                                                       // SSHPrivateKeyFile is the file containing the SSHPrivateKey
 	SSHPrivateKeyPassphrase       string                 `env:"SSH_PRIVATE_KEY_PASSPHRASE"`                                                                      // SSHPrivateKeyPassphrase is the passphrase for the SSH private key, if applicable
 	SSHPrivateKeyPassphraseFile   string                 `env:"SSH_PRIVATE_KEY_PASSPHRASE_FILE,file"`                                                            // SSHPrivateKeyPassphraseFile is the file containing the SSHPrivateKeyPassphrase
+	SSHKnownHostsFile             string                 `env:"SSH_KNOWN_HOSTS_FILE"`                                                                            // SSHKnownHostsFile is an operator-managed known_hosts file used to verify Git SSH hosts.
 	SkipTLSVerification           bool                   `env:"SKIP_TLS_VERIFICATION,notEmpty" envDefault:"false"`                                               // SkipTLSVerification skips the TLS verification when cloning repositories.
 	DockerQuietDeploy             bool                   `env:"DOCKER_QUIET_DEPLOY,notEmpty" envDefault:"true"`                                                  // DockerQuietDeploy suppresses the status output of dockerCli in deployments (e.g. pull, create, start)
 	SchedulerEnabled              bool                   `env:"SCHEDULER_ENABLED,notEmpty" envDefault:"true"`                                                    // SchedulerEnabled controls whether the built-in scheduled job runner is started in this doco-cd instance
+	McpEnabled                    bool                   `env:"MCP_ENABLED,notEmpty" envDefault:"false"`                                                         // McpEnabled enables the built-in MCP server and requires API_SECRET.
+	OpenAPIEnabled                bool                   `env:"OPENAPI_ENABLED,notEmpty" envDefault:"false"`                                                     // OpenAPIEnabled exposes the runtime OpenAPI document and Swagger UI.
 	DockerSwarmFeatures           bool                   `env:"DOCKER_SWARM_FEATURES,notEmpty" envDefault:"true"`                                                // DockerSwarmFeatures enables the usage Docker Swarm features in the application if it has detected that it is running in a Docker Swarm environment
 	DockerSwarmConfigRetention    int                    `env:"DOCKER_SWARM_CONFIG_RETENTION,notEmpty" envDefault:"0" validate:"min=-1"`                         // DockerSwarmConfigRetention is the global default number of old Swarm config revisions to keep per resource (excluding the active one). -1 disables automatic pruning.
 	DockerSwarmSecretRetention    int                    `env:"DOCKER_SWARM_SECRET_RETENTION,notEmpty" envDefault:"0" validate:"min=-1"`                         // DockerSwarmSecretRetention is the global default number of old Swarm secret revisions to keep per resource (excluding the active one). -1 disables automatic pruning.
@@ -76,11 +78,15 @@ type Config struct {
 	DataHostPath                  string                 `env:"DATA_HOST_PATH"`                                                                                  // DataHostPath is the optional Docker daemon host path backing DataMountPath.
 	DeployConfigBaseDir           string                 `env:"DEPLOY_CONFIG_BASE_DIR" envDefault:"/"`                                                           // DeployConfigBaseDir is the base directory (relative to the repository root) where deployment configuration files will be searched for.
 	PassEnv                       bool                   `env:"PASS_ENV"`                                                                                        // PassEnv controls whether environment variables from the doco-cd container should be passed to the deployment environment for docker compose variable interpolation. Use with caution, as this may expose sensitive information to the deployment environment.
+	InterpolateExternalSecrets    bool                   `env:"INTERPOLATE_EXTERNAL_SECRETS"`                                                                    // InterpolateExternalSecrets enables Compose-style interpolation in legacy external secret references using the doco-cd process environment.
+	InterpolateResolvedSecrets    bool                   `env:"INTERPOLATE_RESOLVED_SECRETS"`                                                                    // InterpolateResolvedSecrets enables Compose-style interpolation of one resolved external secret's value referencing another (e.g. DB_URL containing ${DB_PASSWORD}). Only other external secrets are consulted; the doco-cd process environment is never used for this lookup.
 	PollConfigYAML                string                 `env:"POLL_CONFIG"`                                                                                     // PollConfigYAML is the unparsed string containing the PollConfig in YAML format
 	PollConfigFile                string                 `env:"POLL_CONFIG_FILE,file"`                                                                           // PollConfigFile is the file containing the PollConfig in YAML format
 	PollConfig                    []poll.Config          `yaml:"-"`                                                                                              // PollConfig is the YAML configuration for polling Git repositories for changes
-	MaxPayloadSize                int64                  `env:"MAX_PAYLOAD_SIZE,notEmpty" envDefault:"1048576"`                                                  // MaxPayloadSize is the maximum size of the payload in bytes that the HTTP server will accept (default 1MB = 1048576 bytes)
+	MaxPayloadSize                int64                  `env:"MAX_PAYLOAD_SIZE,notEmpty" envDefault:"1048576" validate:"min=1"`                                 // MaxPayloadSize is the maximum size of the payload in bytes that the HTTP server will accept (default 1MB = 1048576 bytes)
 	MetricsPort                   uint16                 `env:"METRICS_PORT,notEmpty" envDefault:"9120" validate:"min=1,max=65535"`                              // MetricsPort is the port the prometheus metrics server will listen on
+	PprofEnabled                  bool                   `env:"PPROF_ENABLED,notEmpty" envDefault:"false"`                                                       // PprofEnabled enables the loopback-only Go runtime profiling server.
+	PprofPort                     uint16                 `env:"PPROF_PORT,notEmpty" envDefault:"6060" validate:"min=1,max=65535"`                                // PprofPort is the loopback port used by the Go runtime profiling server.
 	AppriseApiURL                 config.HttpUrl         `env:"APPRISE_API_URL" validate:"httpUrl"`                                                              // AppriseApiURL is the URL of the Apprise notification service
 	AppriseNotifyUrls             string                 `env:"APPRISE_NOTIFY_URLS"`                                                                             // AppriseNotifyUrls is a comma-separated list of URLs to notify via the Apprise notification service
 	AppriseNotifyUrlsFile         string                 `env:"APPRISE_NOTIFY_URLS_FILE,file"`                                                                   // AppriseNotifyUrlsFile is the file containing the AppriseNotifyUrls
@@ -124,6 +130,10 @@ func GetConfig() (*Config, error) {
 	err := config.ParseConfigFromEnv(&cfg, &mappings)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", config.ErrParseConfigFailed, err)
+	}
+
+	if cfg.McpEnabled && cfg.ApiSecret == "" {
+		return nil, errors.New("MCP_ENABLED requires API_SECRET")
 	}
 
 	err = cfg.parsePollConfig()
@@ -184,6 +194,16 @@ func GetConfig() (*Config, error) {
 		return nil, fmt.Errorf("HTTP_PORT and METRICS_PORT cannot be the same port number: %d", cfg.HttpPort)
 	}
 
+	if cfg.PprofEnabled {
+		if cfg.PprofPort == cfg.HttpPort {
+			return nil, fmt.Errorf("PPROF_PORT and HTTP_PORT cannot be the same port number: %d", cfg.PprofPort)
+		}
+
+		if cfg.PprofPort == cfg.MetricsPort {
+			return nil, fmt.Errorf("PPROF_PORT and METRICS_PORT cannot be the same port number: %d", cfg.PprofPort)
+		}
+	}
+
 	cfg.HttpTLSCertFile = strings.TrimSpace(cfg.HttpTLSCertFile)
 	cfg.HttpTLSKeyFile = strings.TrimSpace(cfg.HttpTLSKeyFile)
 
@@ -220,18 +240,6 @@ func GetConfig() (*Config, error) {
 		if !path.IsAbs(cfg.DataHostPath) {
 			return nil, fmt.Errorf("DATA_HOST_PATH must be an absolute Unix path: %q", cfg.DataHostPath)
 		}
-	}
-
-	notification.SetFailureRepeatInterval(cfg.AppriseNotifyRepeatInterval)
-
-	err = notification.SetAppriseConfig(
-		string(cfg.AppriseApiURL),
-		cfg.AppriseNotifyUrls,
-		cfg.AppriseNotifyLevel,
-		cfg.AppriseNotifyBodyTemplate,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure notifications: %w", err)
 	}
 
 	return &cfg, nil

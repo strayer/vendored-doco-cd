@@ -70,7 +70,7 @@ func TestValidateDocoLayoutV1_CustomTargetDoesNotFallBackToDefault(t *testing.T)
 	t.Parallel()
 
 	dir := t.TempDir()
-	// Only the default config exists — custom target must NOT fall back to it.
+	// Only the default config exists. A custom target must NOT fall back to it.
 	if err := os.WriteFile(filepath.Join(dir, ".doco-cd.yaml"), []byte("version: doco.v1\nname: app\n"), filesystem.PermOwner); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -114,7 +114,7 @@ func TestFindArtifactConfigFile_CustomTargetDoesNotFallBackToDefault(t *testing.
 	t.Parallel()
 
 	dir := t.TempDir()
-	// Only the default config exists — should not be returned when a custom target is set.
+	// Only the default config exists and should not be returned when a custom target is set.
 	if err := os.WriteFile(filepath.Join(dir, ".doco-cd.yaml"), []byte("name: app\n"), filesystem.PermOwner); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
@@ -176,7 +176,7 @@ func TestSyncDirectoryContents_PreservesDestinationInode(t *testing.T) {
 	// The destination directory inode must be unchanged.
 	inodeAfter := dirInode(t, dst)
 	if inodeBefore != inodeAfter {
-		t.Fatalf("destination inode changed: before=%d after=%d — bind mounts would be broken", inodeBefore, inodeAfter)
+		t.Fatalf("destination inode changed: before=%d after=%d; bind mounts would be broken", inodeBefore, inodeAfter)
 	}
 
 	// The new file must be present.

@@ -1,8 +1,11 @@
 package stages
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"testing"
 
@@ -11,6 +14,8 @@ import (
 
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 
+	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
 )
 
@@ -32,6 +37,19 @@ func TestAutoDiscoveryConfigLabelDriftServices(t *testing.T) {
 				"web": {
 					Labels: docker.Labels{
 						docker.DocoCDLabels.Deployment.AutoDiscoveryConfig: expected,
+					},
+				},
+			},
+			wantServices:   nil,
+			wantFirstLabel: expected,
+		},
+		{
+			// Serialization-only changes must not cause drift (#1818).
+			name: "same config, different key order",
+			status: map[docker.Service]docker.ServiceStatus{
+				"web": {
+					Labels: docker.Labels{
+						docker.DocoCDLabels.Deployment.AutoDiscoveryConfig: "{depth: 0, enabled: true, delete: false, remove_volumes: true, remove_images: true}",
 					},
 				},
 			},
@@ -134,13 +152,20 @@ func TestAutoDiscoveryConfigLabelDriftServices(t *testing.T) {
 				expected = tt.expected
 			}
 
-			gotServices, gotFirst := autoDiscoveryConfigLabelDriftServices(tt.status, expected)
+			expectedCfg := docker.ParseAutoDiscoveryConfig(expected)
+
+			gotServices, gotFirst := autoDiscoveryConfigLabelDriftServices(tt.status, expectedCfg)
 			if !slices.Equal(gotServices, tt.wantServices) {
 				t.Fatalf("autoDiscoveryConfigLabelDriftServices() services = %v, want %v", gotServices, tt.wantServices)
 			}
 
-			if gotFirst != tt.wantFirstLabel {
-				t.Fatalf("autoDiscoveryConfigLabelDriftServices() first label = %q, want %q", gotFirst, tt.wantFirstLabel)
+			wantFirstLabel := tt.wantFirstLabel
+			if wantFirstLabel == expected {
+				wantFirstLabel = docker.MarshalAutoDiscoveryConfig(expectedCfg)
+			}
+
+			if gotFirst != wantFirstLabel {
+				t.Fatalf("autoDiscoveryConfigLabelDriftServices() first label = %q, want %q", gotFirst, wantFirstLabel)
 			}
 		})
 	}
@@ -149,6 +174,7 @@ func TestAutoDiscoveryConfigLabelDriftServices(t *testing.T) {
 func TestShouldSkipDeployment(t *testing.T) {
 	tests := []struct {
 		name                      string
+		retryAfterFailure         bool
 		composeChanged            bool
 		autoDiscoveryLabelChanged bool
 		changedServices           []docker.Change
@@ -157,6 +183,17 @@ func TestShouldSkipDeployment(t *testing.T) {
 		mismatchServices          []docker.ServiceMismatch
 		want                      bool
 	}{
+		{
+			name:                      "retry after failed deployment",
+			retryAfterFailure:         true,
+			composeChanged:            false,
+			autoDiscoveryLabelChanged: false,
+			changedServices:           nil,
+			ignoredInfo:               docker.IgnoredInfo{},
+			imagesChanged:             false,
+			mismatchServices:          nil,
+			want:                      false,
+		},
 		{
 			name:                      "no changes",
 			composeChanged:            false,
@@ -254,7 +291,7 @@ func TestShouldSkipDeployment(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldSkipDeployment(tt.composeChanged, tt.autoDiscoveryLabelChanged, tt.changedServices, tt.ignoredInfo, tt.imagesChanged, tt.mismatchServices)
+			got := shouldSkipDeployment(tt.retryAfterFailure, tt.composeChanged, tt.autoDiscoveryLabelChanged, tt.changedServices, tt.ignoredInfo, tt.imagesChanged, tt.mismatchServices)
 			if got != tt.want {
 				t.Errorf("shouldSkipDeployment() = %v, want %v", got, tt.want)
 			}
@@ -268,13 +305,17 @@ func TestShouldSkipOCIDeployment(t *testing.T) {
 		forceRecreate bool
 		deployed      string
 		resolved      string
+		deployedHash  string
+		resolvedHash  string
 		want          bool
 	}{
 		{
-			name:          "skip when digest unchanged",
+			name:          "skip when digest and project hash unchanged",
 			forceRecreate: false,
 			deployed:      "sha256:abc",
 			resolved:      "sha256:abc",
+			deployedHash:  "project-abc",
+			resolvedHash:  "project-abc",
 			want:          true,
 		},
 		{
@@ -282,6 +323,17 @@ func TestShouldSkipOCIDeployment(t *testing.T) {
 			forceRecreate: false,
 			deployed:      "sha256:abc",
 			resolved:      "sha256:def",
+			deployedHash:  "project-abc",
+			resolvedHash:  "project-abc",
+			want:          false,
+		},
+		{
+			name:          "do not skip when project hash changed",
+			forceRecreate: false,
+			deployed:      "sha256:abc",
+			resolved:      "sha256:abc",
+			deployedHash:  "project-abc",
+			resolvedHash:  "project-def",
 			want:          false,
 		},
 		{
@@ -289,6 +341,8 @@ func TestShouldSkipOCIDeployment(t *testing.T) {
 			forceRecreate: false,
 			deployed:      "",
 			resolved:      "sha256:def",
+			deployedHash:  "project-abc",
+			resolvedHash:  "project-abc",
 			want:          false,
 		},
 		{
@@ -296,6 +350,24 @@ func TestShouldSkipOCIDeployment(t *testing.T) {
 			forceRecreate: false,
 			deployed:      "sha256:def",
 			resolved:      "",
+			deployedHash:  "project-abc",
+			resolvedHash:  "project-abc",
+			want:          false,
+		},
+		{
+			name:          "do not skip when deployed project hash missing",
+			forceRecreate: false,
+			deployed:      "sha256:abc",
+			resolved:      "sha256:abc",
+			resolvedHash:  "project-abc",
+			want:          false,
+		},
+		{
+			name:          "do not skip when resolved project hash missing",
+			forceRecreate: false,
+			deployed:      "sha256:abc",
+			resolved:      "sha256:abc",
+			deployedHash:  "project-abc",
 			want:          false,
 		},
 		{
@@ -303,6 +375,8 @@ func TestShouldSkipOCIDeployment(t *testing.T) {
 			forceRecreate: true,
 			deployed:      "sha256:abc",
 			resolved:      "sha256:abc",
+			deployedHash:  "project-abc",
+			resolvedHash:  "project-abc",
 			want:          false,
 		},
 		{
@@ -310,17 +384,51 @@ func TestShouldSkipOCIDeployment(t *testing.T) {
 			forceRecreate: false,
 			deployed:      "  sha256:abc  ",
 			resolved:      "sha256:abc",
+			deployedHash:  "  project-abc  ",
+			resolvedHash:  "project-abc",
 			want:          true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := shouldSkipOCIDeployment(tt.forceRecreate, tt.deployed, tt.resolved)
+			got := shouldSkipOCIDeployment(tt.forceRecreate, tt.deployed, tt.resolved, tt.deployedHash, tt.resolvedHash)
 			if got != tt.want {
 				t.Errorf("shouldSkipOCIDeployment() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestShouldSkipOCIDeployment_InterpolationEnvironmentChanged(t *testing.T) {
+	t.Parallel()
+
+	makeProject := func(value string) *types.Project {
+		return &types.Project{
+			Services: types.Services{
+				"app": {
+					Name:  "app",
+					Image: "myapp:latest",
+					Environment: types.MappingWithEquals{
+						"SECRET": &value,
+					},
+				},
+			},
+		}
+	}
+
+	deployedHash, err := docker.ProjectHash(makeProject("old-secret"))
+	if err != nil {
+		t.Fatalf("hash deployed project: %v", err)
+	}
+
+	resolvedHash, err := docker.ProjectHash(makeProject("new-secret"))
+	if err != nil {
+		t.Fatalf("hash resolved project: %v", err)
+	}
+
+	if shouldSkipOCIDeployment(false, "sha256:abc", "sha256:abc", deployedHash, resolvedHash) {
+		t.Fatal("expected environment-only project change to prevent OCI deployment skip")
 	}
 }
 
@@ -461,5 +569,231 @@ func TestPkiRoleNormMap_HashStability(t *testing.T) {
 
 	if h1 != h2 {
 		t.Errorf("hash changed despite same pki-role ref: %q vs %q", h1, h2)
+	}
+}
+
+func TestGetAbsWorkingDirContainment(t *testing.T) {
+	t.Parallel()
+
+	repoPath := filepath.Join(t.TempDir(), "repository")
+
+	tests := []struct {
+		name       string
+		workingDir string
+		wantPath   string
+		wantErr    bool
+	}{
+		{name: "repository root", workingDir: ".", wantPath: repoPath},
+		{name: "nested directory", workingDir: "deploy/production", wantPath: filepath.Join(repoPath, "deploy/production")},
+		{name: "normalized nested directory", workingDir: "deploy/../production", wantPath: filepath.Join(repoPath, "production")},
+		{name: "parent traversal", workingDir: "..", wantPath: filepath.Dir(repoPath), wantErr: true},
+		{name: "sibling prefix", workingDir: "../repository-backup", wantPath: repoPath + "-backup", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := getAbsWorkingDir(repoPath, tt.workingDir)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("getAbsWorkingDir() error = %v, wantErr %v", err, tt.wantErr)
+			}
+
+			if got != tt.wantPath {
+				t.Fatalf("getAbsWorkingDir() = %q, want %q", got, tt.wantPath)
+			}
+		})
+	}
+}
+
+func TestLoadComposeProjectHashCachesProjectAndHash(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+
+	composePath := filepath.Join(repoPath, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte("services:\n  app:\n    image: busybox:latest\n"), 0o600); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+
+	config := deploy.New("app", "main")
+	config.WorkingDirectory = "."
+	config.ComposeFiles = []string{"compose.yaml"}
+	config.EnvFiles = nil
+
+	manager := &StageManager{
+		AppConfig:    &app.Config{},
+		DeployConfig: config,
+		Docker:       &Docker{},
+		Repository: &RepositoryData{
+			PathInternal: repoPath,
+			PathExternal: repoPath,
+		},
+	}
+
+	got, err := manager.loadComposeProjectHash(context.Background())
+	if err != nil {
+		t.Fatalf("loadComposeProjectHash() error = %v", err)
+	}
+
+	if manager.Docker.Project == nil {
+		t.Fatal("loadComposeProjectHash() did not cache the Compose project")
+	}
+
+	if got == "" || manager.Docker.ProjectHash != got {
+		t.Fatalf("cached project hash = %q, returned %q", manager.Docker.ProjectHash, got)
+	}
+}
+
+// fakeSchedulerHolds is a SchedulerStopHolds stub keyed by context/project/service.
+type fakeSchedulerHolds struct {
+	held  map[string]bool
+	calls int
+}
+
+func (f *fakeSchedulerHolds) IsSchedulerStopHeld(contextName, project, service string) bool {
+	f.calls++
+
+	return f.held[contextName+"/"+project+"/"+service]
+}
+
+// TestDropSchedulerHeldMismatches_SkipsDeploymentDuringJobStopWindow reproduces #1856:
+// a scheduled job stops its cd.doco.job.stop_services targets, a poll tick lands inside
+// that stop window, and the stopped service reports 0 running replicas. Without the
+// scheduler-hold check the replicas mismatch makes shouldSkipDeployment return false and
+// doco-cd runs a full deploy cycle for a service it stopped itself.
+func TestDropSchedulerHeldMismatches_SkipsDeploymentDuringJobStopWindow(t *testing.T) {
+	project := &types.Project{
+		Name: "db",
+		Services: types.Services{
+			"db": types.ServiceConfig{
+				Name:    "db",
+				Restart: "unless-stopped",
+			},
+		},
+	}
+
+	// Service is present but stopped, so no container counts as a running replica.
+	deployedStatus := map[docker.Service]docker.ServiceStatus{
+		"db": {Labels: docker.Labels{}},
+	}
+
+	mismatches := docker.CheckServiceMismatch(false, deployedStatus, project.Services)
+	if len(mismatches) != 1 {
+		t.Fatalf("expected the stopped service to report a mismatch, got %v", mismatches)
+	}
+
+	if shouldSkipDeployment(false, false, false, nil, docker.IgnoredInfo{}, false, mismatches) {
+		t.Fatal("expected an unfiltered replicas mismatch to force a deployment")
+	}
+
+	holds := &fakeSchedulerHolds{held: map[string]bool{"/db/db": true}}
+
+	s := &StageManager{
+		Docker:         &Docker{Project: project},
+		DeployConfig:   &deploy.Config{Name: "db"},
+		SchedulerHolds: holds,
+	}
+
+	filtered := s.dropSchedulerHeldMismatches(mismatches, nil)
+	if len(filtered) != 0 {
+		t.Fatalf("expected mismatch of scheduler-held service to be dropped, got %v", filtered)
+	}
+
+	if !shouldSkipDeployment(false, false, false, nil, docker.IgnoredInfo{}, false, filtered) {
+		t.Fatal("expected deployment to be skipped while the job scheduler holds the service stopped")
+	}
+}
+
+func TestDropSchedulerHeldMismatches(t *testing.T) {
+	mismatches := []docker.ServiceMismatch{
+		{ServiceName: "db", Reasons: []docker.ServiceMismatchReason{{Reason: docker.ServiceMismatchReasonReplicas, Want: 1, Got: uint64(0)}}},
+		{ServiceName: "web", Reasons: []docker.ServiceMismatchReason{{Reason: docker.ServiceMismatchReasonReplicas, Want: 1, Got: uint64(0)}}},
+	}
+
+	project := &types.Project{
+		Name: "stack",
+		Services: types.Services{
+			"db":  types.ServiceConfig{Name: "db", Restart: "unless-stopped"},
+			"web": types.ServiceConfig{Name: "web", Restart: "unless-stopped"},
+		},
+	}
+
+	tests := []struct {
+		name      string
+		swarmMode bool
+		context   string
+		holds     *fakeSchedulerHolds
+		want      []string
+		wantCalls bool
+	}{
+		{
+			name:      "held service is dropped, others stay",
+			holds:     &fakeSchedulerHolds{held: map[string]bool{"/stack/db": true}},
+			want:      []string{"web"},
+			wantCalls: true,
+		},
+		{
+			name:      "nothing held keeps every mismatch",
+			holds:     &fakeSchedulerHolds{held: map[string]bool{}},
+			want:      []string{"db", "web"},
+			wantCalls: true,
+		},
+		{
+			name:      "holds are keyed by docker context",
+			context:   "remote",
+			holds:     &fakeSchedulerHolds{held: map[string]bool{"/stack/db": true}},
+			want:      []string{"db", "web"},
+			wantCalls: true,
+		},
+		{
+			// Holds are only registered for compose-mode jobs, same scope as the
+			// reconciliation event listener uses.
+			name:      "swarm deployments are untouched",
+			swarmMode: true,
+			holds:     &fakeSchedulerHolds{held: map[string]bool{"/stack/db": true}},
+			want:      []string{"db", "web"},
+			wantCalls: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &StageManager{
+				Docker:         &Docker{Project: project, SwarmMode: tc.swarmMode},
+				DeployConfig:   &deploy.Config{Name: "stack", Context: tc.context},
+				SchedulerHolds: tc.holds,
+			}
+
+			got := s.dropSchedulerHeldMismatches(mismatches, nil)
+
+			names := make([]string, 0, len(got))
+			for _, m := range got {
+				names = append(names, m.ServiceName)
+			}
+
+			if !slices.Equal(names, tc.want) {
+				t.Fatalf("expected remaining mismatches %v, got %v", tc.want, names)
+			}
+
+			if tc.wantCalls != (tc.holds.calls > 0) {
+				t.Fatalf("expected scheduler holds queried=%v, got %d calls", tc.wantCalls, tc.holds.calls)
+			}
+		})
+	}
+}
+
+// TestDropSchedulerHeldMismatches_NoTracker covers deployments created without a
+// scheduler hold tracker, e.g. from tests or an embedding that does not run a scheduler.
+func TestDropSchedulerHeldMismatches_NoTracker(t *testing.T) {
+	mismatches := []docker.ServiceMismatch{{ServiceName: "db"}}
+
+	s := &StageManager{
+		Docker:       &Docker{Project: &types.Project{Name: "stack"}},
+		DeployConfig: &deploy.Config{Name: "stack"},
+	}
+
+	if got := s.dropSchedulerHeldMismatches(mismatches, nil); len(got) != 1 {
+		t.Fatalf("expected mismatches to pass through unchanged, got %v", got)
 	}
 }

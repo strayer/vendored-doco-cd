@@ -3,6 +3,7 @@ package stages
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -17,14 +18,19 @@ import (
 	types2 "github.com/kimdre/doco-cd/internal/config"
 
 	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/common/lifecycle"
 	"github.com/kimdre/doco-cd/internal/common/types/slice"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
 
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
+
+	"github.com/kimdre/doco-cd/internal/common/validation"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
+	sourcecache "github.com/kimdre/doco-cd/internal/source/cache"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
@@ -32,6 +38,12 @@ var (
 	ErrNotManagedByDocoCD = errors.New("stack is not managed by doco-cd")
 	ErrDeploymentConflict = errors.New("another stack with the same name already exists and is not managed by this repository")
 	ErrSkipDeployment     = errors.New("deployment skipped") // Special error to indicate deployment was skipped, not an actual failure/error
+
+	// ErrWebhookFilterMismatch is returned when the deployment is skipped because
+	// the webhook ref does not match the configured webhook_filter. It wraps
+	// ErrSkipDeployment so existing errors.Is checks still match, but callers can
+	// distinguish it to return an appropriate "skipped" response instead of "success".
+	ErrWebhookFilterMismatch = fmt.Errorf("webhook filter did not match: %w", ErrSkipDeployment)
 )
 
 type StageName string
@@ -115,14 +127,26 @@ type Stages struct {
 
 // RepositoryData holds information about the triggering repository.
 type RepositoryData struct {
-	Source       types2.SourceType // Source backend used for this deployment (git or oci)
-	SourceUrl    string            // Repository or OCI artifact URL (e.g., "https://github.com/user/my-repo.git" or "ghcr.io/org/repo:tag")
-	Name         string            // Repository name (e.g., "user/my-repo")
-	PathInternal string            // Path to the repository inside the container
-	PathExternal string            // Path to the repository on the host machine
-	Git          *git.Repository   // Git repository instance
-	Revision     string            // Resolved immutable revision (commit SHA or digest)
-	OCITrusted   bool              // True when the OCI artifact passed trust-policy verification before reconciliation/cleanup
+	Source          types2.SourceType // Source backend used for this deployment (git or oci)
+	SourceUrl       string            // Repository or OCI artifact URL used for the deployment
+	ConfigSourceUrl string            // Resolved URL of the repository or artifact containing the deploy config
+	Name            string            // Repository name (e.g., "user/my-repo")
+	PathInternal    string            // Path to the repository inside the container
+	PathExternal    string            // Path to the repository on the host machine
+	Git             *git.Repository   // Git repository instance
+	Revision        string            // Resolved immutable revision (commit SHA or digest)
+	OCITrusted      bool              // True when the OCI artifact passed trust-policy verification before reconciliation/cleanup
+}
+
+// SchedulerStopHolds reports whether a Compose service is currently held
+// stopped by doco-cd's own job scheduler, i.e. a scheduled job listed it in
+// cd.doco.job.stop_services and has not restarted it yet (the post-release
+// grace period counts as held too).
+//
+// Holds are only registered for Compose-mode jobs, keyed by Docker context,
+// Compose project and service name.
+type SchedulerStopHolds interface {
+	IsSchedulerStopHeld(contextName, project, service string) bool
 }
 
 // Docker holds the Docker CLI and client instances along with the data mount point.
@@ -130,15 +154,18 @@ type Docker struct {
 	Cmd            command.Cli
 	DataMountPoint container.MountPoint
 	Project        *types.Project
+	ProjectHash    string
 	SwarmMode      bool
+	SwarmAvailable bool
 }
 
 // DeploymentState holds the dynamic state information during the deployment process.
 type DeploymentState struct {
 	changedServices      []docker.Change
-	imageChangedServices []string // services whose deployed image digest drifted from the registry (force_image_pull)
+	imageChangedServices []string // services whose image moved: digest drift under force_image_pull, otherwise a changed image reference
 	ignoredInfo          docker.IgnoredInfo
 	DeployedCommit       string // previously-deployed commit SHA, carried to post-deploy for the changelog
+	latestCommit         string // current commit SHA, resolved during pre-deploy for reuse by deploy
 }
 
 // changedServiceNames flattens the detected changes and image digest drifts into a unique list of service names.
@@ -162,44 +189,75 @@ func (d *DeploymentState) changedServiceNames() []string {
 
 // StageManager is the main structure that holds the logger and stage data.
 type StageManager struct {
-	Stages            *Stages
-	Log               *slog.Logger
-	JobID             string            // Unique identifier for the job
-	JobTrigger        JobTrigger        // Trigger type for the job (e.g., "webhook", "poll")
-	NotifyFailureFunc NotifyFailureFunc // Function to call on failure
-	AppConfig         *app.Config
-	DeployConfig      *deploy.Config
-	DeployState       *DeploymentState
-	Docker            *Docker
-	Payload           *webhook.ParsedPayload
-	Repository        *RepositoryData
-	SecretProvider    *secretprovider.SecretProvider
-	Metadata          notification.Metadata // Notification metadata (may include reconciliation event info)
+	Stages         *Stages
+	Log            *slog.Logger
+	JobID          string     // Unique identifier for the job
+	JobTrigger     JobTrigger // Trigger type for the job (e.g., "webhook", "poll")
+	AppConfig      *app.Config
+	DeployConfig   *deploy.Config
+	DeployState    *DeploymentState
+	Docker         *Docker
+	Payload        *webhook.ParsedPayload
+	Repository     *RepositoryData
+	SecretProvider secretprovider.SecretProvider
+	Notifier       notification.Sender
+	Metadata       notification.Metadata // Notification metadata (may include reconciliation event info)
+	// SchedulerHolds is optional; a nil value means no scheduler stop holds are tracked.
+	SchedulerHolds SchedulerStopHolds
 }
 
-type NotifyFailureFunc func(log *slog.Logger, err error, metadata notification.Metadata)
+// Dependencies holds the stable services shared by every StageManager run in a process:
+// application configuration, the optional secret provider used to resolve external secret
+// references, and the notifier used for deployment lifecycle messages.
+type Dependencies struct {
+	AppConfig      *app.Config `validate:"required,nostructlevel"`
+	SecretProvider secretprovider.SecretProvider
+	Notifier       notification.Sender `validate:"required,nostructlevel"`
+	// SchedulerHolds lets the pre-deploy stage ask whether a service is
+	// intentionally stopped by a running scheduled job. A nil value disables
+	// the check.
+	SchedulerHolds SchedulerStopHolds
+}
 
-// NewStageManager creates and initializes a new StageManager instance for managing stages.ß.
-func NewStageManager(jobID string, jobTrigger JobTrigger, log *slog.Logger,
-	failNotifyFunc NotifyFailureFunc,
-	repoData *RepositoryData, dockerData *Docker, payload *webhook.ParsedPayload,
-	appConfig *app.Config, deployConfig *deploy.Config,
-	secretProvider *secretprovider.SecretProvider,
-	metadata notification.Metadata,
-) *StageManager {
+// RunInput holds the per-deployment input for a single StageManager run: the job identity and
+// trigger, logger, repository data, Docker CLI/data mount point, the parsed webhook payload
+// (may be nil for non-webhook triggers), the resolved deploy config, and notification metadata.
+type RunInput struct {
+	Log          *slog.Logger `validate:"required,nostructlevel"`
+	JobID        string
+	JobTrigger   JobTrigger      `validate:"required,oneof=webhook poll"`
+	Repository   *RepositoryData `validate:"required,nostructlevel"`
+	Docker       *Docker         `validate:"required,nostructlevel"`
+	Payload      *webhook.ParsedPayload
+	DeployConfig *deploy.Config `validate:"required,nostructlevel"`
+	Metadata     notification.Metadata
+}
+
+// NewStageManager validates dependencies and run, then creates and initializes a new
+// StageManager instance for managing stages.
+func NewStageManager(dependencies Dependencies, run RunInput) (*StageManager, error) {
+	if err := validation.Validate(dependencies); err != nil {
+		return nil, fmt.Errorf("validate stage dependencies: %w", err)
+	}
+
+	if err := validation.Validate(run); err != nil {
+		return nil, fmt.Errorf("validate stage run input: %w", err)
+	}
+
 	return &StageManager{
-		Log:               log.With(),
-		JobID:             jobID,
-		JobTrigger:        jobTrigger,
-		NotifyFailureFunc: failNotifyFunc,
-		AppConfig:         appConfig,
-		DeployConfig:      deployConfig,
-		DeployState:       &DeploymentState{},
-		Docker:            dockerData,
-		Payload:           payload,
-		Repository:        repoData,
-		SecretProvider:    secretProvider,
-		Metadata:          metadata,
+		Log:            run.Log.With(),
+		JobID:          run.JobID,
+		JobTrigger:     run.JobTrigger,
+		AppConfig:      dependencies.AppConfig,
+		DeployConfig:   run.DeployConfig,
+		DeployState:    &DeploymentState{},
+		Docker:         run.Docker,
+		Payload:        run.Payload,
+		Repository:     run.Repository,
+		SecretProvider: dependencies.SecretProvider,
+		Notifier:       dependencies.Notifier,
+		SchedulerHolds: dependencies.SchedulerHolds,
+		Metadata:       run.Metadata,
 		Stages: &Stages{
 			Init: &InitStageData{
 				MetaData: NewMetaData(StageInit),
@@ -223,7 +281,7 @@ func NewStageManager(jobID string, jobTrigger JobTrigger, log *slog.Logger,
 				MetaData: NewMetaData(StageCleanup),
 			},
 		},
-	}
+	}, nil
 }
 
 // GetStageMetaData retrieves the metadata for the specified stage.
@@ -248,10 +306,8 @@ func (s *StageManager) GetStageMetaData(stageName StageName) (*MetaData, error) 
 	}
 }
 
-// NotifyFailure sends a failure notification using the provided NotifyFailureFunc
-// and returns notifyErr marked as already reported, so the caller that receives
-// it does not notify about the same failure a second time. Without a
-// NotifyFailureFunc nothing is sent and the error is returned unchanged.
+// NotifyFailure sends a failure notification and returns notifyErr marked as already
+// reported, so the caller does not notify about the same failure a second time.
 func (s *StageManager) NotifyFailure(notifyErr error) error {
 	var (
 		latestCommit string
@@ -259,44 +315,48 @@ func (s *StageManager) NotifyFailure(notifyErr error) error {
 		commitSha    string
 	)
 
-	if s.NotifyFailureFunc != nil {
-		if s.Repository.Git != nil {
-			latestCommit, commitErr = gitInternal.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
-			if commitErr != nil {
-				latestCommit = ""
-			}
-
-			commitSha, commitErr = gitInternal.GetShortestUniqueCommitHash(s.Repository.Git, latestCommit, gitInternal.DefaultShortSHALength)
-			if commitErr != nil {
-				commitSha = latestCommit
-			}
+	if s.Repository.Git != nil {
+		latestCommit, commitErr = gitInternal.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
+		if commitErr != nil {
+			latestCommit = ""
 		}
 
-		if s.Repository.Git == nil {
-			commitSha = strings.TrimSpace(s.Repository.Revision)
+		commitSha, commitErr = gitInternal.GetShortestUniqueCommitHash(s.Repository.Git, latestCommit, gitInternal.DefaultShortSHALength)
+		if commitErr != nil {
+			commitSha = latestCommit
 		}
-
-		revision := notification.GetRevision(s.DeployConfig.Reference, commitSha)
-
-		metadata := s.Metadata
-		metadata.Repository = s.Repository.Name
-		metadata.Stack = s.DeployConfig.Name
-		metadata.Context = s.DeployConfig.Context
-		metadata.Target = s.DeployConfig.Internal.ConfigTarget
-		metadata.Revision = revision
-		metadata.JobID = s.JobID
-		metadata.ChangedServices = s.DeployState.changedServiceNames()
-
-		if !s.Stages.Init.StartedAt.IsZero() {
-			metadata.Duration = time.Since(s.Stages.Init.StartedAt).Truncate(time.Millisecond)
-		}
-
-		s.NotifyFailureFunc(s.Log, notifyErr, metadata)
-
-		return notification.MarkNotified(notifyErr)
 	}
 
-	return notifyErr
+	if s.Repository.Git == nil {
+		commitSha = strings.TrimSpace(s.Repository.Revision)
+	}
+
+	revision := notification.GetRevision(s.DeployConfig.Reference, commitSha)
+
+	metadata := s.Metadata
+	metadata.Repository = s.Repository.Name
+	metadata.Stack = s.DeployConfig.Name
+	metadata.Context = s.DeployConfig.Context
+	metadata.Target = s.DeployConfig.Internal.ConfigTarget
+	metadata.Revision = revision
+	metadata.JobID = s.JobID
+	metadata.ChangedServices = s.DeployState.changedServiceNames()
+
+	if !s.Stages.Init.StartedAt.IsZero() {
+		metadata.Duration = time.Since(s.Stages.Init.StartedAt).Truncate(time.Millisecond)
+	}
+
+	go func() {
+		if err := s.Notifier.Send(notification.Failure, "Deployment Failed", notifyErr.Error(), metadata); err != nil {
+			s.Log.Error("failed to send notification", logger.ErrAttr(err))
+		}
+	}()
+
+	s.Log.Error("deployment failed",
+		slog.String("stack", metadata.Stack),
+		logger.ErrAttr(notifyErr))
+
+	return notification.MarkNotified(notifyErr)
 }
 
 func (s *StageManager) NotifyDeploymentStarted() error {
@@ -331,7 +391,7 @@ func (s *StageManager) NotifyDeploymentStarted() error {
 	metadata.JobID = s.JobID
 	metadata.ChangedServices = s.DeployState.changedServiceNames()
 
-	return notification.Send(
+	return s.Notifier.Send(
 		notification.Info,
 		"Deployment started",
 		"Starting deployment of stack "+s.DeployConfig.Name,
@@ -370,74 +430,43 @@ func (s *StageManager) resolveCommitStatusContext() string {
 	return commitstatus.ContextForStack(s.DeployConfig.Internal.ConfigTarget, s.DeployConfig.Name)
 }
 
-func (s *StageManager) resolveCommitStatusRequest() (commitstatus.Provider, string, string, string, string, string, string, bool) {
-	if !s.AppConfig.GitCommitStatus {
-		return commitstatus.ProviderAuto, "", "", "", "", "", "", false
-	}
-
-	if s.Repository.Source == types2.SourceTypeOCI {
-		return commitstatus.ProviderAuto, "", "", "", "", "", "", false
-	}
-
-	commitSHA := s.resolveCommitSHA()
-	if commitSHA == "" {
-		s.Log.Debug("skipping commit status: no commit SHA available")
-
-		return commitstatus.ProviderAuto, "", "", "", "", "", "", false
-	}
-
-	resolved := gitInternal.ResolveAuthConfig(s.Repository.SourceUrl, "", "", "")
-
-	token, err := gitInternal.ResolveHTTPToken(s.Repository.SourceUrl, resolved)
-	if err != nil {
-		s.Log.Warn("failed to resolve commit status token", slog.String("error", err.Error()))
-	}
-
-	if token == "" {
-		token = s.AppConfig.GitAccessToken
-	}
-
-	if token == "" {
-		s.Log.Debug("skipping commit status: no access token configured")
-
-		return commitstatus.ProviderAuto, "", "", "", "", "", "", false
-	}
-
+func (s *StageManager) resolveCommitStatusRequest() (commitstatus.Request, bool) {
 	repoURL := ""
 	repoFullName := ""
 
 	if s.Payload != nil {
-		repoURL = strings.TrimSpace(s.Payload.WebURL)
-		repoFullName = strings.TrimSpace(s.Payload.FullName)
+		repoURL = s.Payload.WebURL
+		repoFullName = s.Payload.FullName
 	}
 
-	if repoURL == "" {
-		repoURL = s.Repository.SourceUrl
-	}
-
-	if repoFullName == "" {
-		repoFullName = gitInternal.GetFullName(repoURL)
-	}
-
-	provider, _ := commitstatus.ParseProvider(s.AppConfig.GitScmProvider)
-
-	return provider, string(s.AppConfig.GitScmApiUrl), repoURL, repoFullName, commitSHA, token, s.resolveCommitStatusContext(), true
+	return commitstatus.ResolveRequest(s.Log, commitstatus.RequestParams{
+		Enabled:          s.AppConfig.GitCommitStatus,
+		SourceIsGit:      s.Repository.Source != types2.SourceTypeOCI,
+		SourceURL:        s.Repository.SourceUrl,
+		CommitSHA:        s.resolveCommitSHA(),
+		PayloadWebURL:    repoURL,
+		PayloadFullName:  repoFullName,
+		ProviderOverride: s.AppConfig.GitScmProvider,
+		APIBaseURL:       string(s.AppConfig.GitScmApiUrl),
+		AccessToken:      s.AppConfig.GitAccessToken,
+		ContextName:      s.resolveCommitStatusContext(),
+	})
 }
 
 func (s *StageManager) GetCurrentCommitStatus(ctx context.Context) (commitstatus.Status, bool) {
-	provider, apiBaseURL, repoURL, repoFullName, commitSHA, token, contextName, ok := s.resolveCommitStatusRequest()
+	req, ok := s.resolveCommitStatusRequest()
 	if !ok {
 		return commitstatus.Status{}, false
 	}
 
 	s.Log.Debug("getting commit status",
-		slog.String("provider", string(provider)),
-		slog.String("repository", repoFullName),
-		slog.String("commit_sha", commitSHA),
-		slog.String("context", contextName),
+		slog.String("provider", string(req.Provider)),
+		slog.String("repository", req.RepoFullName),
+		slog.String("commit_sha", req.CommitSHA),
+		slog.String("context", req.Context),
 	)
 
-	status, found, err := commitstatus.Get(ctx, provider, apiBaseURL, repoURL, repoFullName, commitSHA, token, contextName)
+	status, found, err := req.Get(ctx)
 	if err != nil {
 		s.Log.Warn("failed to get commit status", slog.String("error", err.Error()))
 		return commitstatus.Status{}, false
@@ -445,10 +474,10 @@ func (s *StageManager) GetCurrentCommitStatus(ctx context.Context) (commitstatus
 
 	if !found {
 		s.Log.Debug("no commit status found",
-			slog.String("provider", string(provider)),
-			slog.String("repository", repoFullName),
-			slog.String("commit_sha", commitSHA),
-			slog.String("context", contextName),
+			slog.String("provider", string(req.Provider)),
+			slog.String("repository", req.RepoFullName),
+			slog.String("commit_sha", req.CommitSHA),
+			slog.String("context", req.Context),
 		)
 	}
 
@@ -460,26 +489,62 @@ func (s *StageManager) GetCurrentCommitStatus(ctx context.Context) (commitstatus
 // or when no access token / commit SHA is available.
 // Errors are logged as warnings so they never block a deployment.
 func (s *StageManager) PostCommitStatus(ctx context.Context, state commitstatus.State, description string) {
-	provider, apiBaseURL, repoURL, repoFullName, commitSHA, token, contextName, ok := s.resolveCommitStatusRequest()
+	req, ok := s.resolveCommitStatusRequest()
 	if !ok {
 		return
 	}
 
 	s.Log.Debug("posting commit status",
-		slog.String("provider", string(provider)),
-		slog.String("repository", repoFullName),
-		slog.String("commit_sha", commitSHA),
-		slog.String("context", contextName),
+		slog.String("provider", string(req.Provider)),
+		slog.String("repository", req.RepoFullName),
+		slog.String("commit_sha", req.CommitSHA),
+		slog.String("context", req.Context),
 		slog.String("state", string(state)),
 		slog.String("description", description),
 	)
 
-	err := commitstatus.Post(ctx, provider, apiBaseURL, repoURL, repoFullName, commitSHA, token, commitstatus.Status{
+	err := req.Post(ctx, commitstatus.Status{
 		State:       state,
 		Description: description,
-		Context:     contextName,
 	})
 	if err != nil {
+		if lifecycle.IsCanceled(err) {
+			s.Log.Debug("skipped commit status during application shutdown", slog.String("error", err.Error()))
+
+			return
+		}
+
 		s.Log.Warn("failed to post commit status", slog.String("error", err.Error()))
 	}
+}
+
+// sourceLockKey returns the key used to serialize every operation that mutates
+// the prepared source tree of this deployment's repository: clones, checkouts
+// (which reset and re-decrypt tracked files) and compose loads (which decrypt in place).
+// All of them must agree on one key, or they do not exclude each other at all.
+func (s *StageManager) sourceLockKey() string {
+	if s.Repository == nil {
+		return ""
+	}
+
+	if s.Repository.PathInternal != "" {
+		return s.Repository.PathInternal
+	}
+
+	return s.Repository.PathExternal
+}
+
+// withSourceLock runs fn while holding the source lock of this deployment's repository.
+// Without a resolvable source path there is nothing to serialize on, and locking
+// the empty key would serialize unrelated repositories against each other.
+func (s *StageManager) withSourceLock(fn func() error) error {
+	key := s.sourceLockKey()
+	if key == "" {
+		return fn()
+	}
+
+	unlock := sourcecache.AcquirePathLock(key)
+	defer unlock()
+
+	return fn()
 }

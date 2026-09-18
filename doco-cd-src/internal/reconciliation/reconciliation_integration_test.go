@@ -15,7 +15,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
-	dockerSwarm "github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/stages"
@@ -168,13 +167,13 @@ func TestReconciliationStopEventRestartSuppressionIntegration(t *testing.T) {
 	dc.Reconciliation.RestartTimeout = 1
 
 	jobLog := logger.New(slog.LevelError).Logger
-	reconcileJob := newJob(jobInfo{
-		jobLog:        jobLog,
-		dockerCli:     stack.DockerCli,
-		metadata:      notification.Metadata{Repository: repositoryName, Stack: stackName, JobID: "test-job"},
-		repoData:      stages.RepositoryData{SourceUrl: "https://github.com/kimdre/doco-cd_tests.git", Name: repositoryName},
-		payload:       &webhook.ParsedPayload{FullName: repositoryName},
-		deployConfigs: []*deployConfig.Config{dc},
+	reconcileJob := newJob(newTestManagerWithDependencies(t, Dependencies{DockerCLI: stack.DockerCli}), DeployRequest{
+		Logger:        jobLog,
+		Metadata:      notification.Metadata{Repository: repositoryName, Stack: stackName, JobID: "test-job"},
+		JobTrigger:    stages.JobTriggerWebhook,
+		Repository:    stages.RepositoryData{SourceUrl: "https://github.com/kimdre/doco-cd_tests.git", Name: repositoryName},
+		Payload:       &webhook.ParsedPayload{FullName: repositoryName},
+		DeployConfigs: []*deployConfig.Config{dc},
 	}, getDeployConfigGroupByEvent([]*deployConfig.Config{dc}))
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -241,10 +240,12 @@ func TestCleanupObsoleteAutoDiscoveredContainers_EmptyDiscoveredConfigs_RemovesS
 		ctx,
 		jobLog,
 		stack.DockerCli,
-		dockerSwarm.GetModeEnabled(),
+		resolveTestSwarmMode(t, stack.DockerCli.Client()),
+		"",
 		repoURL,
 		[]*deployConfig.Config{},
 		notification.Metadata{Repository: "kimdre/doco-cd_tests", Stack: stackName, JobID: "cleanup-empty-discovered-configs"},
+		newTestNotifier(t),
 	)
 	if err != nil {
 		t.Fatalf("cleanupObsoleteAutoDiscoveredContainers returned error: %v", err)
@@ -273,11 +274,7 @@ func requireDockerIntegrationTestGate(t *testing.T) {
 		_ = dockerCli.Client().Close()
 	}()
 
-	if err := dockerSwarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("failed to inspect Docker swarm mode: %v", err)
-	}
-
-	if dockerSwarm.GetModeEnabled() {
+	if resolveTestSwarmMode(t, dockerCli.Client()) {
 		t.Skip("reconciliation Docker event integration tests require non-Swarm mode")
 	}
 }

@@ -1,6 +1,7 @@
 package encryption
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -8,59 +9,58 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/getsops/sops/v3"
+	"github.com/getsops/sops/v3/cmd/sops/common"
 	"github.com/getsops/sops/v3/cmd/sops/formats"
+	"github.com/getsops/sops/v3/config"
 	"github.com/getsops/sops/v3/decrypt"
 	"github.com/go-git/go-billy/v5/osfs"
 	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 )
 
-var ErrSopsKeyNotSet = errors.New("SOPS secret key is not set")
+var errSopsKeyNotSet = errors.New("SOPS secret key is not set")
 
-func GetFileFormat(path string) string {
-	var format string
-
-	switch {
-	case formats.IsYAMLFile(path):
-		format = "yaml"
-	case formats.IsJSONFile(path):
-		format = "json"
-	case formats.IsEnvFile(path):
-		format = "dotenv"
-	case formats.IsIniFile(path):
-		format = "ini"
-	default:
-		format = "binary"
-	}
-
-	return format
-}
+// probedFormats lists the formats that are probed for paths without a format-specific extension.
+// Binary is probed first because its JSON envelope also parses as JSON and YAML,
+// and JSON before YAML because the YAML parser accepts JSON as well.
+var probedFormats = []formats.Format{formats.Binary, formats.Json, formats.Dotenv, formats.Ini, formats.Yaml}
 
 // DecryptFile decrypts a SOPS-encrypted file at the given path and returns its contents as a byte slice.
 func DecryptFile(path string) ([]byte, error) {
 	if !SopsKeyIsSet() {
-		return nil, ErrSopsKeyNotSet
+		return nil, errSopsKeyNotSet
 	}
 
-	format := GetFileFormat(path)
+	path = filepath.Clean(path)
 
-	return decrypt.File(path, format)
+	content, err := os.ReadFile(path) // #nosec G304
+	if err != nil {
+		return nil, err
+	}
+
+	format, _ := DetectFormat(content, path)
+
+	return DecryptContent(content, format)
 }
 
-func DecryptContent(content []byte, format string) ([]byte, error) {
-	return decrypt.Data(content, format)
+// DecryptContent decrypts SOPS-encrypted content using the supplied format.
+// The format must be the one returned by DetectFormat for the same content.
+func DecryptContent(content []byte, format formats.Format) ([]byte, error) {
+	return decrypt.DataWithFormat(content, format)
 }
 
 // DecryptFilesInDirectory walks through the specified directory and decrypts all SOPS-encrypted files.
 func DecryptFilesInDirectory(repoPath, dirPath string) ([]string, error) {
-	return decryptFilesInDirectory(repoPath, dirPath, make(map[string]struct{}))
+	return decryptFilesInDirectory(repoPath, dirPath, set.New[string]())
 }
 
 // decryptFilesInDirectory is the recursive implementation of DecryptFilesInDirectory.
 // The visited set tracks already-processed real paths to prevent infinite recursion
 // caused by symlink loops (e.g. a symlink pointing to an ancestor directory).
-func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct{}) ([]string, error) {
+func decryptFilesInDirectory(repoPath, dirPath string, visited set.Set[string]) ([]string, error) {
 	if !filesystem.InBasePath(repoPath, dirPath) {
 		return nil, fmt.Errorf("%w: %s is outside the repository root %s", filesystem.ErrPathTraversal, dirPath, repoPath)
 	}
@@ -71,11 +71,11 @@ func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct
 		realPath = filepath.Clean(dirPath)
 	}
 
-	if _, ok := visited[realPath]; ok {
+	if visited.Contains(realPath) {
 		return nil, nil
 	}
 
-	visited[realPath] = struct{}{}
+	visited.Add(realPath)
 
 	var decryptedFiles []string
 
@@ -156,22 +156,74 @@ func decryptFilesInDirectory(repoPath, dirPath string, visited map[string]struct
 
 // IsEncryptedFile checks if the file at the given path is a SOPS-encrypted file.
 func IsEncryptedFile(path string) (bool, error) {
-	bytes, err := os.ReadFile(path) // #nosec G304
+	path = filepath.Clean(path)
+
+	content, err := os.ReadFile(path) // #nosec G304
 	if err != nil {
 		return false, err
 	}
 
-	return IsEncryptedContent(string(bytes)), nil
+	_, encrypted := DetectFormat(content, path)
+
+	return encrypted, nil
 }
 
-// IsEncryptedContent checks the given content for SOPS-specific markers to determine if it is a SOPS-encrypted file.
-func IsEncryptedContent(content string) bool {
-	return strings.Contains(content, "sops") && strings.Contains(content, "ENC[")
+// DetectFormat returns the SOPS format that parses the content as an encrypted document,
+// and whether such a format was found.
+// The format is derived from the path extension, falling back to probing every supported
+// format when the extension does not identify one.
+// Callers must decrypt with the returned format, as detecting and decrypting with different
+// formats either fails or emits the content in the wrong format.
+func DetectFormat(content []byte, path string) (formats.Format, bool) {
+	if format := formats.FormatForPath(path); format != formats.Binary {
+		return format, hasSopsMetadata(content, format)
+	}
+
+	for _, format := range probedFormats {
+		if hasSopsMetadata(content, format) {
+			return format, true
+		}
+	}
+
+	return formats.Binary, false
+}
+
+// formatName returns the SOPS name of a format, such as "yaml" or "binary".
+// formats.Format is an unnamed integer enum, so it is unusable in messages as is.
+func formatName(format formats.Format) string {
+	return common.StoreForFormat(format, config.NewStoresConfig()).Name()
+}
+
+// hasSopsMetadata parses the content with the supplied SOPS format and verifies
+// that it contains valid SOPS metadata without attempting decryption.
+func hasSopsMetadata(content []byte, format formats.Format) bool {
+	store := common.StoreForFormat(format, config.NewStoresConfig())
+
+	tree, err := store.LoadEncryptedFile(content)
+	if err != nil || tree.Metadata.MasterKeyCount() == 0 {
+		return false
+	}
+
+	// SOPS always stores an encrypted MAC, so a plaintext one marks a document that
+	// merely mimics the metadata structure. SOPS exposes no predicate for this.
+	if !strings.HasPrefix(tree.Metadata.MessageAuthenticationCode, "ENC[") {
+		return false
+	}
+
+	// A single value store (binary) only emits its "data" key, so let the store reject
+	// documents it could load but not emit, such as structured JSON.
+	if singleValue, ok := store.(sops.SingleValueStore); ok && singleValue.IsSingleValueStore() {
+		if _, err = store.EmitPlainFile(tree.Branches); err != nil {
+			return false
+		}
+	}
+
+	return true
 }
 
 // DecryptFileInPlace decrypts a SOPS-encrypted file at the given path and overwrites it with the decrypted content.
 // If the file is encrypted and successfully decrypted, it returns true. If the file is not encrypted, it returns false without modifying the file.
-// The repoPath parameter is used to ensure that the file being decrypted is within the trusted repository root, preventing potential security issues with symlinks or path traversal.
+// The path must be absolute so that it cannot be resolved relative to an unexpected working directory.
 func DecryptFileInPlace(path string) (bool, error) {
 	path = filepath.Clean(path)
 
@@ -187,22 +239,65 @@ func DecryptFileInPlace(path string) (bool, error) {
 	lock := acquireFileLock(path)
 	defer releaseFileLock(path, lock)
 
-	isEncrypted, err := IsEncryptedFile(path)
+	// Read and detect once, as calling IsEncryptedFile and DecryptFile would read
+	// and parse the same file twice for every file visited during a repository walk.
+	content, err := os.ReadFile(path) // #nosec G304
 	if err != nil {
-		return false, fmt.Errorf("failed to check if file is encrypted: %w", err)
+		return false, fmt.Errorf("failed to read file %s: %w", path, err)
 	}
 
+	return lockedDecryptToFile(path, content)
+}
+
+// DecryptToFile decrypts encrypted and writes the plaintext to path, without
+// ever placing the ciphertext itself on disk. It reports false and leaves path
+// untouched when encrypted carries no SOPS metadata.
+//
+// The path must be absolute so that it cannot be resolved relative to an
+// unexpected working directory.
+func DecryptToFile(path string, encrypted []byte) (bool, error) {
+	path = filepath.Clean(path)
+
+	if !filepath.IsAbs(path) {
+		return false, fmt.Errorf("%w: path must be absolute: %s", filesystem.ErrInvalidFilePath, path)
+	}
+
+	lock := acquireFileLock(path)
+	defer releaseFileLock(path, lock)
+
+	return lockedDecryptToFile(path, encrypted)
+}
+
+// lockedDecryptToFile is the shared core of DecryptFileInPlace and
+// DecryptToFile: it detects, decrypts and writes encrypted's plaintext to the
+// already-validated path. Callers must hold path's file lock, since the
+// compare-then-write below must not interleave with another decryption of the
+// same path.
+//
+// The write is skipped when path already holds exactly that plaintext, so
+// processes watching the file (e.g. a bind-mounted config consumed by a container)
+// are not woken for content that did not change.
+func lockedDecryptToFile(path string, encrypted []byte) (bool, error) {
+	format, isEncrypted := DetectFormat(encrypted, path)
 	if !isEncrypted {
 		return false, nil
 	}
 
-	decryptedContent, err := DecryptFile(path)
-	if err != nil {
-		return false, fmt.Errorf("failed to decrypt file %s: %w", path, err)
+	if !SopsKeyIsSet() {
+		return false, errSopsKeyNotSet
 	}
 
-	err = os.WriteFile(path, decryptedContent, filesystem.PermOwner)
+	decryptedContent, err := DecryptContent(encrypted, format)
 	if err != nil {
+		return false, fmt.Errorf("failed to decrypt content for %s: %w", path, err)
+	}
+
+	if current, readErr := os.ReadFile(path); readErr == nil && bytes.Equal(current, decryptedContent) { // #nosec G304 -- path validated by callers
+		return true, nil
+	}
+
+	// #nosec G703 -- path is cleaned and required to be absolute by callers.
+	if err = os.WriteFile(path, decryptedContent, filesystem.PermOwner); err != nil {
 		return false, fmt.Errorf("failed to write file %s: %w", path, err)
 	}
 

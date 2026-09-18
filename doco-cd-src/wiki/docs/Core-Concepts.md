@@ -32,7 +32,7 @@ Doco-CD automatically detects whether the Docker daemon is running in Swarm mode
 
 ### Webhook
 An event-based HTTP notification sent by your Git provider (GitHub, GitLab, Gitea, etc.) to Doco-CD whenever a commit is pushed.
-Webhooks are the recommended trigger method — they are fast and efficient, but require Doco-CD to be reachable from the internet or local network.
+Webhooks are the recommended trigger method. They are fast and efficient, but require Doco-CD to be reachable from the internet or local network.
 
 Enabled by setting the `WEBHOOK_SECRET` environment variable. See [Setup Webhook](Setup-Webhook.md) and [Webhook Listener](Endpoints/Webhook-Listener.md) for details.
 
@@ -59,6 +59,12 @@ During a deployment, Doco-CD will:
 2. Resolve any [external secrets](External-Secrets/index.md) or [encrypted values](Advanced/Encryption.md).
 3. Build Docker images if necessary.
 4. Deploy the services defined in the `docker-compose.yml` files.
+
+### Failed Deployment Retry
+A deployment that fails after its containers were already created (for example a failed lifecycle hook) is recorded and retried on every following trigger until it succeeds.
+A retry of a failed deploy stage recreates the whole stack, so partially applied changes like never-finished hooks run again.
+The record lives in memory: a restart of Doco-CD drops it and the regular change detection applies again.
+Each failed attempt reports a failure [notification](Advanced/Notifications.md), de-duplicated with periodic reminders.
 
 ### Deployment Configuration
 A YAML file (`.doco-cd.yml` or `.doco-cd.yaml`) placed in the root of a Git repository that controls how a deployment is performed.

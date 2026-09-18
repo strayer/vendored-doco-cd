@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"log/slog"
 	"maps"
 	"os"
@@ -28,8 +27,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/secretprovider"
-
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
 
 	"github.com/go-git/go-git/v5/plumbing"
 
@@ -112,7 +109,7 @@ func TestLoadCompose(t *testing.T) {
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,6 +123,54 @@ func TestLoadCompose(t *testing.T) {
 
 	if len(project.Services) != 1 {
 		t.Fatalf("expected 1 service, got %d", len(project.Services))
+	}
+}
+
+// TestLoadCompose_PassEnvHonoredIndependentOfEnvVar proves that whether the doco-cd process's
+// own OS environment variables are passed through for interpolation is controlled solely by
+// ComposeLoadOptions.PassEnv, not by reading the PASS_ENV environment variable directly. A stale
+// PASS_ENV=true left over from a previous process invocation must not leak OS environment
+// variables into the compose project when the caller explicitly passes PassEnv: false, and setting
+// PassEnv: true must pass them through regardless of what PASS_ENV is set to.
+func TestLoadCompose_PassEnvHonoredIndependentOfEnvVar(t *testing.T) {
+	ctx := context.Background()
+
+	tmpDir := t.TempDir()
+
+	filePath := filepath.Join(tmpDir, "test.compose.yaml")
+
+	composeYAML := `services:
+  test:
+    image: nginx:latest
+    environment:
+      MARKER: ${DOCO_CD_TEST_PASSENV_MARKER}
+`
+	createComposeFile(t, filePath, composeYAML)
+
+	stackName := test.ConvertTestName(t.Name())
+
+	// A stale PASS_ENV=true must have no effect: production code no longer reads this
+	// environment variable, only the explicit ComposeLoadOptions.PassEnv field.
+	t.Setenv("PASS_ENV", "true")
+	t.Setenv("DOCO_CD_TEST_PASSENV_MARKER", "marker-value")
+
+	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{PassEnv: false})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, ok := project.Services["test"].Environment["MARKER"]; ok && got != nil && *got != "" {
+		t.Fatalf("expected MARKER to be unset when PassEnv=false despite PASS_ENV=true, got %q", *got)
+	}
+
+	project, err = LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{PassEnv: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := project.Services["test"].Environment["MARKER"]
+	if got == nil || *got != "marker-value" {
+		t.Fatalf("expected MARKER to be %q when PassEnv=true, got %v", "marker-value", got)
 	}
 }
 
@@ -173,6 +218,14 @@ func waitForSingleRunningProjectContainerID(ctx context.Context, t *testing.T, c
 	return containerID, err
 }
 
+func TestDeployStackValidatesRequest(t *testing.T) {
+	t.Parallel()
+
+	if err := DeployStack(t.Context(), DeployRequest{}); err == nil {
+		t.Fatal("DeployStack() error = nil, want request validation error")
+	}
+}
+
 func TestDeployCompose(t *testing.T) {
 	encryption.SetupAgeKeyEnvVar(t)
 
@@ -207,18 +260,14 @@ func TestDeployCompose(t *testing.T) {
 		})
 	}
 
-	if err := swarm.RefreshModeEnabled(ctx, dockerClient); err != nil {
-		log.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if swarm.GetModeEnabled() {
+	if resolveTestSwarmMode(ctx, t, dockerClient) {
 		t.Skip("Swarm mode is enabled, skipping test")
 	}
 
 	p := webhook.ParsedPayload{
 		Ref:       git.MainBranch,
 		CommitSHA: plumbing.NewHash("4d877107dfa2e3b582bd8f8f803befbd3a1d867e"),
-		Name:      id.GenID(),
+		Name:      id.New(),
 		FullName:  "kimdre/doco-cd_tests",
 		CloneURL:  cloneUrlTest,
 		Private:   false,
@@ -260,7 +309,7 @@ func TestDeployCompose(t *testing.T) {
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{}, []string{}, map[string]string{})
+	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +360,7 @@ compose_files:
 
 		t.Logf("Deploying '%s'", deployConf.Name)
 
-		jobID := id.GenID()
+		jobID := id.New()
 
 		testLog := logger.New(slog.LevelInfo)
 		jobLog := testLog.With(slog.String("job_id", jobID))
@@ -337,8 +386,16 @@ compose_files:
 				return strings.Contains(strings.ToLower(err.Error()), ErrNoSuchImage.Error())
 			}),
 		).Do(func() error {
-			return DeployStack(jobLog, repoPath, &ctx, dockerCli, &p, deployConf,
-				nil, nil, latestCommit, "dev", 0, 0, swarm.GetModeEnabled(), nil)
+			return DeployStack(ctx, DeployRequest{
+				JobLog:           jobLog,
+				ExternalRepoPath: repoPath,
+				DockerCLI:        dockerCli,
+				Payload:          &p,
+				DeployConfig:     deployConf,
+				LatestCommit:     latestCommit,
+				AppVersion:       "dev",
+				SwarmMode:        resolveTestSwarmMode(ctx, t, dockerClient),
+			})
 		})
 		if err != nil {
 			t.Fatalf("failed to deploy stack: %v", err)
@@ -346,7 +403,7 @@ compose_files:
 
 		t.Log("Verifying deployment")
 
-		serviceLabels, err := GetLabeledServices(ctx, dockerClient, swarm.GetModeEnabled(), DocoCDLabels.Deployment.Name, deployConf.Name)
+		serviceLabels, err := GetLabeledServices(ctx, dockerClient, resolveTestSwarmMode(ctx, t, dockerClient), DocoCDLabels.Deployment.Name, deployConf.Name)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -413,14 +470,14 @@ compose_files:
 
 		t.Log("Destroying deployment")
 
-		err = DestroyStack(jobLog, &ctx, &dockerCli, deployConf, swarm.GetModeEnabled())
+		err = DestroyStack(jobLog, &ctx, &dockerCli, deployConf, resolveTestSwarmMode(ctx, t, dockerClient))
 		if err != nil {
 			t.Fatal(err)
 		}
 
 		t.Log("Verifying destruction")
 
-		serviceLabels, err = GetLabeledServices(ctx, dockerClient, swarm.GetModeEnabled(), DocoCDLabels.Deployment.Name, deployConf.Name)
+		serviceLabels, err = GetLabeledServices(ctx, dockerClient, resolveTestSwarmMode(ctx, t, dockerClient), DocoCDLabels.Deployment.Name, deployConf.Name)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -429,7 +486,7 @@ compose_files:
 			t.Fatalf("expected no labeled containers after destruction, got %d", len(serviceLabels))
 		}
 
-		stats, err := GetLatestDeployStatus(ctx, dockerClient, swarm.GetModeEnabled(), p.CloneURL, stackName)
+		stats, err := GetLatestDeployStatus(ctx, dockerClient, resolveTestSwarmMode(ctx, t, dockerClient), p.CloneURL, stackName)
 		if err != nil {
 			t.Fatalf("GetLatestDeployStatus err: %v", err)
 		}
@@ -455,6 +512,7 @@ compose_files:
 			deployConf.EnvFiles,
 			deployConf.Profiles,
 			deployConf.Internal.Environment,
+			ComposeLoadOptions{},
 		)
 		if err != nil {
 			t.Fatalf("failed to load expected project: %v", err)
@@ -1586,7 +1644,7 @@ func TestProjectFilesHaveChanges(t *testing.T) {
 				t.Fatalf("Failed to get changed files: %v", err)
 			}
 
-			project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, d.Name, d.ComposeFiles, d.EnvFiles, d.Profiles, map[string]string{})
+			project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, d.Name, d.ComposeFiles, d.EnvFiles, d.Profiles, map[string]string{}, ComposeLoadOptions{})
 			if err != nil {
 				t.Fatalf("Failed to load compose file: %v", err)
 			}
@@ -1924,7 +1982,7 @@ func TestInjectSecretsToProject(t *testing.T) {
 
 			t.Log("Resolved secrets:", resolvedSecrets)
 
-			project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, test.ConvertTestName(t.Name()), []string{filePath}, []string{".env"}, []string{}, resolvedSecrets)
+			project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, test.ConvertTestName(t.Name()), []string{filePath}, []string{".env"}, []string{}, resolvedSecrets, ComposeLoadOptions{})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2145,7 +2203,7 @@ func TestStopAndStartProjectServices(t *testing.T) {
 		}
 	}
 
-	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, timeout); err != nil {
+	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, &timeout); err != nil {
 		t.Fatalf("failed to stop project service: %v", err)
 	}
 
@@ -2158,6 +2216,74 @@ func TestStopAndStartProjectServices(t *testing.T) {
 
 	assertServiceState("db", "running")
 	assertServiceState("app", "running")
+}
+
+// TestStopProjectServices_HonoursContainerStopTimeout verifies that when no
+// explicit timeout override is passed to StopProjectServices, a container
+// that declares its own stop timeout (via the compose file's
+// stop_grace_period) is detected as such, so the stop request leaves the
+// timeout unset for it, letting the Docker engine apply the container's own
+// value instead of the doco-cd default (see #1852).
+func TestStopProjectServices_HonoursContainerStopTimeout(t *testing.T) {
+	ctx := context.Background()
+
+	const composeYAML = `services:
+  withgrace:
+    image: nginx:latest
+    stop_grace_period: 5s
+  withoutgrace:
+    image: nginx:latest
+`
+
+	stack := test.ComposeUp(ctx, t, test.WithYAML(composeYAML))
+
+	c, err := app.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dockerCli, err := CreateDockerCli(c.DockerQuietDeploy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	containers, err := GetProjectContainers(ctx, dockerCli, stack.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(containers) != 2 {
+		t.Fatalf("expected 2 containers, got %d", len(containers))
+	}
+
+	for _, cont := range containers {
+		svcName := cont.Labels[api.ServiceLabel]
+
+		hasTimeout, err := containerHasConfiguredStopTimeout(ctx, dockerCli, cont.ID)
+		if err != nil {
+			t.Fatalf("containerHasConfiguredStopTimeout(%q): %v", svcName, err)
+		}
+
+		switch svcName {
+		case "withgrace":
+			if !hasTimeout {
+				t.Fatalf("expected service %q (stop_grace_period: 5s) to have a configured stop timeout", svcName)
+			}
+		case "withoutgrace":
+			if hasTimeout {
+				t.Fatalf("expected service %q (no stop_grace_period) to have no configured stop timeout", svcName)
+			}
+		default:
+			t.Fatalf("unexpected service %q", svcName)
+		}
+	}
+
+	// StopProjectServices with no override must still succeed end-to-end for
+	// both containers (one relying on its own configured timeout, one on the
+	// default fallback).
+	if err = StopProjectServices(ctx, dockerCli, stack.Name, []string{"withgrace", "withoutgrace"}, nil); err != nil {
+		t.Fatalf("failed to stop project services: %v", err)
+	}
 }
 
 func TestStopAndStartProjectServices_SchedulerSequence_WithDependsOn(t *testing.T) {
@@ -2228,7 +2354,7 @@ func TestStopAndStartProjectServices_SchedulerSequence_WithDependsOn(t *testing.
 	t.Log("Stopping db service to simulate scheduler pre-run hook")
 
 	// 1) Scheduler pre-run hook: stop selected services (db).
-	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, timeout); err != nil {
+	if err = StopProjectServices(ctx, dockerCli, stackName, []string{"db"}, &timeout); err != nil {
 		t.Fatalf("failed to stop project service: %v", err)
 	}
 
@@ -2282,6 +2408,28 @@ func TestRemoveProject(t *testing.T) {
 
 	if len(containers) != 0 {
 		t.Fatalf("expected 0 containers, got %d", len(containers))
+	}
+}
+
+func TestProjectDownOptionsImageRemoval(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name         string
+		removeImages bool
+		wantImages   string
+	}{
+		{name: "retain images", removeImages: false, wantImages: ""},
+		{name: "remove images", removeImages: true, wantImages: "all"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			options := projectDownOptions(time.Second, false, testCase.removeImages)
+			if options.Images != testCase.wantImages {
+				t.Fatalf("Images = %q, want %q", options.Images, testCase.wantImages)
+			}
+		})
 	}
 }
 
@@ -2624,6 +2772,47 @@ func TestDecryptProjectFiles(t *testing.T) {
 				}
 			},
 			expectedDecryptedFileBasenames: []string{},
+		},
+		{
+			name: "bind-mounted directory without encrypted files does not discard earlier results",
+			buildProject: func(t *testing.T, tmpDir string) *types.Project {
+				t.Helper()
+
+				secretsDir := filepath.Join(tmpDir, "secrets")
+				if err := os.Mkdir(secretsDir, filesystem.PermDir); err != nil {
+					t.Fatalf("failed to create %s: %v", secretsDir, err)
+				}
+
+				envFile := filepath.Join(secretsDir, "app.env")
+				copyFile(t, encryptedEnvSrc, envFile)
+
+				staticDir := filepath.Join(tmpDir, "static")
+				if err := os.Mkdir(staticDir, filesystem.PermDir); err != nil {
+					t.Fatalf("failed to create %s: %v", staticDir, err)
+				}
+
+				// #nosec G703 -- path is constructed from t.TempDir(), not user input
+				if err := os.WriteFile(filepath.Join(staticDir, "index.html"), []byte("<html></html>"), filesystem.PermOwner); err != nil {
+					t.Fatalf("failed to write plain file: %v", err)
+				}
+
+				return &types.Project{
+					WorkingDir: tmpDir,
+					Services: types.Services{
+						"svc1": {
+							Name:     "svc1",
+							EnvFiles: []types.EnvFile{{Path: envFile}},
+							// The directory with the encrypted file is walked first, the
+							// directory without encrypted files second.
+							Volumes: []types.ServiceVolumeConfig{
+								{Type: "bind", Source: secretsDir, Target: "/run/secrets"},
+								{Type: "bind", Source: staticDir, Target: "/srv"},
+							},
+						},
+					},
+				}
+			},
+			expectedDecryptedFileBasenames: []string{"app.env"},
 		},
 	}
 

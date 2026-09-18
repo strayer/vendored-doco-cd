@@ -61,11 +61,7 @@ func TestDeploySwarmStackIsIdempotent(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	if err = swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if !swarm.GetModeEnabled() {
+	if !resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
@@ -101,7 +97,7 @@ func TestDeploySwarmStackIsIdempotent(t *testing.T) {
 
 	filePath := filepath.Join(worktree.Filesystem.Root(), "docker-compose.yml")
 
-	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,10 +123,10 @@ func TestDeploySwarmStackIsIdempotent(t *testing.T) {
 		}
 
 		timestamp := time.Now().UTC().Format(time.RFC3339)
-		addSwarmServiceLabels(cfg, project, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit, projectHash)
+		addSwarmServiceLabels(cfg, project, deployConfigs[0], &p, "", tmpDir, "dev", timestamp, commit, projectHash)
 		addSwarmVolumeLabels(cfg, deployConfigs[0], &p, tmpDir)
-		addSwarmConfigLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit)
-		addSwarmSecretLabels(cfg, deployConfigs[0], &p, tmpDir, "dev", timestamp, commit)
+		addSwarmConfigLabels(cfg, deployConfigs[0], &p, "", tmpDir, "dev", timestamp, commit)
+		addSwarmSecretLabels(cfg, deployConfigs[0], &p, "", tmpDir, "dev", timestamp, commit)
 
 		return retry.New(
 			retry.Attempts(5),

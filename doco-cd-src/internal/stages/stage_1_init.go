@@ -2,7 +2,6 @@ package stages
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -22,6 +21,18 @@ import (
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
+func mergeDeploymentEnvironment(config *deploy.Config) {
+	if len(config.Environment) == 0 {
+		return
+	}
+
+	if config.Internal.Environment == nil {
+		config.Internal.Environment = make(map[string]string)
+	}
+
+	maps.Copy(config.Internal.Environment, config.Environment)
+}
+
 // RunInitStage executes the initialization stage logic for the deployment process.
 func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) error {
 	var err error
@@ -35,12 +46,11 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 	if s.JobTrigger == JobTriggerWebhook {
 		// Skip deployment if the webhook event does not match the filter
 		if s.DeployConfig.WebhookEventFilter != "" {
-			filter := regexp.MustCompile(s.DeployConfig.WebhookEventFilter)
-			if !filter.MatchString(s.Payload.Ref) {
+			if !s.MatchesWebhookEventFilter() {
 				stageLog.Debug("reference does not match the webhook event filter, skipping deployment",
 					slog.String("webhook_filter", s.DeployConfig.WebhookEventFilter), slog.String("ref", s.Payload.Ref))
 
-				return ErrSkipDeployment
+				return ErrWebhookFilterMismatch
 			}
 
 			stageLog.Debug("reference matches the webhook event filter, proceeding with deployment",
@@ -57,6 +67,11 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		err = deploy.LoadLocalDotEnv(s.DeployConfig, s.Repository.PathInternal)
 		if err != nil {
 			return fmt.Errorf("failed to parse local env files: %w", err)
+		}
+
+		err = deploy.LoadExternalSecretsFiles(s.DeployConfig, s.Repository.PathInternal)
+		if err != nil {
+			return fmt.Errorf("failed to parse local external secrets files: %w", err)
 		}
 	}
 
@@ -91,6 +106,14 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 			return fmt.Errorf("failed to parse env files from OCI artifact: %w", err)
 		}
 
+		err = deploy.LoadExternalSecretsFiles(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
+		if err != nil {
+			return fmt.Errorf("failed to parse external secrets files from OCI artifact: %w", err)
+		}
+
+		mergeDeploymentEnvironment(s.DeployConfig)
+		deploy.MergeExternalSecretsFromFiles(s.DeployConfig)
+
 		s.Log = s.Log.With(
 			slog.String("stack", s.DeployConfig.Name),
 			slog.String("repository", s.Repository.Name),
@@ -105,78 +128,90 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		slog.String("reference", s.DeployConfig.Reference),
 	)
 
-	auth, err := git.GetAuthMethod(s.Repository.SourceUrl, s.AppConfig.SSHPrivateKey, s.AppConfig.SSHPrivateKeyPassphrase, s.AppConfig.GitAccessToken)
-	if err != nil {
-		return fmt.Errorf("failed to get auth method: %w", err)
-	}
+	var syncResult *git.SyncResult
 
-	// Attempt to fetch the remote repository before checking if we can skip cloning/updating,
-	// to ensure we have the latest commits and references available locally
-	if s.DeployConfig.RepositoryUrl != "" {
-		repo, err := git.OpenRepository(s.Repository.PathInternal)
-		switch {
-		case err == nil:
-			err = git.FetchRepository(repo, s.Repository.SourceUrl, s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
-			if err != nil {
-				// If fetch failed with corruption indicators, attempt repair
-				if git.IsCorruptionError(err) {
-					stageLog.Warn("detected corruption during fetch, attempting repository repair",
-						slog.String("path", s.Repository.PathExternal))
+	// A sync may check out another commit, which resets and re-decrypts tracked files repository-wide.
+	// Hold the same lock source.Prepare and LoadCompose use, so a concurrent stack cannot observe or race that transition;
+	// git.SyncRepository's own path lock does not serialize against them.
+	if err := s.withSourceLock(func() error {
+		if s.DeployConfig.RepositoryUrl == "" {
+			matches, matchErr := git.MatchesHead(s.Repository.PathInternal, s.DeployConfig.Reference)
+			if matchErr != nil {
+				return fmt.Errorf("failed to check prepared repository state: %w", matchErr)
+			}
 
-					if _, repairErr := git.RepairRepository(s.Repository.PathInternal, s.Repository.SourceUrl, s.DeployConfig.Reference,
-						s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules,
-						s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth), stageLog); repairErr != nil {
-						return fmt.Errorf("failed to fetch repository and repair attempt failed: %w (repair error: %v)", err, repairErr)
-					}
-				} else {
-					return fmt.Errorf("failed to fetch repository: %w", err)
+			if matches && !git.RepositoryNeedsReclone(
+				s.Repository.PathInternal,
+				s.Repository.SourceUrl,
+				s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth),
+			) {
+				repo, openErr := git.OpenRepository(s.Repository.PathInternal)
+				if openErr != nil {
+					return fmt.Errorf("failed to open prepared repository: %w", openErr)
 				}
+
+				syncResult = &git.SyncResult{Repository: repo, State: git.SyncStateCurrent}
 			}
-		case errors.Is(err, git.ErrRepositoryNotExists): // Continue without fetching the repository, it will be cloned later
-		default:
-			return fmt.Errorf("failed to open repository: %w", err)
 		}
+
+		if syncResult != nil {
+			return nil
+		}
+
+		auth, authErr := git.GetAuthMethod(s.Repository.SourceUrl, s.AppConfig.SSHPrivateKey, s.AppConfig.SSHPrivateKeyPassphrase, s.AppConfig.GitAccessToken)
+		if authErr != nil {
+			return fmt.Errorf("failed to get auth method: %w", authErr)
+		}
+
+		var syncErr error
+
+		syncResult, syncErr = git.SyncRepository(
+			s.Repository.PathInternal, s.Repository.SourceUrl, s.DeployConfig.Reference,
+			s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules,
+			s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth),
+		)
+		if syncErr != nil {
+			return fmt.Errorf("failed to synchronize repository: %w", syncErr)
+		}
+
+		return nil
+	}); err != nil {
+		return err
 	}
 
-	// Check if we can skip cloning/updating because the previous run (initial or a prior deploy config)
-	skipCloneUpdate, err := git.MatchesHead(s.Repository.PathInternal, s.DeployConfig.Reference)
-	if err != nil {
-		return fmt.Errorf("failed to check if repository matches remote and reference: %w", err)
+	s.Repository.Git = syncResult.Repository
+	switch syncResult.State {
+	case git.SyncStateCurrent:
+		stageLog.Debug("skipping clone of remote repository, already at correct state",
+			slog.String("url", s.Repository.SourceUrl),
+			slog.String("reference", s.DeployConfig.Reference))
+	case git.SyncStateCloned:
+		stageLog.Info("cloned remote repository",
+			slog.String("url", s.Repository.SourceUrl),
+			slog.String("path", s.Repository.PathExternal))
+	default:
+		stageLog.Debug("updated remote repository",
+			slog.String("url", s.Repository.SourceUrl),
+			slog.String("reference", s.DeployConfig.Reference),
+			slog.String("path", s.Repository.PathExternal))
 	}
 
 	if s.DeployConfig.RepositoryUrl != "" {
-		if skipCloneUpdate {
-			stageLog.Debug("skipping clone of remote repository, already at correct state",
-				slog.String("url", s.Repository.SourceUrl),
-				slog.String("reference", s.DeployConfig.Reference))
-		} else {
-			stageLog.Debug("repository URL provided, cloning remote repository")
-
-			_, err = git.CloneRepository(s.Repository.PathInternal, s.Repository.SourceUrl, s.DeployConfig.Reference,
-				s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
-			if err != nil && !errors.Is(err, git.ErrRepositoryAlreadyExists) {
-				return fmt.Errorf("failed to clone repository: %w", err)
-			}
-
-			stageLog.Info("cloned remote repository",
-				slog.String("url", s.Repository.SourceUrl),
-				slog.String("path", s.Repository.PathExternal))
-		}
-
-		// Now also load remote dotenv files
+		// Now also load remote dotenv files.
 		err = deploy.LoadLocalDotEnv(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
 		if err != nil {
 			return fmt.Errorf("failed to parse remote env files: %w", err)
 		}
-	}
 
-	if len(s.DeployConfig.Environment) > 0 {
-		if s.DeployConfig.Internal.Environment == nil {
-			s.DeployConfig.Internal.Environment = make(map[string]string)
+		// Now also load remote external secrets files.
+		err = deploy.LoadExternalSecretsFiles(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
+		if err != nil {
+			return fmt.Errorf("failed to parse remote external secrets files: %w", err)
 		}
-
-		maps.Copy(s.DeployConfig.Internal.Environment, s.DeployConfig.Environment)
 	}
+
+	mergeDeploymentEnvironment(s.DeployConfig)
+	deploy.MergeExternalSecretsFromFiles(s.DeployConfig)
 
 	if s.DeployConfig.Destroy.Enabled {
 		// Skip deployment if another project with the same name already exists
@@ -199,26 +234,6 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 
 		if !correctRepo {
 			return fmt.Errorf("%w: %s: skipping deployment", ErrDeploymentConflict, s.DeployConfig.Name)
-		}
-	}
-
-	// Skip UpdateRepository if the previous run already cloned/updated with the same URL and reference
-	if skipCloneUpdate {
-		stageLog.Debug("skipping checkout, already at correct reference",
-			slog.String("reference", s.DeployConfig.Reference),
-			slog.String("path", s.Repository.PathExternal))
-
-		s.Repository.Git, err = git.OpenRepository(s.Repository.PathInternal)
-		if err != nil {
-			return fmt.Errorf("failed to open repository: %w", err)
-		}
-	} else {
-		stageLog.Debug("checking out reference "+s.DeployConfig.Reference, slog.String("path", s.Repository.PathExternal))
-
-		s.Repository.Git, err = git.UpdateRepository(s.Repository.PathInternal, s.Repository.SourceUrl, s.DeployConfig.Reference,
-			s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
-		if err != nil {
-			return fmt.Errorf("failed to checkout repository: %w", err)
 		}
 	}
 
@@ -263,4 +278,14 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 	}
 
 	return nil
+}
+
+// MatchesWebhookEventFilter reports whether this run should proceed based on
+// its trigger, configured webhook filter, and payload reference.
+func (s *StageManager) MatchesWebhookEventFilter() bool {
+	if s.JobTrigger != JobTriggerWebhook || s.DeployConfig.WebhookEventFilter == "" {
+		return true
+	}
+
+	return s.Payload != nil && regexp.MustCompile(s.DeployConfig.WebhookEventFilter).MatchString(s.Payload.Ref)
 }

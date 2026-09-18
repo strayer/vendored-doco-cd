@@ -235,7 +235,7 @@ func Test_getLatestServiceState(t *testing.T) {
 			},
 		},
 		{
-			// svc2 has a different repo label but is still part of the project — it must appear
+			// svc2 has a different repo label but is still part of the project, so it must appear
 			// in DeployedStatus. Only metadata (commit SHA, compose hash) is drawn from svc1.
 			name: "two service with timestamp but repo mixed",
 			serviceStatus: map[Service]ServiceStatus{
@@ -395,7 +395,7 @@ func Test_getLatestServiceState(t *testing.T) {
 					Replicas: 1,
 				},
 				"unlabeled": {
-					// No cd.doco.* labels — simulates a container recreated outside doco-cd.
+					// No cd.doco.* labels simulates a container recreated outside doco-cd.
 					Labels:   Labels{},
 					Replicas: 1,
 				},
@@ -488,11 +488,7 @@ func TestGetLatestServiceState(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if swarm.GetModeEnabled() {
+	if resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("Swarm mode is enabled, skipping test")
 	}
 	// t.Parallel()
@@ -535,7 +531,7 @@ services:
 
 	stackName := test.ConvertTestName(t.Name())
 
-	_, err = LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	_, err = LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +545,7 @@ services:
 		}),
 	)
 
-	latest, err := GetLatestDeployStatus(ctx, stack.Client, swarm.GetModeEnabled(), repoName, stackName)
+	latest, err := GetLatestDeployStatus(ctx, stack.Client, resolveTestSwarmMode(ctx, t, stack.Client), repoName, stackName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,11 +576,7 @@ func TestGetLatestServiceSwarm(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if !swarm.GetModeEnabled() {
+	if !resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
@@ -628,7 +620,7 @@ services:
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -666,10 +658,10 @@ services:
 	).Do(
 		func() error {
 			timestamp := time.Now().UTC().Format(time.RFC3339)
-			addSwarmServiceLabels(swarmStack, project, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString(), projectHash)
+			addSwarmServiceLabels(swarmStack, project, deployCfg, &p, "", tmpDir, "dev", timestamp, p.CommitSHAString(), projectHash)
 			addSwarmVolumeLabels(swarmStack, deployCfg, &p, tmpDir)
-			addSwarmConfigLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString())
-			addSwarmSecretLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString())
+			addSwarmConfigLabels(swarmStack, deployCfg, &p, "", tmpDir, "dev", timestamp, p.CommitSHAString())
+			addSwarmSecretLabels(swarmStack, deployCfg, &p, "", tmpDir, "dev", timestamp, p.CommitSHAString())
 
 			return DeploySwarmStack(ctx, dockerCli, swarmStack, opts)
 		},
@@ -682,7 +674,7 @@ services:
 
 	dockerClient := dockerCli.Client()
 
-	latest, err := GetLatestDeployStatus(ctx, dockerClient, swarm.GetModeEnabled(), repoName, stackName)
+	latest, err := GetLatestDeployStatus(ctx, dockerClient, resolveTestSwarmMode(ctx, t, dockerClient), repoName, stackName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1036,7 +1028,7 @@ func TestCheckServiceMismatch(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "swarmMode=true, ignore unnecessary scheduler ephemeral by legacy name fallback",
+			name: "swarmMode=true, ignore unnecessary scheduler ephemeral by execution mode",
 			deployed: map[Service]ServiceStatus{
 				"foo": {Replicas: 1, SwarmMode: swarm.DeployModeReplicated},
 				"foo-doco-job-1730000000000000000": {

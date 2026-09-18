@@ -7,44 +7,36 @@ import (
 
 	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/events"
-	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/common/id"
 	"github.com/kimdre/doco-cd/internal/common/types/set"
 
-	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 
 	"github.com/kimdre/doco-cd/internal/docker"
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/logger"
 )
 
-func (j *job) restartUnhealthyContainersOnStartup(ctx context.Context, jobLog *slog.Logger, contextName string, cli command.Cli, swarmMode bool) {
-	unhealthyAllDCs := j.deployConfigGroupByEvent["unhealthy"]
-
-	unhealthyDCs := filterConfigsByContext(unhealthyAllDCs, contextName)
+func (j *job) restartUnhealthyContainersOnStartup(ctx context.Context, jobLog *slog.Logger, cli command.Cli, swarmMode bool, unhealthyDCs []*deployConfig.Config) {
 	if len(unhealthyDCs) == 0 || swarmMode {
 		return
 	}
 
-	repositoryLabelValue := gitInternal.GetFullName(j.info.repoData.SourceUrl)
-	if j.info.payload != nil && strings.TrimSpace(j.info.payload.FullName) != "" {
-		repositoryLabelValue = j.info.payload.FullName
+	repositoryLabelValue := gitInternal.GetFullName(j.info.Repository.SourceUrl)
+	if j.info.Payload != nil && strings.TrimSpace(j.info.Payload.FullName) != "" {
+		repositoryLabelValue = j.info.Payload.FullName
 	}
 
-	filterArgs := make(client.Filters)
-	filterArgs.Add("label", docker.DocoCDLabels.Metadata.Manager+"="+app.Name)
-	filterArgs.Add("label", docker.DocoCDLabels.Source.Name+"="+repositoryLabelValue)
-
-	containerResult, err := cli.Client().ContainerList(ctx, client.ContainerListOptions{All: true, Filters: filterArgs})
+	containers, err := j.manager.runtimeQueries.ListManagedRepositoryContainers(
+		ctx, cli.Client(), repositoryLabelValue, true,
+	)
 	if err != nil {
 		jobLog.Error("failed to list containers for startup unhealthy scan", logger.ErrAttr(err))
 		return
 	}
 
-	for _, c := range containerResult.Items {
+	for _, c := range containers {
 		stackName := strings.TrimSpace(c.Labels[docker.DocoCDLabels.Deployment.Name])
 		if stackName == "" {
 			continue
@@ -57,7 +49,7 @@ func (j *job) restartUnhealthyContainersOnStartup(ctx context.Context, jobLog *s
 			continue
 		}
 
-		inspectResult, err := cli.Client().ContainerInspect(ctx, c.ID, client.ContainerInspectOptions{})
+		state, err := j.manager.runtimeQueries.InspectContainerState(ctx, cli.Client(), c.ID)
 		if err != nil {
 			jobLog.Debug("failed to inspect container during startup unhealthy scan",
 				slog.String("container_id", shortID(c.ID)),
@@ -67,9 +59,7 @@ func (j *job) restartUnhealthyContainersOnStartup(ctx context.Context, jobLog *s
 			continue
 		}
 
-		inspect := inspectResult.Container
-
-		if inspect.State == nil || inspect.State.Health == nil || strings.ToLower(strings.TrimSpace(string(inspect.State.Health.Status))) != "unhealthy" {
+		if state == nil || state.Health == nil || strings.ToLower(strings.TrimSpace(string(state.Health.Status))) != "unhealthy" {
 			continue
 		}
 
@@ -78,7 +68,7 @@ func (j *job) restartUnhealthyContainersOnStartup(ctx context.Context, jobLog *s
 			containerName = strings.TrimPrefix(c.Names[0], "/")
 		}
 
-		traceID := id.GenID()
+		traceID := id.New()
 
 		eventLog := logger.
 			WithoutAttr(jobLog, "job_id").
@@ -109,9 +99,10 @@ func (j *job) restartUnhealthyContainersOnStartup(ctx context.Context, jobLog *s
 	}
 }
 
-// uniqueRedeployDCsFromGroupByEvent returns a deduplicated slice (by stack name) of deploy configs
-// that have at least one non-restart reconciliation event configured (e.g. "die", "destroy", "update").
-// These are the stacks that should be redeployed when their containers/services go missing.
+// uniqueRedeployDCsFromGroupByEvent returns a deduplicated slice (by Docker context and stack name)
+// of deploy configs that have at least one non-restart reconciliation event configured (e.g. "die",
+// "destroy", "update"). These are the stacks that should be redeployed when their containers/services
+// go missing.
 func uniqueRedeployDCsFromGroupByEvent(grouped map[string][]*deployConfig.Config) []*deployConfig.Config {
 	seen := set.New[string]()
 
@@ -127,8 +118,10 @@ func uniqueRedeployDCsFromGroupByEvent(grouped map[string][]*deployConfig.Config
 				continue
 			}
 
-			if !seen.Contains(dc.Name) {
-				seen.Add(dc.Name)
+			key := dc.Context + "\x00" + dc.Name
+			if !seen.Contains(key) {
+				seen.Add(key)
+
 				result = append(result, dc)
 			}
 		}
@@ -140,8 +133,8 @@ func uniqueRedeployDCsFromGroupByEvent(grouped map[string][]*deployConfig.Config
 // redeployMissingServicesOnStartup performs a one-time startup check for stacks whose
 // reconciliation is configured for redeploy-oriented events (e.g., "die", "destroy", "update")
 // and triggers a redeploy for any stacks that are completely missing their containers/services.
-func (j *job) redeployMissingServicesOnStartup(ctx context.Context, jobLog *slog.Logger, contextName string, cli command.Cli, swarmMode bool) {
-	allCandidates := uniqueRedeployDCsFromGroupByEvent(j.deployConfigGroupByEvent)
+func (j *job) redeployMissingServicesOnStartup(ctx context.Context, jobLog *slog.Logger, contextName string, cli command.Cli, swarmMode bool, modeConfigs []*deployConfig.Config) {
+	allCandidates := uniqueRedeployDCsFromGroupByEvent(getDeployConfigGroupByEvent(modeConfigs))
 
 	candidates := filterConfigsByContext(allCandidates, contextName)
 	if len(candidates) == 0 {
@@ -160,7 +153,7 @@ func (j *job) redeployMissingServicesOnStartup(ctx context.Context, jobLog *slog
 		return
 	}
 
-	traceID := id.GenID()
+	traceID := id.New()
 
 	eventLog := logger.
 		WithoutAttr(jobLog, "job_id").
@@ -171,25 +164,20 @@ func (j *job) redeployMissingServicesOnStartup(ctx context.Context, jobLog *slog
 			),
 		)
 
-	j.deploy(ctx, eventLog, missingDCs, "startup_missing", events.Message{}, traceID, contextName)
+	j.deploy(ctx, eventLog, missingDCs, "startup_missing", events.Message{}, traceID, contextName, swarmMode)
 }
 
 // findMissingContainersOnStartup lists all running containers for this repository and returns
 // deploy configs whose stacks have no running containers at all.
 func (j *job) findMissingContainersOnStartup(ctx context.Context, jobLog *slog.Logger, cli command.Cli, candidates []*deployConfig.Config) []*deployConfig.Config {
-	repositoryLabelValue := gitInternal.GetFullName(j.info.repoData.SourceUrl)
-	if j.info.payload != nil && strings.TrimSpace(j.info.payload.FullName) != "" {
-		repositoryLabelValue = j.info.payload.FullName
+	repositoryLabelValue := gitInternal.GetFullName(j.info.Repository.SourceUrl)
+	if j.info.Payload != nil && strings.TrimSpace(j.info.Payload.FullName) != "" {
+		repositoryLabelValue = j.info.Payload.FullName
 	}
 
-	filterArgs := make(client.Filters)
-	filterArgs.Add("label", docker.DocoCDLabels.Metadata.Manager+"="+app.Name)
-	filterArgs.Add("label", docker.DocoCDLabels.Source.Name+"="+repositoryLabelValue)
-
-	containerResult, err := cli.Client().ContainerList(ctx, client.ContainerListOptions{
-		All:     false, // running only
-		Filters: filterArgs,
-	})
+	containers, err := j.manager.runtimeQueries.ListManagedRepositoryContainers(
+		ctx, cli.Client(), repositoryLabelValue, false,
+	)
 	if err != nil {
 		jobLog.Error("failed to list containers for startup missing scan", logger.ErrAttr(err))
 		return nil
@@ -197,7 +185,7 @@ func (j *job) findMissingContainersOnStartup(ctx context.Context, jobLog *slog.L
 
 	runningStacks := set.New[string]()
 
-	for _, c := range containerResult.Items {
+	for _, c := range containers {
 		if stackName := strings.TrimSpace(c.Labels[docker.DocoCDLabels.Deployment.Name]); stackName != "" {
 			runningStacks.Add(stackName)
 		}
@@ -218,12 +206,14 @@ func (j *job) findMissingContainersOnStartup(ctx context.Context, jobLog *slog.L
 // findMissingSwarmServicesOnStartup lists all swarm services for this repository and returns
 // deploy configs whose stacks have no deployed services at all.
 func (j *job) findMissingSwarmServicesOnStartup(ctx context.Context, jobLog *slog.Logger, cli command.Cli, candidates []*deployConfig.Config) []*deployConfig.Config {
-	repositoryLabelValue := gitInternal.GetFullName(j.info.repoData.SourceUrl)
-	if j.info.payload != nil && strings.TrimSpace(j.info.payload.FullName) != "" {
-		repositoryLabelValue = j.info.payload.FullName
+	repositoryLabelValue := gitInternal.GetFullName(j.info.Repository.SourceUrl)
+	if j.info.Payload != nil && strings.TrimSpace(j.info.Payload.FullName) != "" {
+		repositoryLabelValue = j.info.Payload.FullName
 	}
 
-	services, err := swarm.GetServicesByLabel(ctx, cli.Client(), docker.DocoCDLabels.Metadata.Manager, app.Name)
+	services, err := j.manager.runtimeQueries.ListManagedRepositoryServices(
+		ctx, cli.Client(), repositoryLabelValue,
+	)
 	if err != nil {
 		jobLog.Error("failed to list swarm services for startup missing scan", logger.ErrAttr(err))
 		return nil
@@ -233,11 +223,6 @@ func (j *job) findMissingSwarmServicesOnStartup(ctx context.Context, jobLog *slo
 
 	for _, svc := range services {
 		labels := docker.SwarmServiceLabels(svc)
-
-		// Filter by repository to avoid matching services from other repos on the same swarm.
-		if strings.TrimSpace(labels[docker.DocoCDLabels.Source.Name]) != repositoryLabelValue {
-			continue
-		}
 
 		if stackName := strings.TrimSpace(labels[docker.DocoCDLabels.Deployment.Name]); stackName != "" {
 			existingStacks.Add(stackName)
@@ -262,7 +247,24 @@ func filterConfigsByContext(dcs []*deployConfig.Config, contextName string) []*d
 	var result []*deployConfig.Config
 
 	for _, dc := range dcs {
-		if dc != nil && strings.TrimSpace(dc.Context) == contextName {
+		if dc != nil && docker.NormalizeContextName(dc.Context) == docker.NormalizeContextName(contextName) {
+			result = append(result, dc)
+		}
+	}
+
+	return result
+}
+
+func filterConfigsByMode(dcs []*deployConfig.Config, swarmAvailable, swarmMode bool) []*deployConfig.Config {
+	result := make([]*deployConfig.Config, 0, len(dcs))
+
+	for _, dc := range dcs {
+		if dc == nil {
+			continue
+		}
+
+		selected, err := dc.ResolveSwarmMode(swarmAvailable)
+		if err == nil && selected == swarmMode {
 			result = append(result, dc)
 		}
 	}
