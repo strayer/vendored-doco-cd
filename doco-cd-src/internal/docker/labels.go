@@ -21,6 +21,7 @@ type docoCdLabelNamesDeployment struct {
 	ConfigHash           string // SHA256 hash of the deploy-config used during deployment
 	AutoDiscovery        string // Whether the deployment was auto-discovered
 	AutoDiscoveryConfig  string // JSON-serialized AutoDiscoveryConfig settings
+	Autostart            string // Whether deployment should start the service automatically
 	RecreateIgnore       string // Whether the deployment file changes should ignore recreate
 	RecreateIgnoreSignal string // Signal service when deployment file changes and ignore recreate
 	CertExpiry           string // RFC3339 timestamp of the earliest expiry among the deployment's cert-bearing external secrets
@@ -32,7 +33,16 @@ type docoCdLabelNamesDeployment struct {
 type docoCdLabelNamesSource struct {
 	Type string // Source type (git or oci)
 	Name string // Repository or artifact name
-	URL  string // Repository or artifact URL
+	// URL is the resolved URL used to fetch and name the on-disk source
+	// directory containing the deploy config. It intentionally remains the
+	// config-containing source when repository_url selects a different
+	// deployment repository. It may differ from the webhook/poll payload's
+	// browsable URL (used only transiently for commit-status posting during
+	// the triggering run), e.g. when a Git host serves HTTP(S) and SSH on
+	// different hosts/ports. Consumers that reconstruct the config source
+	// path or verify its identity (scheduler, auto-discovery, migration)
+	// must use this label.
+	URL string
 }
 
 // docoCdLabelNames contains the labels used by DocoCD to identify deployed containers and their metadata.
@@ -60,6 +70,7 @@ var DocoCDLabels = docoCdLabelNames{
 		ConfigHash:           "cd.doco.deployment.config.sha",
 		AutoDiscovery:        "cd.doco.deployment.auto_discovery",
 		AutoDiscoveryConfig:  "cd.doco.deployment.auto_discovery.config",
+		Autostart:            "cd.doco.deployment.autostart",
 		RecreateIgnore:       "cd.doco.deployment.recreate.ignore",
 		RecreateIgnoreSignal: "cd.doco.deployment.recreate.ignore.signal",
 		CertExpiry:           "cd.doco.deployment.cert.expiry",
@@ -73,50 +84,45 @@ var DocoCDLabels = docoCdLabelNames{
 	},
 }
 
-/*
-DeprecatedAutoDiscoverLabel and DeprecatedAutoDiscoverDeleteLabel are the old label names
-kept for backwards-compatible reads. New deployments only write the new labels.
-
-Deprecated: Use DocoCDLabels.Deployment.AutoDiscovery and DocoCDLabels.Deployment.AutoDiscoveryConfig instead.
-
-TODO: Remove in a future release.
-*/
-const (
-	DeprecatedAutoDiscoverLabel       = "cd.doco.deployment.auto_discover"
-	DeprecatedAutoDiscoverDeleteLabel = "cd.doco.deployment.auto_discover.delete"
-	// DeprecatedAutoDiscoveryDeleteLabel is the pre-consolidation scalar label for the delete setting.
-	DeprecatedAutoDiscoveryDeleteLabel = "cd.doco.deployment.auto_discovery.delete" //nolint:staticcheck
-)
-
 // jobLabelPrefix is the common prefix of all labels that configure scheduled jobs.
 const jobLabelPrefix = "cd.doco.job."
 
 var docoCDJobLabelNames = struct {
-	JobEnabled         string // Enable scheduling for a service/container
-	JobSchedule        string // Schedule of the job in 5-field cron format or @every duration
-	JobWaitRunning     string // Override if deployment waits for this running job based on wait_running_jobs
-	JobSkipRunning     string // Skip a schedule trigger when a previous run is still in progress
-	JobExecutionMode   string // Defines if a run restarts/reruns the job or starts an ephemeral one-off execution
-	JobEphemeral       string // Marks a runtime-created scheduler one-off target that should be ignored as drift
-	JobNotifyOn        string // Controls notification behavior: none, success, failure, all
-	JobSwarmReplicas   string // Number of replicas for one-off replicated-job runs in swarm mode
-	JobRestartReplicas string // Intended replica count for swarm restart-mode jobs deployed at 0 replicas
-	JobLastRun         string // Timestamp of the last run in RFC3339 format
-	JobNextRun         string // Timestamp of the next scheduled run in RFC3339 format
-	JobStopServices    string // Comma-separated list of services to stop before the job runs and restart after
+	JobEnabled             string // Enable scheduling for a service/container
+	JobSchedule            string // Schedule of the job in 5-field cron format or @every duration
+	JobWaitRunning         string // Override if deployment waits for this running job based on wait_running_jobs
+	JobSkipRunning         string // Skip a schedule trigger when a previous run is still in progress
+	JobExecutionMode       string // Defines if a run restarts/reruns the job or starts an ephemeral one-off execution
+	JobEphemeral           string // Marks a runtime-created scheduler one-off target that should be ignored as drift
+	JobSourceServiceID     string // Identifies the source service of a runtime-created Swarm one-off target
+	JobRunID               string // Identifies one recoverable scheduled one-off execution
+	JobScheduledAt         string // Original scheduled timestamp for a one-off execution
+	JobStartedAt           string // Original start timestamp for a one-off execution
+	JobNotifyOn            string // Controls notification behavior: none, success, failure, all
+	JobSwarmReplicas       string // Number of replicas for one-off replicated-job runs in swarm mode
+	JobRestartReplicas     string // Intended replica count for swarm restart-mode jobs deployed at 0 replicas
+	JobLastRun             string // Timestamp of the last run in RFC3339 format
+	JobNextRun             string // Timestamp of the next scheduled run in RFC3339 format
+	JobStopServices        string // Comma-separated list of services to stop before the job runs and restart after
+	JobStopServicesTimeout string // Explicit timeout in seconds used when stopping stop_services targets
 }{
-	JobEnabled:         "cd.doco.job.enabled",
-	JobSchedule:        "cd.doco.job.schedule",
-	JobWaitRunning:     "cd.doco.job.wait_running_jobs",
-	JobSkipRunning:     "cd.doco.job.skip_running",
-	JobExecutionMode:   "cd.doco.job.execution_mode",
-	JobEphemeral:       "cd.doco.job.ephemeral",
-	JobNotifyOn:        "cd.doco.job.notify_on",
-	JobSwarmReplicas:   "cd.doco.job.swarm.replicas",
-	JobRestartReplicas: "cd.doco.job.swarm.restart_replicas",
-	JobLastRun:         "cd.doco.job.last_run",
-	JobNextRun:         "cd.doco.job.next_run",
-	JobStopServices:    "cd.doco.job.stop_services",
+	JobEnabled:             "cd.doco.job.enabled",
+	JobSchedule:            "cd.doco.job.schedule",
+	JobWaitRunning:         "cd.doco.job.wait_running_jobs",
+	JobSkipRunning:         "cd.doco.job.skip_running",
+	JobExecutionMode:       "cd.doco.job.execution_mode",
+	JobEphemeral:           "cd.doco.job.ephemeral",
+	JobSourceServiceID:     "cd.doco.job.source_service_id",
+	JobRunID:               "cd.doco.job.run_id",
+	JobScheduledAt:         "cd.doco.job.scheduled_at",
+	JobStartedAt:           "cd.doco.job.started_at",
+	JobNotifyOn:            "cd.doco.job.notify_on",
+	JobSwarmReplicas:       "cd.doco.job.swarm.replicas",
+	JobRestartReplicas:     "cd.doco.job.swarm.restart_replicas",
+	JobLastRun:             "cd.doco.job.last_run",
+	JobNextRun:             "cd.doco.job.next_run",
+	JobStopServices:        "cd.doco.job.stop_services",
+	JobStopServicesTimeout: "cd.doco.job.stop_services.timeout",
 }
 
 // DocoCDJobLabels exposes the scheduler/job labels for consumers outside this package.

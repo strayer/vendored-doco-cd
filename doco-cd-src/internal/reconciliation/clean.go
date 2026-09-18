@@ -4,13 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"maps"
 	"slices"
-	"strconv"
 	"strings"
 
 	"github.com/docker/cli/cli/command"
 
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 
 	"github.com/kimdre/doco-cd/internal/git"
@@ -23,15 +22,18 @@ import (
 
 // cleanupObsoleteAutoDiscoveredContainers removes obsolete auto-discovered containers that are no longer defined in
 // the current deployment configurations but still exist on the Docker host.
+// contextName is the Docker context dockerCli is connected to and is only used to attribute
+// notifications, since the same stack name can exist on several contexts.
 func cleanupObsoleteAutoDiscoveredContainers(ctx context.Context, jobLog *slog.Logger,
-	dockerCli command.Cli, swarmMode bool,
+	dockerCli command.Cli, swarmMode bool, contextName string,
 	cloneUrl string, deployConfigs []*deployConfig.Config, metadata notification.Metadata,
+	notifier notification.Sender,
 ) error {
 	autoDiscoveredNames := make(map[string]bool)
-	runConfigTargets := make(map[string]struct{})
+	runConfigTargets := set.New[string]()
 
 	for _, cfg := range deployConfigs {
-		runConfigTargets[strings.TrimSpace(cfg.Internal.ConfigTarget)] = struct{}{}
+		runConfigTargets.Add(strings.TrimSpace(cfg.Internal.ConfigTarget))
 
 		if cfg.AutoDiscovery.Enabled {
 			autoDiscoveredNames[cfg.Name] = cfg.AutoDiscovery.Delete
@@ -42,30 +44,16 @@ func cleanupObsoleteAutoDiscoveredContainers(ctx context.Context, jobLog *slog.L
 
 	var processedStacks []string
 
-	// Query both new and deprecated labels. We keep reading the deprecated label to
-	// handle containers deployed before the label rename.
-	newServiceLabels, err := docker.GetLabeledServices(ctx, dockerCli.Client(), swarmMode, docker.DocoCDLabels.Deployment.AutoDiscovery, "true")
+	serviceLabels, err := docker.GetAutoDiscoveryServices(ctx, dockerCli.Client(), swarmMode)
 	if err != nil {
-		return fmt.Errorf("failed to retrieve containers for auto-discovery cleanup: %w", err)
-	}
+		if serviceLabels == nil {
+			return fmt.Errorf("failed to retrieve containers for auto-discovery cleanup: %w", err)
+		}
 
-	deprecatedServiceLabels, err := docker.GetLabeledServices(ctx, dockerCli.Client(), swarmMode, docker.DeprecatedAutoDiscoverLabel, "true") //nolint:staticcheck // fallback for pre-rename containers
-	if err != nil {
-		return fmt.Errorf("failed to retrieve containers for auto-discovery cleanup: %w", err)
-	}
-
-	if len(deprecatedServiceLabels) > 0 {
-		jobLog.Warn("found containers with deprecated label, please recreate them to migrate to the new label",
-			slog.String("deprecated_label", docker.DeprecatedAutoDiscoverLabel), //nolint:staticcheck // include deprecated label key in warning for migration clarity
-			slog.String("new_label", docker.DocoCDLabels.Deployment.AutoDiscovery),
+		jobLog.Warn("failed to migrate auto-discovery labels for some services; continuing cleanup",
+			logger.ErrAttr(err),
 		)
 	}
-
-	// Merge label maps and prefer the new label set when a service appears in both.
-	serviceLabels := make(map[docker.Service]map[string]string, len(deprecatedServiceLabels)+len(newServiceLabels))
-	maps.Copy(serviceLabels, deprecatedServiceLabels)
-
-	maps.Copy(serviceLabels, newServiceLabels)
 
 	for _, labels := range serviceLabels {
 		stackName := labels[docker.DocoCDLabels.Deployment.Name]
@@ -118,23 +106,7 @@ func cleanupObsoleteAutoDiscoveredContainers(ctx context.Context, jobLog *slog.L
 
 			stackLog.Debug("checking auto-discovered stack for obsolescence")
 
-			// Parse the auto-discovery config from the new JSON label.
-			// Fall back to the old scalar labels for containers deployed before this change.
 			autoDiscoverCfg := docker.ParseAutoDiscoveryConfig(labels[docker.DocoCDLabels.Deployment.AutoDiscoveryConfig])
-
-			// If the new label was absent, try the legacy scalar delete label.
-			if labels[docker.DocoCDLabels.Deployment.AutoDiscoveryConfig] == "" {
-				legacyDelete := labels[docker.DeprecatedAutoDiscoveryDeleteLabel] //nolint:staticcheck // fallback for pre-consolidation containers
-				if legacyDelete == "" {
-					legacyDelete = labels[docker.DeprecatedAutoDiscoverDeleteLabel] //nolint:staticcheck // fallback for pre-rename containers
-				}
-
-				if legacyDelete != "" {
-					if parsed, err := strconv.ParseBool(legacyDelete); err == nil {
-						autoDiscoverCfg.Delete = parsed
-					}
-				}
-			}
 
 			if !autoDiscoverCfg.Delete {
 				stackLog.Debug("skipping removal of obsolete auto-discovered stack as per configuration")
@@ -149,6 +121,7 @@ func cleanupObsoleteAutoDiscoveredContainers(ctx context.Context, jobLog *slog.L
 			notifyMetadata := metadata
 			notifyMetadata.Target = stackConfigTarget
 			notifyMetadata.Stack = stackName
+			notifyMetadata.Context = contextName
 
 			removeConfig := &deployConfig.Config{Name: stackName}
 			removeConfig.Destroy.Enabled = true
@@ -161,7 +134,7 @@ func cleanupObsoleteAutoDiscoveredContainers(ctx context.Context, jobLog *slog.L
 				return fmt.Errorf("failed to remove obsolete auto-discovered stack '%s': %w", stackName, err)
 			}
 
-			err = notification.Send(notification.Success, "Stack destroyed", "successfully destroyed stack "+removeConfig.Name, notifyMetadata)
+			err = notifier.Send(notification.Success, "Stack destroyed", "successfully destroyed stack "+removeConfig.Name, notifyMetadata)
 			if err != nil {
 				stackLog.Error("failed to send notification", logger.ErrAttr(err))
 			}
@@ -177,9 +150,9 @@ func cleanupObsoleteAutoDiscoveredContainers(ctx context.Context, jobLog *slog.L
 }
 
 // isCleanupTargetMatch checks if the stack's config target matches any of the run config targets.
-func isCleanupTargetMatch(runConfigTargets map[string]struct{}, stackConfigTarget string) bool {
+func isCleanupTargetMatch(runConfigTargets set.Set[string], stackConfigTarget string) bool {
 	// Backward compatibility: if no run target context is available, keep legacy behavior.
-	if len(runConfigTargets) == 0 {
+	if runConfigTargets.IsEmpty() {
 		return true
 	}
 
@@ -188,24 +161,18 @@ func isCleanupTargetMatch(runConfigTargets map[string]struct{}, stackConfigTarge
 	// Backward compatibility for pre-label deployments: only include unlabeled stacks
 	// for default-target runs, never for custom targets.
 	if stackConfigTarget == "" {
-		_, defaultTargetRun := runConfigTargets[""]
-		return defaultTargetRun
+		return runConfigTargets.Contains("")
 	}
 
-	_, ok := runConfigTargets[stackConfigTarget]
-
-	return ok
+	return runConfigTargets.Contains(stackConfigTarget)
 }
 
-func sortedTargetKeys(m map[string]struct{}) []string {
-	if len(m) == 0 {
+func sortedTargetKeys(m set.Set[string]) []string {
+	if m.IsEmpty() {
 		return nil
 	}
 
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
+	keys := m.ToSlice()
 
 	slices.Sort(keys)
 

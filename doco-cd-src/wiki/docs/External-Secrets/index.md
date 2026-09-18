@@ -15,6 +15,7 @@ This allows you to keep your secrets out of your Git repository and manage them 
 | Provider                                                        | More Information                                                                                |
 |-----------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
 | [AWS Secrets Manager](AWS-Secrets-Manager.md)                   | https://docs.aws.amazon.com/secretsmanager/latest/userguide/intro.html                          |
+| [Azure Key Vault](Azure-Key-Vault.md)                           | https://azure.microsoft.com/en-us/products/key-vault                                            |
 | [Bitwarden Secrets Manager](Bitwarden-Secrets-Manager.md)       | https://bitwarden.com/products/secrets-manager/                                                 |
 | [Bitwarden Vault / Vaultwarden](Bitwarden-Vault-Vaultwarden.md) | https://bitwarden.com/help/vault-management-api/ and https://github.com/dani-garcia/vaultwarden |
 | [1Password](1Password.md)                                       | https://1password.com                                                                           |
@@ -92,3 +93,78 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: supersecretpassword123 # Value of external secret fetched from Bitwarden Secrets Manager
 ```
+
+### With Interpolation
+
+External-secret references can optionally support Compose-style interpolation using environment variables set on the doco-cd deployment itself. 
+Set `INTERPOLATE_EXTERNAL_SECRETS=true` to enable this feature. It is disabled by default:
+
+```yaml title=".doco-cd.yml"
+name: myapp
+external_secrets:
+  DB_PASSWORD: "kv:db-${PROJECT_STAGE:-prod}"
+```
+
+With `INTERPOLATE_EXTERNAL_SECRETS=true` and `PROJECT_STAGE=lab` set in the doco-cd container, the provider receives `kv:db-lab`. 
+If `PROJECT_STAGE` is not set, the default `prod` is used. 
+
+!!! note "Only legacy string references are interpolated"
+    Structured webhook references are preserved unchanged. 
+
+!!! info "Only use with trusted external secret references"
+    Enable this option only when the external secret references are trusted, because referenced process environment variables are included in provider requests.
+
+### Defining External Secrets in a File
+
+Instead of (or in addition to) declaring `external_secrets` inline in your `.doco-cd.yml`, you can set `external_secrets_files` to a list of YAML files, each holding a map of env var name to external secret reference using the same shape as `external_secrets`:
+
+```yaml title=".doco-cd.yml"
+name: myapp
+external_secrets_files:
+  - secrets.yaml
+```
+
+```yaml title="secrets.yaml"
+DB_PASSWORD: a8f1e4eb-d76d-47b4-aa3c-103733e77fce
+LABEL_SECRET: cfd0c4a9-16d4-44c8-9a80-c6143a7c7b71
+```
+
+File paths are resolved relative to the same directory as [dotenv files](../Deploy-Settings.md#dotenv-file-format). Like `env_files`, you can use the `remote:<filepath>` syntax to load a file from the remote repository when `repository_url` is also specified:
+
+```yaml title=".doco-cd.yml"
+name: myapp
+repository_url: https://github.com/example/other-repo.git
+external_secrets_files:
+  - remote:secrets.yaml
+```
+
+Files can also be [SOPS-encrypted](../Advanced/Encryption.md), the same way encrypted dotenv files are supported.
+
+!!! note "Inline entries take precedence"
+    `external_secrets_files` are merged first, then `external_secrets` entries are applied on top. If the same name is defined in both, the inline value from `external_secrets` wins.
+
+### Referencing Other Resolved Secrets
+
+A resolved secret's value can itself reference another external secret by name, letting you compose one secret from others without duplicating values in your Compose file.
+Set `INTERPOLATE_RESOLVED_SECRETS=true` to enable this feature. It is disabled by default:
+
+```yaml title=".doco-cd.yml"
+name: myapp
+external_secrets:
+  DB_PASSWORD: <secret-ref-a>
+  DB_HOST: <secret-ref-b>
+  DB_URL: <secret-ref-c> # resolves to: postgres://user:${DB_PASSWORD}@${DB_HOST}/mydb
+```
+
+With `INTERPOLATE_RESOLVED_SECRETS=true`, if the secret provider returns `postgres://user:${DB_PASSWORD}@${DB_HOST}/mydb` for `DB_URL`, doco-cd substitutes `${DB_PASSWORD}` and `${DB_HOST}` with the values of the other resolved external secrets before the value is made available to the Compose file. References can be chained across multiple secrets.
+
+!!! note "Only other external secrets are used"
+    Unlike [reference interpolation](#with-interpolation), this only substitutes names that match another entry in `external_secrets`. The doco-cd process environment is never consulted, so an unrelated `${VAR}` left in a secret's value (e.g. matching an OS environment variable) is left untouched.
+
+!!! warning "Circular references fail the deployment"
+    If secret `A`'s value references secret `B`, and `B`'s value references `A`, doco-cd returns an error instead of interpolating.
+
+!!! warning "Literal `$` characters must be escaped as `$$`"
+    While enabled, secret values are parsed for Compose-style variables, so a literal `$` must be written as `$$`.
+    A value of `pa$$word` is delivered as `pa$word`, and a value of `$DB_HOST` is replaced when another external secret is named `DB_HOST`.
+    If any of your secret values contain literal `$` characters that you cannot escape at the source, leave this option disabled.

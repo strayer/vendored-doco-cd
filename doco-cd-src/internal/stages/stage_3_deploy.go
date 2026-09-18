@@ -24,22 +24,50 @@ func (s *StageManager) RunDeployStage(ctx context.Context, stageLog *slog.Logger
 
 	latestCommit := strings.TrimSpace(s.Repository.Revision)
 	if s.Repository.Source != config.SourceTypeOCI {
-		latestCommit, err = git.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
-		if err != nil {
-			return fmt.Errorf("failed to get latest commit: %w", err)
+		latestCommit = s.DeployState.latestCommit
+		if latestCommit == "" {
+			latestCommit, err = git.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
+			if err != nil {
+				return fmt.Errorf("failed to get latest commit: %w", err)
+			}
 		}
 	}
 
-	err = docker.DeployStack(stageLog, s.Repository.PathExternal, &ctx, s.Docker.Cmd,
-		s.Payload, s.DeployConfig,
-		s.DeployState.changedServices, s.DeployState.ignoredInfo.NeedSendSignal,
-		latestCommit, app.Version,
-		s.AppConfig.DockerSwarmConfigRetention, s.AppConfig.DockerSwarmSecretRetention,
-		s.Docker.SwarmMode,
-		pkiRoleNormMap(s.DeployConfig.ExternalSecrets, s.DeployConfig.Internal.Environment))
+	err = docker.DeployStack(ctx, docker.DeployRequest{
+		JobLog:           stageLog,
+		ExternalRepoPath: s.Repository.PathExternal,
+		InternalRepoPath: s.Repository.PathInternal,
+		DockerCLI:        s.Docker.Cmd,
+		Payload:          s.Payload,
+		SourceURL:        sourceURLForLabels(s.Repository),
+		DeployConfig:     s.DeployConfig,
+		DetectedChanges:  s.DeployState.changedServices,
+		NeedSignal:       s.DeployState.ignoredInfo.NeedSendSignal,
+		LatestCommit:     latestCommit,
+		AppVersion:       app.Version,
+		ComposeLoad:      docker.NewComposeLoadOptions(s.AppConfig),
+		SwarmRetention:   docker.NewSwarmRetentionOptions(s.AppConfig),
+		SwarmMode:        s.Docker.SwarmMode,
+		HashNormMap:      pkiRoleNormMap(s.DeployConfig.ExternalSecrets, s.DeployConfig.Internal.Environment),
+		Project:          s.Docker.Project,
+		ProjectHash:      s.Docker.ProjectHash,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to deploy stack %s: %w", s.DeployConfig.Name, err)
 	}
 
 	return nil
+}
+
+func sourceURLForLabels(repository *RepositoryData) string {
+	if repository == nil {
+		return ""
+	}
+
+	if repository.ConfigSourceUrl != "" {
+		return repository.ConfigSourceUrl
+	}
+
+	// Preserve compatibility with callers that construct RepositoryData directly.
+	return repository.SourceUrl
 }

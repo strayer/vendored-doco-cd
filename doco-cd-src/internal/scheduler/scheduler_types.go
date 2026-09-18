@@ -1,0 +1,172 @@
+package scheduler
+
+import (
+	"errors"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/docker/cli/cli/command"
+	"github.com/go-co-op/gocron/v2"
+
+	"github.com/kimdre/doco-cd/internal/common/types/set"
+	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/secretprovider"
+)
+
+var (
+	ErrScheduledJobNotFound  = errors.New("scheduled job not found")
+	ErrScheduledJobDisabled  = errors.New("scheduled job is disabled")
+	ErrScheduledJobAmbiguous = errors.New("multiple scheduled jobs matched, narrow your selection")
+)
+
+type scheduledJobMode string
+
+const (
+	scheduledJobModeContainer scheduledJobMode = "container"
+	scheduledJobModeSwarm     scheduledJobMode = "swarm"
+)
+
+type scheduledJob struct {
+	key             string
+	name            string
+	id              string
+	mode            scheduledJobMode
+	labels          map[string]string
+	containerState  string // Docker container state (container mode only), e.g. "running", "exited"
+	containerStatus string // Docker container status string (container mode only), e.g. "Exited (0) 2 hours ago"
+	running         bool   // An execution is currently active (e.g. a running one_off ephemeral container)
+	// context is the normalized Docker context name the job was discovered on
+	// (empty string means the default context). See docker.NormalizeContextName.
+	context string
+}
+
+type scheduledJobState struct {
+	fingerprint string
+	schedule    gocron.Cron
+	lastRun     time.Time
+	nextRun     time.Time
+	deployment  string
+	cfg         docker.JobScheduleConfig
+}
+
+type scheduler struct {
+	dockerCli command.Cli
+	// contextName is the normalized Docker context this worker operates on
+	// (empty string means the default context). See docker.NormalizeContextName.
+	contextName string
+	// mode is the runtime this worker manages jobs for. A Swarm manager hosts
+	// both Compose projects and Swarm stacks, so it runs one worker per mode
+	// using the capability supplied by ContextRegistry.
+	mode            scheduledJobMode
+	secretProvider  secretprovider.SecretProvider
+	notifier        notification.Sender
+	stopHoldTracker ServiceStopHoldTracker
+	log             *slog.Logger
+	wg              *sync.WaitGroup
+	startedAt       time.Time
+	runtime         *runtimeStore
+	executions      *executionStore
+	runs            sync.WaitGroup
+	// composeOptions bundles the Docker-owned settings needed to reload the compose project for
+	// a scheduled run (see docker.ScheduledComposeOptions), resolved explicitly by the caller
+	// instead of being read from the application configuration deep inside the Docker package.
+	composeOptions docker.ScheduledComposeOptions
+
+	states map[string]scheduledJobState
+
+	// stopHolds reference-counts services currently held stopped by
+	// stopServicesForJob/startServicesForJob. It is keyed by (mode, resolved
+	// project/stack, service) so that if two concurrent scheduled runs both
+	// declare the same target in stop_services, the target is only actually
+	// stopped by the first holder and only actually restarted once the last
+	// holder releases it. This prevents one run from prematurely restarting
+	// a service another concurrent run still needs stopped. For swarm mode,
+	// the held state also records the original replica count so it can be
+	// restored when the last holder releases it.
+	stopHoldsMu sync.Mutex
+	stopHolds   map[stopHoldKey]*stopHoldState
+	recoveryMu  sync.Mutex
+	recovering  set.Set[string]
+}
+
+// ServiceStopHoldTracker suppresses reconciliation while scheduled jobs
+// intentionally keep Compose services stopped.
+type ServiceStopHoldTracker interface {
+	MarkSchedulerStopHeld(contextName, project, service string)
+	UnmarkSchedulerStopHeld(contextName, project, service string)
+}
+
+// stopHoldKey identifies a service that may be concurrently held stopped by
+// more than one scheduled job run. context is the normalized Docker context
+// name the hold applies to, so that two workers operating on different
+// contexts never share a hold for a same-named project/service.
+type stopHoldKey struct {
+	context string
+	mode    scheduledJobMode
+	project string
+	service string
+}
+
+// stopHoldState tracks how many concurrent job runs currently hold a service
+// stopped, and (for swarm mode) the replica count it should be restored to.
+type stopHoldState struct {
+	refCount int
+	replicas uint64
+}
+
+// JobInfo describes one scheduler-managed target and its runtime scheduling status.
+type JobInfo struct {
+	LastRunAt      *time.Time              `json:"last_run_at,omitempty"`
+	NextRunAt      *time.Time              `json:"next_run_at,omitempty"`
+	LabelNextRunAt *time.Time              `json:"label_next_run_at,omitempty"`
+	Name           string                  `json:"name"`
+	Context        string                  `json:"context"`
+	Stack          string                  `json:"stack,omitempty"`
+	Mode           string                  `json:"mode"`
+	Schedule       string                  `json:"schedule,omitempty"`
+	ExecutionMode  docker.JobExecutionMode `json:"execution_mode,omitempty"`
+	NotifyOn       docker.JobNotifyOn      `json:"notify_on,omitempty"`
+	Status         string                  `json:"status,omitempty"`
+	Repository     string                  `json:"repository,omitempty"`
+	ScheduleError  string                  `json:"schedule_error,omitempty"`
+	StopServices   []string                `json:"stop_services,omitempty"`
+	Replicas       uint64                  `json:"replicas,omitempty"`
+	Enabled        bool                    `json:"enabled"`
+	SkipRunning    bool                    `json:"skip_running"`
+	Valid          bool                    `json:"valid"`
+}
+
+// newSchedulerForMode builds a scheduler worker bound to a single Docker
+// context and runtime mode. log and wg may be nil for short-lived, one-shot
+// workers (e.g. a single ListJobs/TriggerNow call) that never call run().
+func newSchedulerForMode(cc docker.ContextClient, mode scheduledJobMode, log *slog.Logger, wg *sync.WaitGroup, secretProvider secretprovider.SecretProvider, notifier notification.Sender, stopHoldTracker ServiceStopHoldTracker, runtime *runtimeStore, composeOptions docker.ScheduledComposeOptions) *scheduler {
+	if log == nil {
+		log = slog.Default()
+	}
+
+	if runtime == nil {
+		runtime = newRuntimeStore()
+	}
+
+	contextName := docker.NormalizeContextName(cc.Name)
+
+	return &scheduler{
+		dockerCli:       cc.Cli,
+		contextName:     contextName,
+		mode:            mode,
+		secretProvider:  secretProvider,
+		notifier:        notifier,
+		stopHoldTracker: stopHoldTracker,
+		log:             log.With(slog.String("component", "scheduler"), slog.String("context", docker.DisplayContextName(contextName))),
+		wg:              wg,
+		startedAt:       schedulerNow(),
+		runtime:         runtime,
+		executions:      newExecutionStore(composeOptions.ComposeLoad.DataMountPath),
+		composeOptions:  composeOptions,
+		states:          map[string]scheduledJobState{},
+		stopHolds:       map[stopHoldKey]*stopHoldState{},
+		recovering:      set.New[string](),
+	}
+}

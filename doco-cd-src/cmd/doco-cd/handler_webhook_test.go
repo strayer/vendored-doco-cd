@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,35 +19,197 @@ import (
 
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
+	swarmTypes "github.com/moby/moby/api/types/swarm"
 	"github.com/moby/moby/client"
 
+	restserver "github.com/kimdre/doco-cd/internal/api"
+	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/controlplane"
 
 	"github.com/kimdre/doco-cd/internal/git"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
-
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/encryption"
+	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/reconciliation"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
+
+func TestPostSkippedWebhookCommitStatusUsesRunContext(t *testing.T) {
+	type postedStatus struct {
+		State       string `json:"state"`
+		Description string `json:"description"`
+		Context     string `json:"context"`
+	}
+
+	var received postedStatus
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode status: %v", err)
+		}
+
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	postSkippedWebhookCommitStatus(t.Context(), &app.Config{
+		GitCommitStatus: true,
+		GitAccessToken:  "token",
+		GitScmProvider:  string(commitstatus.ProviderGitea),
+		GitScmApiUrl:    config.HttpUrl(server.URL),
+	}, logger.New(logger.LevelCritical).Logger, webhook.ParsedPayload{
+		Source:    webhook.PayloadSourceGit,
+		CommitSHA: plumbing.NewHash("0123456789012345678901234567890123456789"),
+		FullName:  "owner/repo",
+		CloneURL:  "https://git.example.com/owner/repo.git",
+		WebURL:    "https://git.example.com/owner/repo",
+	})
+
+	if received.State != string(commitstatus.StateSuccess) || received.Description != "Skipped" {
+		t.Fatalf("unexpected skipped status: %+v", received)
+	}
+
+	if received.Context != commitstatus.DeployContext {
+		t.Fatalf("context = %q, want %q", received.Context, commitstatus.DeployContext)
+	}
+}
+
+func TestAcquireWebhookRepoLockHonorsCancellation(t *testing.T) {
+	t.Parallel()
+
+	repoLock := lock.GetRepoLock(t.Name())
+	if !repoLock.TryLock("holder") {
+		t.Fatal("failed to acquire test lock")
+	}
+	defer repoLock.Unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	if acquireWebhookRepoLock(ctx, repoLock, "waiter", func() {}) {
+		t.Fatal("acquired repository lock after cancellation")
+	}
+}
+
+func TestRunWebhookSynchronouslyIgnoresRequestCancellation(t *testing.T) {
+	t.Parallel()
+
+	applicationCtx, cancelApplication := context.WithCancel(t.Context())
+	runs := newTestControlPlaneRuns(t, testControlPlaneRunsOptions{applicationCtx: applicationCtx})
+	jobID := runs.Accept("webhook", controlplane.RunTriggerWebhook, controlplane.RunMetadata{})
+
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	runCtx := make(chan context.Context, 1)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- runs.Execute(requestCtx, jobID, controlplane.RunExecution{
+			Mode:         controlplane.RunSynchronousDetached,
+			PanicContext: "webhook deployment",
+			PanicError:   errWebhookDeploymentPanicked,
+		}, func(ctx context.Context) (controlplane.RunResult, error) {
+			runCtx <- ctx
+
+			<-ctx.Done()
+
+			return controlplane.RunResult{}, ctx.Err()
+		})
+	}()
+
+	ctx := <-runCtx
+
+	cancelRequest()
+
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("webhook run cancelled with request: %v", err)
+	}
+
+	cancelApplication()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("webhook run error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("webhook run did not stop during application shutdown")
+	}
+
+	runs.CloseAndWait()
+}
+
+func TestAcquireWebhookRepoLockReportsWaitAndAcquires(t *testing.T) {
+	t.Parallel()
+
+	repoLock := lock.GetRepoLock(t.Name())
+	if !repoLock.TryLock("holder") {
+		t.Fatal("failed to acquire test lock")
+	}
+
+	waiting := make(chan struct{}, 1)
+	acquired := make(chan bool, 1)
+
+	go func() {
+		acquired <- acquireWebhookRepoLock(t.Context(), repoLock, "waiter", func() {
+			waiting <- struct{}{}
+		})
+	}()
+
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		t.Fatal("repository lock wait was not reported")
+	}
+
+	repoLock.Unlock()
+
+	select {
+	case ok := <-acquired:
+		if !ok {
+			t.Fatal("repository lock acquisition was cancelled")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("repository lock was not acquired")
+	}
+
+	repoLock.Unlock()
+}
 
 const (
 	githubPayloadFile          = "testdata/github_payload.json"
 	githubPayloadFileSwarmMode = "testdata/github_payload_swarm_mode.json"
 	webhookTestPollInterval    = 100 * time.Millisecond
-	composeContent             = `services:
-  nginx:
+)
+
+// webhookFixtureFiles backs the local, network-independent fixture repo used
+// by TestHandlerData_WebhookHandler in non-swarm mode, so that test doesn't
+// depend on cloning the live kimdre/doco-cd GitHub repository.
+var webhookFixtureFiles = map[string]string{
+	".doco-cd.yaml": `
+name: webhook-test-deploy
+compose_files:
+  - test.compose.yaml
+`,
+	"test.compose.yaml": `
+services:
+  app:
     image: nginx:latest
     ports:
-      - "80"
-`
-)
+      - "80"  # use random published port
+    volumes:
+      - ./:/usr/share/nginx/html
+`,
+	"index.html": "webhook test fixture index page\n",
+}
 
 func newWebhookRequest(t *testing.T, url string, payload []byte, appConfig *app.Config) *http.Request {
 	t.Helper()
@@ -88,13 +252,22 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	stackName := test.ConvertTestName(t.Name())
 
 	payloadFile := githubPayloadFile
-	cloneUrl := "https://github.com/kimdre/doco-cd.git"
-	indexPath := path.Join("test", "index.html")
+	// payloadCloneUrl is the clone_url baked into the webhook payload fixture
+	// file. In non-swarm mode it is rewritten below (via SourceURLRewrites) to
+	// a local, ephemeral fixture repository so this test doesn't depend on
+	// the live kimdre/doco-cd GitHub repository.
+	payloadCloneUrl := "https://github.com/kimdre/doco-cd.git"
+	indexPath := "index.html"
 
-	if swarm.GetModeEnabled() {
+	var cloneUrl string
+
+	if SwarmModeEnabled {
 		payloadFile = githubPayloadFileSwarmMode
 		cloneUrl = "https://github.com/kimdre/doco-cd_tests.git"
 		indexPath = path.Join("html", "index.html")
+	} else {
+		_, fixtureCloneURL, _ := newLocalFixtureRepo(t, webhookFixtureFiles)
+		cloneUrl = fixtureCloneURL
 	}
 
 	indexPath = path.Join(tmpDir, git.GetRepoName(cloneUrl), indexPath)
@@ -118,6 +291,14 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 
 	appConfig.GitCommitStatus = false
 
+	if !SwarmModeEnabled {
+		// Route the payload's clone URL to the local fixture repo created
+		// above, so this test never clones the live kimdre/doco-cd repo.
+		appConfig.SourceURLRewrites = map[string]string{
+			payloadCloneUrl: cloneUrl,
+		}
+	}
+
 	log := logger.New(logger.LevelCritical)
 
 	dockerCli, err := docker.CreateDockerCli(appConfig.DockerQuietDeploy)
@@ -134,21 +315,32 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		}
 	})
 
-	h := handlerData{
-		dockerCli:  dockerCli,
-		appConfig:  appConfig,
-		appVersion: app.Version,
-		dataMountPoint: container.MountPoint{
-			Type:        "bind",
-			Source:      tmpDir,
-			Destination: tmpDir,
-			Mode:        "rw",
-		},
-		log:      log,
-		testName: stackName,
+	mountPoint := container.MountPoint{
+		Type:        "bind",
+		Source:      tmpDir,
+		Destination: tmpDir,
+		Mode:        "rw",
 	}
 
-	req := newWebhookRequest(t, webhookPath+"?wait=true", minifiedPayload.Bytes(), appConfig)
+	h := orchestrationHandler{
+		appConfig: appConfig,
+		log:       log,
+		testName:  stackName,
+
+		deployment: newTestDeployment(t, appConfig, mountPoint, reconciliation.Dependencies{
+			AppConfig:      appConfig,
+			DataMountPoint: mountPoint,
+			DockerCLI:      dockerCli,
+		}),
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			appConfig:      appConfig,
+			dataMountPoint: mountPoint,
+			dockerCli:      dockerCli,
+			log:            log,
+		}),
+	}
+
+	req := newWebhookRequest(t, restserver.WebhookPath+"?wait=true", minifiedPayload.Bytes(), appConfig)
 
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.WebhookHandler)
@@ -183,12 +375,12 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		testContainerPort string
 	)
 
-	if swarm.GetModeEnabled() {
+	if SwarmModeEnabled {
 		t.Log("Testing in Swarm mode")
 
 		inspectName := stackName + "_" + "test"
 
-		svc, err := docker.WaitForSwarmService(ctx, t, dockerClient, inspectName, 30*time.Second)
+		svc, err := waitForSwarmService(ctx, t, dockerClient, inspectName, 30*time.Second)
 		if err != nil {
 			t.Fatalf("Failed to find swarm service for test container: %v", err)
 		}
@@ -345,16 +537,22 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 
 	log := logger.New(logger.LevelCritical)
 
-	h := handlerData{
-		appConfig:  appConfig,
-		appVersion: app.Version,
-		dataMountPoint: container.MountPoint{
-			Type:        "bind",
-			Source:      t.TempDir(),
-			Destination: t.TempDir(),
-			Mode:        "rw",
-		},
-		log: log,
+	mountPoint := container.MountPoint{
+		Type:        "bind",
+		Source:      t.TempDir(),
+		Destination: t.TempDir(),
+		Mode:        "rw",
+	}
+
+	h := orchestrationHandler{
+		appConfig: appConfig,
+		log:       log,
+
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			appConfig:      appConfig,
+			dataMountPoint: mountPoint,
+			log:            log,
+		}),
 	}
 
 	testCases := []struct {
@@ -363,11 +561,11 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 	}{
 		{
 			name: "Default async when wait not set",
-			url:  webhookPath,
+			url:  restserver.WebhookPath,
 		},
 		{
 			name: "Synchronous when wait=true",
-			url:  webhookPath + "?wait=true",
+			url:  restserver.WebhookPath + "?wait=true",
 		},
 	}
 
@@ -391,4 +589,28 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 			}
 		})
 	}
+}
+
+// waitForSwarmService waits until a swarm service exists (and optionally has published ports).
+func waitForSwarmService(ctx context.Context, t *testing.T, cli client.APIClient, serviceName string, timeout time.Duration) (swarmTypes.Service, error) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		result, err := cli.ServiceInspect(ctx, serviceName, client.ServiceInspectOptions{
+			InsertDefaults: true,
+		})
+		if err == nil {
+			return result.Service, nil
+		}
+
+		lastErr = err
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return swarmTypes.Service{}, fmt.Errorf("timed out waiting for service %s after %s: %w", serviceName, timeout.String(), lastErr)
 }

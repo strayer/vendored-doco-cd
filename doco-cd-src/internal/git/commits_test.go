@@ -1,126 +1,86 @@
-package git
+package git_test
 
 import (
 	"testing"
 	"time"
 
-	"github.com/go-git/go-billy/v5/memfs"
 	gogit "github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"github.com/go-git/go-git/v5/storage/memory"
+
+	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/git"
 )
 
-// commitN creates n empty commits and returns their hashes oldest-first.
-func commitN(t *testing.T, wt *gogit.Worktree, n int) []plumbing.Hash {
-	t.Helper()
+func TestGetLatestCommit(t *testing.T) {
+	t.Parallel()
 
-	hashes := make([]plumbing.Hash, 0, n)
-	when := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-
-	for i := range n {
-		sig := &object.Signature{Name: "Jane Doe", Email: "jane@example.com", When: when.Add(time.Duration(i) * time.Minute)}
-
-		h, err := wt.Commit("commit "+string(rune('a'+i)), &gogit.CommitOptions{
-			AllowEmptyCommits: true,
-			Author:            sig,
-			Committer:         sig,
-		})
-		if err != nil {
-			t.Fatalf("commit %d: %v", i, err)
-		}
-
-		hashes = append(hashes, h)
+	c, err := app.GetConfig()
+	if err != nil {
+		t.Fatalf("Failed to get app config: %v", err)
 	}
 
-	return hashes
+	url := cloneUrl
+
+	auth, err := git.GetAuthMethod(url, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken)
+	if err != nil {
+		t.Fatalf("Failed to get auth method: %v", err)
+	}
+
+	if auth != nil {
+		t.Logf("Using auth method: %s", auth.Name())
+	} else {
+		t.Log("No auth method configured, using anonymous access")
+	}
+
+	repo, err := git.CloneRepository(t.TempDir(), url, git.MainBranch, false, c.HttpProxy, auth, c.GitCloneSubmodules, 0)
+	if err != nil {
+		t.Fatalf("Failed to clone repository: %v", err)
+	}
+
+	if repo == nil {
+		t.Fatal("Repository is nil")
+	}
+
+	commit, err := git.GetLatestCommit(repo, git.MainBranch)
+	if err != nil {
+		t.Fatalf("Failed to get latest commit: %v", err)
+	}
+
+	if commit == "" {
+		t.Fatal("Commit hash is empty")
+	}
+
+	t.Log(commit)
 }
 
-func TestGetCommitsBetween(t *testing.T) {
-	repo, err := gogit.Init(memory.NewStorage(), memfs.New())
+func TestGetLatestCommitAnnotatedTag(t *testing.T) {
+	t.Parallel()
+
+	repoPath := t.TempDir()
+	repo := initLocalTestRepo(t, repoPath)
+
+	head, err := repo.Head()
 	if err != nil {
-		t.Fatalf("init: %v", err)
+		t.Fatalf("read HEAD: %v", err)
 	}
 
-	wt, err := repo.Worktree()
+	if _, err = repo.CreateTag("v1.0.0", head.Hash(), &gogit.CreateTagOptions{
+		Tagger: &object.Signature{
+			Name:  "test",
+			Email: "test@example.com",
+			When:  time.Now(),
+		},
+		Message: "release",
+	}); err != nil {
+		t.Fatalf("create annotated tag: %v", err)
+	}
+
+	commit, err := git.GetLatestCommit(repo, "v1.0.0")
 	if err != nil {
-		t.Fatalf("worktree: %v", err)
+		t.Fatalf("GetLatestCommit() error = %v", err)
 	}
 
-	h := commitN(t, wt, 4) // h[0] oldest .. h[3] newest
-
-	// commits after h[0] up to h[3]: h[3], h[2], h[1] (newest first)
-	got, err := GetCommitsBetween(repo, h[0], h[3], 50)
-	if err != nil {
-		t.Fatalf("GetCommitsBetween: %v", err)
-	}
-
-	if len(got) != 3 {
-		t.Fatalf("expected 3 commits, got %d: %+v", len(got), got)
-	}
-
-	if got[0].Hash != h[3].String() || got[2].Hash != h[1].String() {
-		t.Fatalf("wrong order: %+v", got)
-	}
-
-	if got[0].Author != "Jane Doe" || got[0].ShortHash != h[3].String()[:DefaultShortSHALength] {
-		t.Fatalf("unexpected fields: %+v", got[0])
-	}
-
-	// same old==new -> empty
-	empty, err := GetCommitsBetween(repo, h[3], h[3], 50)
-	if err != nil {
-		t.Fatalf("GetCommitsBetween equal: %v", err)
-	}
-
-	if len(empty) != 0 {
-		t.Fatalf("expected 0 commits, got %d", len(empty))
-	}
-
-	// cap is honoured
-	capped, err := GetCommitsBetween(repo, plumbing.ZeroHash, h[3], 2)
-	if err != nil {
-		t.Fatalf("GetCommitsBetween capped: %v", err)
-	}
-
-	if len(capped) != 2 {
-		t.Fatalf("expected 2 commits (capped), got %d", len(capped))
-	}
-}
-
-// A force-push/rebase makes the old tip no longer an ancestor of the new tip.
-// The walk must stop at the merge-base and return only the diverged commits,
-// not the whole new branch.
-func TestGetCommitsBetween_DivergedHistory(t *testing.T) {
-	repo, err := gogit.Init(memory.NewStorage(), memfs.New())
-	if err != nil {
-		t.Fatalf("init: %v", err)
-	}
-
-	wt, err := repo.Worktree()
-	if err != nil {
-		t.Fatalf("worktree: %v", err)
-	}
-
-	h := commitN(t, wt, 3) // a, b(h[1]), oldTip=c(h[2])
-
-	// rewind to b and build a divergent history: d, e
-	if err := wt.Checkout(&gogit.CheckoutOptions{Hash: h[1]}); err != nil {
-		t.Fatalf("checkout: %v", err)
-	}
-
-	d := commitN(t, wt, 2) // d, newTip=e(d[1]) — both parented on b
-
-	got, err := GetCommitsBetween(repo, h[2], d[1], 50)
-	if err != nil {
-		t.Fatalf("GetCommitsBetween: %v", err)
-	}
-
-	if len(got) != 2 {
-		t.Fatalf("expected 2 diverged commits, got %d: %+v", len(got), got)
-	}
-
-	if got[0].Hash != d[1].String() || got[1].Hash != d[0].String() {
-		t.Fatalf("expected [e, d], got %+v", got)
+	if commit != head.Hash().String() {
+		t.Fatalf("GetLatestCommit() = %q, want tagged commit %q", commit, head.Hash())
 	}
 }

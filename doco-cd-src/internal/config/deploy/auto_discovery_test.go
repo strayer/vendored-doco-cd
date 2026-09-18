@@ -308,6 +308,19 @@ func TestMergeConfig(t *testing.T) {
 			t.Errorf("RestartWindow should remain 300, got %d", base.Reconciliation.RestartWindow)
 		}
 	})
+
+	t.Run("MergeSwarmEnabled_NestedStruct", func(t *testing.T) {
+		t.Parallel()
+
+		base := &Config{Swarm: SwarmConfig{Enabled: new(true)}}
+		override := &Config{Swarm: SwarmConfig{Enabled: new(false)}}
+
+		mergeConfig(base, override)
+
+		if base.Swarm.Enabled == nil || *base.Swarm.Enabled {
+			t.Fatalf("expected nested swarm.enabled override to be false, got %v", base.Swarm.Enabled)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -347,7 +360,7 @@ environment:
 		},
 	}
 
-	configs, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	configs, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +412,7 @@ func TestAutoDiscoverDeployments_WithNestedConfig_EnvironmentOnly_DoesNotOverrid
 		Environment:      map[string]string{"BASE": "root"},
 	}
 
-	configs, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	configs, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +475,7 @@ external_secrets:
 		AutoDiscovery:    AutoDiscoveryConfig{Enabled: true},
 	}
 
-	_, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	_, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err == nil {
 		t.Fatal("expected error for multiple YAML documents in nested config, got nil")
 	}
@@ -493,7 +506,7 @@ func TestAutoDiscoverDeployments_NoNestedConfig_BackwardsCompatible(t *testing.T
 		Timeout:          300,
 	}
 
-	configs, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	configs, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -546,7 +559,7 @@ func TestAutoDiscoverDeployments_SkipHeavyDirectories(t *testing.T) {
 		AutoDiscovery:    AutoDiscoveryConfig{Enabled: true},
 	}
 
-	configs, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	configs, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -589,7 +602,7 @@ func TestAutoDiscoverDeployments_CacheKeyedByHeadAndSettings(t *testing.T) {
 		AutoDiscovery:    AutoDiscoveryConfig{Enabled: true},
 	}
 
-	first, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	first, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -602,13 +615,28 @@ func TestAutoDiscoverDeployments_CacheKeyedByHeadAndSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	second, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	second, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if len(second) != 1 {
 		t.Fatalf("expected cached result with 1 config when HEAD is unchanged, got %d", len(second))
+	}
+
+	if err := createTestFile(t, filepath.Join(serviceDir, "compose.yaml"), "services:\n  app:\n    image: nginx"); err != nil {
+		t.Fatal(err)
+	}
+
+	baseConfig.Swarm.Enabled = new(false)
+
+	modeChanged, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(modeChanged) != 1 || modeChanged[0].Swarm.Enabled == nil || *modeChanged[0].Swarm.Enabled {
+		t.Fatalf("expected swarm.enabled change to invalidate the cache, got %#v", modeChanged)
 	}
 
 	if err := createTestFile(t, filepath.Join(serviceDir, "compose.yaml"), "services:\n  app:\n    image: nginx:alpine"); err != nil {
@@ -627,13 +655,69 @@ func TestAutoDiscoverDeployments_CacheKeyedByHeadAndSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	third, err := autoDiscoverDeployments(repoRoot, baseConfig)
+	third, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), baseConfig)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	if len(third) != 2 {
 		t.Fatalf("expected cache invalidation after HEAD change, got %d configs", len(third))
+	}
+}
+
+func TestAutoDiscoverDeployments_CacheSeparatesFullBaseConfig(t *testing.T) {
+	t.Parallel()
+
+	repoRoot := t.TempDir()
+
+	repo, err := git.PlainInit(repoRoot, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	serviceDir := filepath.Join(repoRoot, "service")
+	if err := os.MkdirAll(serviceDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := createTestFile(t, filepath.Join(serviceDir, "compose.yaml"), "services:\n  app:\n    image: nginx"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := commitAll(t, repo, "initial"); err != nil {
+		t.Fatal(err)
+	}
+
+	productionConfig := &Config{
+		Context:          "production",
+		WorkingDirectory: ".",
+		ComposeFiles:     []string{"compose.yaml"},
+		AutoDiscovery:    AutoDiscoveryConfig{Enabled: true},
+	}
+
+	production, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), productionConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(production) != 1 || production[0].Context != "production" {
+		t.Fatalf("expected production config, got %#v", production)
+	}
+
+	nasConfig := &Config{
+		Context:          "nas",
+		WorkingDirectory: ".",
+		ComposeFiles:     []string{"compose.yaml"},
+		AutoDiscovery:    AutoDiscoveryConfig{Enabled: true},
+	}
+
+	nas, err := autoDiscoverDeployments(os.DirFS(repoRoot), repoRoot, revisionKeyForRepoRoot(repoRoot), nasConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(nas) != 1 || nas[0].Context != "nas" {
+		t.Fatalf("expected nas config rather than a cached production config, got %#v", nas)
 	}
 }
 

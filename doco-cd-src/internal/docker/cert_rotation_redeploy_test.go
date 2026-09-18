@@ -9,23 +9,96 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/filesystem"
+	"github.com/kimdre/doco-cd/internal/git"
+	"github.com/kimdre/doco-cd/internal/lock"
+	"github.com/kimdre/doco-cd/internal/source/oci"
 	"github.com/kimdre/doco-cd/internal/test"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
 func TestRotateProjectCertificates_MissingLabels(t *testing.T) {
-	err := RotateProjectCertificates(context.Background(), nil, map[string]string{}, nil, false)
+	err := RotateProjectCertificates(context.Background(), "", nil, map[string]string{}, nil, false, CertificateRotationOptions{})
 	if err == nil {
 		t.Fatal("expected an error for missing deployment labels")
 	}
 }
 
+// TestPruneSwarmStackRevisions_RetentionHonoredIndependentOfEnvVar proves that Swarm
+// config/secret revision retention is controlled solely by
+// CertificateRotationOptions.SwarmRetention, not by
+// reading the DOCKER_SWARM_CONFIG_RETENTION/DOCKER_SWARM_SECRET_RETENTION environment variables
+// directly. A stale environment value that would enable pruning must have no effect: when the
+// options explicitly disable pruning (-1) and the deploy config has no override, no attempt is
+// made to reach the Docker daemon at all. dockerCli is passed as nil here; if the retention
+// resolution incorrectly fell back to reading the environment variables (which are set to a
+// pruning-enabled value below), calling dockerCli.Client() on the nil interface would panic and
+// fail the test.
+func TestPruneSwarmStackRevisions_RetentionHonoredIndependentOfEnvVar(t *testing.T) {
+	t.Setenv("DOCKER_SWARM_CONFIG_RETENTION", "5")
+	t.Setenv("DOCKER_SWARM_SECRET_RETENTION", "5")
+
+	opts := CertificateRotationOptions{
+		SwarmRetention: SwarmRetentionOptions{
+			Config: -1,
+			Secret: -1,
+		},
+	}
+	deployConfig := &deploy.Config{}
+
+	pruneSwarmStackRevisions(context.Background(), nil, "stack", deployConfig, opts)
+}
+
 func TestRotateProjectCertificates_SwarmMissingLabels(t *testing.T) {
-	err := RotateProjectCertificates(context.Background(), nil, map[string]string{}, nil, true)
+	err := RotateProjectCertificates(context.Background(), "", nil, map[string]string{}, nil, true, CertificateRotationOptions{})
 	if err == nil {
 		t.Fatal("expected an error for missing deployment labels in swarm mode")
+	}
+}
+
+// TestRotateProjectCertificates_ContextNamespacesLock verifies that RotateProjectCertificates
+// locks using lock.StackKey(contextName, stack), so a rotation on a named Docker context does not
+// serialize behind a same-named stack rotation on a different context (or the default context).
+// It uses the Swarm-labels path (composeScheduledServiceRefFromSwarmLabels) since it only requires
+// the doco-cd deployment name label to reach the lock acquisition, unlike the Compose path which
+// also requires the Compose service label.
+func TestRotateProjectCertificates_ContextNamespacesLock(t *testing.T) {
+	stackName := test.ConvertTestName(t.Name())
+
+	labels := map[string]string{
+		DocoCDLabels.Deployment.Name: stackName,
+	}
+
+	keyDefault := lock.StackKey("", stackName)
+	keyRemote := lock.StackKey("docker01", stackName)
+
+	if keyDefault == keyRemote {
+		t.Fatalf("expected different lock keys for default and remote contexts, both got %q", keyDefault)
+	}
+
+	lock.LockStack(keyDefault)
+	defer lock.UnlockStack(keyDefault)
+
+	// With the default-context lock held, RotateProjectCertificates for the same stack name on a
+	// different (remote) context must still be able to acquire its own (different) lock key. It
+	// will fail quickly afterwards because the deployment labels carry no working directory, but
+	// that failure must happen right after acquiring the lock, not be blocked by it.
+	done := make(chan error, 1)
+
+	go func() {
+		done <- RotateProjectCertificates(context.Background(), "docker01", nil, labels, nil, true, CertificateRotationOptions{})
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected an error since the deployment labels carry no working directory")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out: rotation for a different context blocked on the default context's lock")
 	}
 }
 
@@ -37,8 +110,10 @@ func TestRotateProjectCertificates_SwarmMissingLabels(t *testing.T) {
 // file list to find the project at all.
 func TestRotateProjectCertificates_SwarmReloadFallsBackToConfiguredComposeFiles(t *testing.T) {
 	dataMountPath := t.TempDir()
-	t.Setenv("DATA_MOUNT_PATH", dataMountPath)
-	t.Setenv("DEPLOY_CONFIG_BASE_DIR", "/")
+	scheduledOpts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
 
 	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
 
@@ -88,7 +163,7 @@ external_secrets:
 
 	provider := newStubProvider(map[string]string{"CERT": certPEM}, nil)
 
-	project, _, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider)
+	project, _, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider, scheduledOpts)
 	if err != nil {
 		t.Fatalf("unexpected error reloading project: %v", err)
 	}
@@ -106,12 +181,14 @@ external_secrets:
 // TestRotateProjectCertificates_ReloadReissuesCertAndRelabels verifies that reloading a rotatable
 // deployment's compose project re-resolves its external secrets (reissuing the pki-role
 // certificate through the secret provider) and that relabeling the reloaded project stamps fresh
-// cert expiry/rotatable labels — the two steps RotateProjectCertificates performs before handing
+// cert expiry/rotatable labels. These are the two steps RotateProjectCertificates performs before handing
 // off to deployCompose (which requires a live Docker daemon and is out of scope for this unit test).
 func TestRotateProjectCertificates_ReloadReissuesCertAndRelabels(t *testing.T) {
 	dataMountPath := t.TempDir()
-	t.Setenv("DATA_MOUNT_PATH", dataMountPath)
-	t.Setenv("DEPLOY_CONFIG_BASE_DIR", "/")
+	scheduledOpts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
 
 	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
 
@@ -156,7 +233,7 @@ external_secrets:
 
 	provider := newStubProvider(map[string]string{"CERT": certPEM}, nil)
 
-	project, deployConfig, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider)
+	project, deployConfig, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider, scheduledOpts)
 	if err != nil {
 		t.Fatalf("unexpected error reloading project: %v", err)
 	}
@@ -172,7 +249,7 @@ external_secrets:
 
 	payload := &webhook.ParsedPayload{Trigger: certRotationTrigger}
 
-	addComposeServiceLabels(project, deployConfig, payload, ref.WorkingDir, "test", time.Now().UTC().Format(time.RFC3339), ComposeVersion, "", "")
+	addComposeServiceLabels(project, deployConfig, payload, "", ref.WorkingDir, "test", time.Now().UTC().Format(time.RFC3339), ComposeVersion, "", "")
 
 	svc, err = project.GetService("app")
 	if err != nil {
@@ -201,8 +278,10 @@ external_secrets:
 // relies on that label to find the correct .doco-cd.<target>.yml file.
 func TestRotateProjectCertificates_ReloadPreservesConfigTargetLabel(t *testing.T) {
 	dataMountPath := t.TempDir()
-	t.Setenv("DATA_MOUNT_PATH", dataMountPath)
-	t.Setenv("DEPLOY_CONFIG_BASE_DIR", "/")
+	scheduledOpts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
 
 	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
 
@@ -248,7 +327,7 @@ external_secrets:
 
 	provider := newStubProvider(map[string]string{"CERT": certPEM}, nil)
 
-	project, deployConfig, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider)
+	project, deployConfig, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider, scheduledOpts)
 	if err != nil {
 		t.Fatalf("unexpected error reloading project: %v", err)
 	}
@@ -259,7 +338,7 @@ external_secrets:
 
 	payload := &webhook.ParsedPayload{Trigger: certRotationTrigger}
 
-	addComposeServiceLabels(project, deployConfig, payload, ref.WorkingDir, "test", time.Now().UTC().Format(time.RFC3339), ComposeVersion, "", "")
+	addComposeServiceLabels(project, deployConfig, payload, "", ref.WorkingDir, "test", time.Now().UTC().Format(time.RFC3339), ComposeVersion, "", "")
 
 	svc, err := project.GetService("app")
 	if err != nil {
@@ -274,12 +353,14 @@ external_secrets:
 // TestServicesUsingRotatableCerts verifies that only services actually consuming a pki-role-backed
 // certificate or private key are selected for redeploy, whether the value reaches them via a
 // direct environment variable, a config using "content: $VAR", or a config using the native
-// "environment: VAR" form (see resolveConfigsEnvironment in compose-go's loader) — and that
+// "environment: VAR" form (see resolveConfigsEnvironment in compose-go's loader), and that
 // services with no relation to the rotated certificate are excluded.
 func TestServicesUsingRotatableCerts(t *testing.T) {
 	dataMountPath := t.TempDir()
-	t.Setenv("DATA_MOUNT_PATH", dataMountPath)
-	t.Setenv("DEPLOY_CONFIG_BASE_DIR", "/")
+	scheduledOpts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
 
 	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
 
@@ -341,7 +422,7 @@ external_secrets:
 
 	provider := newStubProvider(map[string]string{"CERT": certPEM}, nil)
 
-	project, deployConfig, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider)
+	project, deployConfig, err := loadComposeScheduledProjectAll(context.Background(), nil, ref, provider, scheduledOpts)
 	if err != nil {
 		t.Fatalf("unexpected error reloading project: %v", err)
 	}
@@ -385,19 +466,19 @@ func TestRotateSwarmProjectCertificatesIntegration(t *testing.T) {
 		t.Fatalf("failed to create Docker CLI: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Skipf("skipping swarm cert rotation integration test: %v", err)
-	}
-
-	if !swarm.GetModeEnabled() {
+	if !resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("swarm mode is not enabled, skipping cert rotation integration test")
 	}
 
 	stackName := test.ConvertTestName(t.Name())
 
 	dataMountPath := t.TempDir()
-	t.Setenv("DATA_MOUNT_PATH", dataMountPath)
-	t.Setenv("DEPLOY_CONFIG_BASE_DIR", "/")
+	certOpts := CertificateRotationOptions{
+		Scheduled: ScheduledComposeOptions{
+			ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+			DeployConfigBaseDir: "/",
+		},
+	}
 
 	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
 	workingDir := filepath.Join(repoRoot, "stacks", stackName)
@@ -444,7 +525,7 @@ external_secrets:
 		}
 	})
 
-	if err := RotateProjectCertificates(t.Context(), dockerCli, labels, provider, true); err != nil {
+	if err := RotateProjectCertificates(t.Context(), "", dockerCli, labels, provider, true, certOpts); err != nil {
 		t.Fatalf("unexpected error rotating swarm project certificates: %v", err)
 	}
 
@@ -476,5 +557,172 @@ external_secrets:
 
 	if gotCert != certPEM {
 		t.Errorf("expected service environment to carry the freshly issued certificate, got %q", gotCert)
+	}
+}
+
+// TestResolvedSourceType covers the source type a rotation writes back into the redeployed
+// services' labels. The labeled type is only a hint: it is wrong for every deployment created
+// before the source type label existed, so the on-disk layout decides and the label is used only
+// when neither directory is there to look at.
+func TestResolvedSourceType(t *testing.T) {
+	t.Parallel()
+
+	const (
+		artifactRef   = "ghcr.io/kimdre/doco-cd_tests:compose-oci"
+		repositoryURL = "https://example.com/owner/repo"
+	)
+
+	testCases := []struct {
+		name        string
+		sourceType  string
+		repoURL     string
+		existingDir func(dataMountPath string) string
+		want        config.SourceType
+	}{
+		{
+			name:       "oci label with the extracted artifact directory present",
+			sourceType: "oci",
+			repoURL:    artifactRef,
+			existingDir: func(dataMountPath string) string {
+				return filepath.Join(dataMountPath, oci.RepositoryNameFromArtifact(artifactRef))
+			},
+			want: config.SourceTypeOCI,
+		},
+		{
+			name:       "stale git label on an oci artifact resolves to oci",
+			sourceType: "git",
+			repoURL:    artifactRef,
+			existingDir: func(dataMountPath string) string {
+				return filepath.Join(dataMountPath, oci.RepositoryNameFromArtifact(artifactRef))
+			},
+			want: config.SourceTypeOCI,
+		},
+		{
+			name:       "git label with the checkout present stays git",
+			sourceType: "git",
+			repoURL:    repositoryURL,
+			existingDir: func(dataMountPath string) string {
+				return filepath.Join(dataMountPath, git.GetRepoName(repositoryURL))
+			},
+			want: config.SourceTypeGit,
+		},
+		{
+			name:       "no directory on disk keeps the labeled type",
+			sourceType: "oci",
+			repoURL:    artifactRef,
+			want:       config.SourceTypeOCI,
+		},
+		{
+			name:       "missing label defaults to git",
+			sourceType: "",
+			repoURL:    repositoryURL,
+			want:       config.SourceTypeGit,
+		},
+		{
+			// A repository URL that escapes the data mount makes both candidate paths
+			// unusable, so there is nothing on disk left to check and the labeled type
+			// (normalized) is all that remains.
+			name:       "unresolvable path falls back to the normalized label",
+			sourceType: "OCI",
+			repoURL:    "../../escape",
+			want:       config.SourceTypeOCI,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dataMountPath := t.TempDir()
+
+			if tc.existingDir != nil {
+				if err := os.MkdirAll(tc.existingDir(dataMountPath), 0o755); err != nil {
+					t.Fatalf("mkdir repo dir: %v", err)
+				}
+			}
+
+			ref := composeScheduledServiceRef{
+				Project:        "compose-oci",
+				RepositoryURL:  tc.repoURL,
+				SourceType:     tc.sourceType,
+				DeploymentName: "compose-oci",
+			}
+
+			opts := ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}}
+
+			if got := resolvedSourceType(ref, opts); got != tc.want {
+				t.Fatalf("expected source type %q, got %q", tc.want, got)
+			}
+		})
+	}
+}
+
+// TestCertRotationPayload proves that a rotation stamps the resolved source type into the
+// payload instead of the hardcoded "git" it used to write. Rotation redeploys relabel the
+// certificate-consuming services, so a wrong value here is what leaves a project whose services
+// disagree about their own source in the first place.
+func TestCertRotationPayload(t *testing.T) {
+	t.Parallel()
+
+	testCases := []struct {
+		name        string
+		sourceType  config.SourceType
+		labeledType string
+		want        webhook.PayloadSource
+	}{
+		{
+			name:        "resolved oci type overrides a stale git label",
+			sourceType:  config.SourceTypeOCI,
+			labeledType: "git",
+			want:        webhook.PayloadSourceOCI,
+		},
+		{
+			name:        "resolved git type is preserved",
+			sourceType:  config.SourceTypeGit,
+			labeledType: "git",
+			want:        webhook.PayloadSourceGit,
+		},
+		{
+			name:        "empty resolved type falls back to the existing label",
+			sourceType:  "",
+			labeledType: "oci",
+			want:        webhook.PayloadSourceOCI,
+		},
+		{
+			name:        "neither known defaults to git",
+			sourceType:  "",
+			labeledType: "",
+			want:        webhook.PayloadSourceGit,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			labels := map[string]string{
+				DocoCDLabels.Source.Type: tc.labeledType,
+				DocoCDLabels.Source.Name: "  owner/repo  ",
+				DocoCDLabels.Source.URL:  "  https://example.com/owner/repo  ",
+			}
+
+			payload := certRotationPayload(labels, tc.sourceType)
+
+			if payload.Source != tc.want {
+				t.Errorf("expected payload source %q, got %q", tc.want, payload.Source)
+			}
+
+			if payload.Trigger != certRotationTrigger {
+				t.Errorf("expected trigger %q, got %q", certRotationTrigger, payload.Trigger)
+			}
+
+			if payload.FullName != "owner/repo" {
+				t.Errorf("expected trimmed full name, got %q", payload.FullName)
+			}
+
+			if payload.WebURL != "https://example.com/owner/repo" {
+				t.Errorf("expected trimmed web url, got %q", payload.WebURL)
+			}
+		})
 	}
 }

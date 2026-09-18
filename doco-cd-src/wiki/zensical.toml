@@ -42,6 +42,7 @@ nav = [
     { "External Secrets" = [
       "External-Secrets/index.md",
       { "AWS Secrets Manager" = "External-Secrets/AWS-Secrets-Manager.md" },
+      { "Azure Key Vault" = "External-Secrets/Azure-Key-Vault.md" },
       { "Bitwarden Secrets Manager" = "External-Secrets/Bitwarden-Secrets-Manager.md" },
       { "Bitwarden Vault / Vaultwarden" = "External-Secrets/Bitwarden-Vault-Vaultwarden.md" },
       { "1Password" = "External-Secrets/1Password.md" },
@@ -68,7 +69,9 @@ nav = [
     { "Core Concepts" = "Core-Concepts.md" },
     { Endpoints = [
       { "Healthcheck" = "Endpoints/Healthcheck.md" },
+      { "MCP Server" = "Endpoints/MCP-Server.md" },
       { "Prometheus Metrics / Monitoring" = "Endpoints/Metrics.md" },
+      { "Go Runtime Profiling" = "Endpoints/Profiling.md" },
       { "REST API" = "Endpoints/REST-API.md" },
       { "Webhook Listener" = "Endpoints/Webhook-Listener.md" },
     ] },
@@ -212,3 +215,14 @@ configurations = [
 ]
 
 [project.plugins.markdown-exec]
+[project.plugins.minify]
+minify_html = true
+minify_js = true
+js_files = [
+  "javascripts/*.js"
+]
+minify_css = true
+css_files = [
+  "stylesheets/*.css"
+]
+cache_safe = true

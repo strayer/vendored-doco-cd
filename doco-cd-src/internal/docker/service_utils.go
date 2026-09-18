@@ -84,10 +84,10 @@ func normalizeRepositoryForLabelMatch(repository string) string {
 // for matching by normalizing the input repository string.
 func buildRepositoryLabelCandidates(repository string) set.Set[string] {
 	if strings.TrimSpace(repository) == "" {
-		return map[string]struct{}{"": {}}
+		return set.New("")
 	}
 
-	candidates := set.Set[string]{}
+	candidates := set.New[string]()
 
 	add := func(v string) {
 		v = strings.TrimSpace(v)
@@ -230,8 +230,9 @@ func getServiceStatusFromContainerStatus(projectName string, containers []contai
 			// the labels may be different between containers, but they should be the same for the same service,
 			// except com.docker.compose.container-number, com.docker.compose.replace
 			// so just use the labels of the first container we encounter for each service
-			status = ServiceStatus{}
-			status.Labels = cont.Labels
+			status = ServiceStatus{
+				Labels: cont.Labels,
+			}
 		}
 
 		if cont.State == container.StateRunning {
@@ -251,7 +252,6 @@ const (
 	ServiceMismatchReasonSwarmMode   = "swarm mode mismatch"
 	ServiceMismatchReasonReplicas    = "replicas mismatch"
 	oneOffServiceNameSeparator       = "-doco-job-"
-	legacyOneShotExecutionMode       = "one_shot"
 )
 
 type ServiceMismatch struct {
@@ -400,7 +400,7 @@ func isEphemeralOneOffService(name string, status ServiceStatus, declaredService
 	}
 
 	mode := strings.TrimSpace(labels[DocoCDJobLabels.JobExecutionMode])
-	if mode != string(JobExecutionModeOneOff) && mode != legacyOneShotExecutionMode {
+	if mode != string(JobExecutionModeOneOff) {
 		return false
 	}
 

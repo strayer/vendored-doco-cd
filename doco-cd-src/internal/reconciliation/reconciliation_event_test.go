@@ -405,31 +405,37 @@ func TestCloneDeployConfigsWithForcedRecreate(t *testing.T) {
 func TestStackDeploymentInProgressTracking(t *testing.T) {
 	t.Parallel()
 
-	r := newReconciliation()
+	r := newTestManager(t)
 	repo := "github.com/example/repo"
 	stack := "stack-a"
+	context := ""
 
-	if r.isStackDeploymentInProgress(repo, stack) {
+	if r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to be initially not in progress")
 	}
 
-	r.startStackDeployment(repo, stack)
+	r.deployments.start(repo, context, stack)
 
-	if !r.isStackDeploymentInProgress(repo, stack) {
+	if !r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to be marked in progress")
 	}
 
-	// Reference counting should keep stack marked as in-progress until all marks are cleared.
-	r.startStackDeployment(repo, stack)
-	r.finishStackDeployment(repo, stack)
+	// A same-named stack in a different context must be tracked independently.
+	if r.deployments.isInProgress(repo, "other-context", stack) {
+		t.Fatal("expected same-named stack in a different context to be unaffected")
+	}
 
-	if !r.isStackDeploymentInProgress(repo, stack) {
+	// Reference counting should keep stack marked as in-progress until all marks are cleared.
+	r.deployments.start(repo, context, stack)
+	r.deployments.finish(repo, context, stack)
+
+	if !r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to remain in progress after one of two marks is cleared")
 	}
 
-	r.finishStackDeployment(repo, stack)
+	r.deployments.finish(repo, context, stack)
 
-	if r.isStackDeploymentInProgress(repo, stack) {
+	if r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to be cleared after all marks are removed")
 	}
 }
@@ -736,6 +742,31 @@ func TestDeployConfigsByName(t *testing.T) {
 	}
 }
 
+// TestFilterConfigsByContext_SameNameDifferentContexts ensures that stacks sharing a name across
+// different Docker contexts are only matched within their own context, since duplicate stack names
+// are now permitted as long as they target different Docker contexts.
+func TestFilterConfigsByContext_SameNameDifferentContexts(t *testing.T) {
+	t.Parallel()
+
+	dcDefault := deployConfig.New("telegraf", "main")
+	dcDocker01 := deployConfig.New("telegraf", "main")
+	dcDocker01.Context = "docker01"
+	dcDocker02 := deployConfig.New("telegraf", "main")
+	dcDocker02.Context = "docker02"
+
+	all := []*deployConfig.Config{dcDefault, dcDocker01, dcDocker02}
+
+	got := filterConfigsByContext(all, "docker01")
+	if len(got) != 1 || got[0] != dcDocker01 {
+		t.Fatalf("expected only the docker01 config, got %#v", got)
+	}
+
+	got = filterConfigsByContext(all, "")
+	if len(got) != 1 || got[0] != dcDefault {
+		t.Fatalf("expected only the default context config, got %#v", got)
+	}
+}
+
 func TestUniqueRedeployDCsFromGroupByEvent(t *testing.T) {
 	t.Parallel()
 
@@ -743,12 +774,14 @@ func TestUniqueRedeployDCsFromGroupByEvent(t *testing.T) {
 	dcDestroy := deployConfig.New("stack-destroy", "main")
 	dcBoth := deployConfig.New("stack-both", "main")       // registered under two redeploy events
 	dcRestart := deployConfig.New("stack-restart", "main") // only restart events → must be excluded
+	dcDifferentContext := deployConfig.New("stack-die", "main")
+	dcDifferentContext.Context = "remote"
 
 	grouped := map[string][]*deployConfig.Config{
-		"die":       {dcDie, dcBoth},
-		"destroy":   {dcDestroy, dcBoth}, // dcBoth appears again — must be deduplicated
-		"unhealthy": {dcRestart},         // restart-oriented — must be excluded
-		"stop":      {dcRestart},         // restart-oriented — must be excluded
+		"die":       {dcDie, dcBoth, dcDifferentContext},
+		"destroy":   {dcDestroy, dcBoth}, // dcBoth appears again and must be deduplicated
+		"unhealthy": {dcRestart},         // restart-oriented and must be excluded
+		"stop":      {dcRestart},         // restart-oriented and must be excluded
 	}
 
 	got := uniqueRedeployDCsFromGroupByEvent(grouped)
@@ -759,8 +792,8 @@ func TestUniqueRedeployDCsFromGroupByEvent(t *testing.T) {
 		names[dc.Name] = struct{}{}
 	}
 
-	if len(got) != 3 {
-		t.Fatalf("expected 3 unique redeploy configs, got %d: %v", len(got), names)
+	if len(got) != 4 {
+		t.Fatalf("expected 4 unique redeploy configs, got %d: %v", len(got), names)
 	}
 
 	for _, wantName := range []string{"stack-die", "stack-destroy", "stack-both"} {
@@ -771,6 +804,18 @@ func TestUniqueRedeployDCsFromGroupByEvent(t *testing.T) {
 
 	if _, ok := names["stack-restart"]; ok {
 		t.Error("expected stack-restart to be excluded (only restart-oriented events)")
+	}
+
+	var stackDieContexts []string
+
+	for _, dc := range got {
+		if dc.Name == "stack-die" {
+			stackDieContexts = append(stackDieContexts, dc.Context)
+		}
+	}
+
+	if !slices.Contains(stackDieContexts, "") || !slices.Contains(stackDieContexts, "remote") {
+		t.Fatalf("expected stack-die in default and remote contexts, got %v", stackDieContexts)
 	}
 }
 

@@ -487,6 +487,36 @@ See [Go Regular Expressions](https://pkg.go.dev/regexp/syntax) for more informat
 
             E.g. `refs/heads/main` (without `^` and `$`) also allows `refs/heads/main-something`
 
+### Preserve a service's running state
+
+Docker Compose services are started automatically after they are created or updated. 
+To let an external tool control a service's lifecycle, set the `cd.doco.deployment.autostart` service label to `false`.
+
+```yaml title="docker-compose.yml"
+services:
+  on-demand:
+    image: example/on-demand:latest
+    labels:
+      cd.doco.deployment.autostart: "false"
+```
+
+The label defaults to `true`. When it is `false`:
+
+- A service without an existing container is created but not started.
+- A stopped service remains stopped when it is recreated or updated.
+- A running service is restarted normally when it is recreated or updated.
+- A service that remains stopped is excluded from deployment readiness checks.
+
+The label controls only deployment-triggered startup; 
+manual actions, restart policies, reconciliation, and external lifecycle tools can still start or stop the service.
+
+Dependencies on an opted-out stopped service are not started or waited for during deployment. 
+Ensure dependent services can tolerate that service being unavailable until an external tool starts it.
+
+!!! note
+    This label applies to Docker (Standalone) deployments. 
+    In Docker Swarm mode, use `deploy.replicas: 0` to deploy a managed service without running tasks.
+
 ### Prevent recreation on config, secret or bind mount changes
 
 When using docker compose with configs, secrets or bind mounts, changes to these resources will trigger a recreation of the service containers by default.
@@ -585,10 +615,22 @@ Precedence:
 
 The following settings can be configured in the nested `swarm` object:
 
-| Key                | Type   | Description                                                                                                                                                                                         | Default value     |
-|--------------------|--------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
-| `config_retention` | number | Number of old Swarm config revisions to keep per resource (excluding the active revision). `-1` disables automatic pruning. If unset, global [`DOCKER_SWARM_CONFIG_RETENTION`](Docker-Settings.md#swarm-environment-variables) is used. | unset (use global) |
-| `secret_retention` | number | Number of old Swarm secret revisions to keep per resource (excluding the active revision). `-1` disables automatic pruning. If unset, global [`DOCKER_SWARM_SECRET_RETENTION`](Docker-Settings.md#swarm-environment-variables) is used. | unset (use global) |
+| Key                | Type    | Description                                                                                                                                                                                                                                                                             | Default value       |
+|--------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------|
+| `enabled`          | boolean | `true` deploys a Docker Swarm stack. `false` deploys a Docker Compose project. When omitted, the Docker context determines the mode. An explicit `true` fails if the context is not a Swarm manager or [`DOCKER_SWARM_FEATURES=false`](Docker-Settings.md#swarm-environment-variables). | unset (auto-detect) |
+| `config_retention` | number  | Number of old Swarm config revisions to keep per resource (excluding the active revision). `-1` disables automatic pruning. If unset, global [`DOCKER_SWARM_CONFIG_RETENTION`](Docker-Settings.md#swarm-environment-variables) is used.                                                 | unset (use global)  |
+| `secret_retention` | number  | Number of old Swarm secret revisions to keep per resource (excluding the active revision). `-1` disables automatic pruning. If unset, global [`DOCKER_SWARM_SECRET_RETENTION`](Docker-Settings.md#swarm-environment-variables) is used.                                                 | unset (use global)  |
+
+Use `swarm.enabled` to select the deployment type for one stack:
+
+```yaml title=".doco-cd.yml"
+name: netbird
+swarm:
+  enabled: false
+```
+
+When the value of `enabled` changes for a doco-cd-managed deployment, doco-cd removes the previous-mode project or stack before deploying the new mode.
+Its volumes are retained during this migration.
 
 #### Keep old Swarm configs/secrets
 

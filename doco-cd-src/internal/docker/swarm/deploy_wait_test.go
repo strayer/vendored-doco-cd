@@ -1,11 +1,129 @@
 package swarm
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	swarmTypes "github.com/moby/moby/api/types/swarm"
 )
+
+func TestWaitOnServicesWithTimeout(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 10 * time.Millisecond
+
+	err := waitOnServicesWith(t.Context(), []string{"svc-1"}, timeout, func(ctx context.Context, _ string) error {
+		<-ctx.Done()
+
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitOnServicesWith() error = %v, want context deadline exceeded", err)
+	}
+
+	if !strings.Contains(err.Error(), "timed out after 10ms waiting for swarm services to converge") {
+		t.Fatalf("waitOnServicesWith() error = %q, missing timeout context", err)
+	}
+}
+
+func TestWaitOnServicesWithParentCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := waitOnServicesWith(ctx, []string{"svc-1"}, time.Minute, func(ctx context.Context, _ string) error {
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitOnServicesWith() error = %v, want context canceled", err)
+	}
+
+	if strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("waitOnServicesWith() error = %q, parent cancellation reported as timeout", err)
+	}
+}
+
+func TestJobTaskFailureFromTasks(t *testing.T) {
+	t.Parallel()
+
+	iteration := uint64(7)
+	otherIteration := uint64(6)
+	tests := []struct {
+		name  string
+		tasks []swarmTypes.Task
+		want  string
+	}{
+		{
+			name: "current iteration failed task includes task details",
+			tasks: []swarmTypes.Task{
+				{
+					ID:           "failed-task",
+					JobIteration: &swarmTypes.Version{Index: iteration},
+					Status: swarmTypes.TaskStatus{
+						State: swarmTypes.TaskStateFailed,
+						Err:   "process exited unexpectedly",
+						ContainerStatus: &swarmTypes.ContainerStatus{
+							ExitCode: 7,
+						},
+					},
+				},
+			},
+			want: "job task failed-task ended in failed (exit code 7): process exited unexpectedly",
+		},
+		{
+			name: "previous iteration failure is ignored",
+			tasks: []swarmTypes.Task{
+				{
+					ID:           "old-failed-task",
+					JobIteration: &swarmTypes.Version{Index: otherIteration},
+					Status:       swarmTypes.TaskStatus{State: swarmTypes.TaskStateFailed},
+				},
+				{
+					ID:           "current-complete-task",
+					JobIteration: &swarmTypes.Version{Index: iteration},
+					Status:       swarmTypes.TaskStatus{State: swarmTypes.TaskStateComplete},
+				},
+			},
+		},
+		{
+			name: "current iteration rejected task uses message",
+			tasks: []swarmTypes.Task{
+				{
+					ID:           "rejected-task",
+					JobIteration: &swarmTypes.Version{Index: iteration},
+					Status: swarmTypes.TaskStatus{
+						State:   swarmTypes.TaskStateRejected,
+						Message: "no suitable node",
+					},
+				},
+			},
+			want: "job task rejected-task ended in rejected: no suitable node",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := jobTaskFailureFromTasks(tt.tasks, iteration)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("jobTaskFailureFromTasks() error = %v, want nil", err)
+				}
+
+				return
+			}
+
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("jobTaskFailureFromTasks() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
 
 func TestShouldWaitForService(t *testing.T) {
 	t.Parallel()
