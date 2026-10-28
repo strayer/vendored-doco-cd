@@ -6,26 +6,51 @@ import (
 	"log/slog"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/notification"
 )
 
-func newTestStageManager() *StageManager {
-	return NewStageManager(
-		"job-1",
-		JobTriggerWebhook,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
-		nil,
-		&RepositoryData{Name: "owner/repo"},
-		&Docker{},
-		nil,
-		&app.Config{},
-		&deploy.Config{},
-		nil,
-		notification.Metadata{},
+type recordingNotificationSender struct {
+	metadata chan notification.Metadata
+}
+
+func (s recordingNotificationSender) Send(_ notification.Level, _, _ string, metadata notification.Metadata, _ ...notification.SendOption) error {
+	s.metadata <- metadata
+
+	return nil
+}
+
+func newTestStageManager(t *testing.T) *StageManager {
+	t.Helper()
+
+	notifier, err := notification.New(notification.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sm, err := NewStageManager(
+		Dependencies{
+			AppConfig: &app.Config{},
+			Notifier:  notifier,
+		},
+		RunInput{
+			Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
+			JobID:        "job-1",
+			JobTrigger:   JobTriggerWebhook,
+			Repository:   &RepositoryData{Name: "owner/repo"},
+			Docker:       &Docker{},
+			DeployConfig: &deploy.Config{},
+			Metadata:     notification.Metadata{},
+		},
 	)
+	if err != nil {
+		t.Fatalf("NewStageManager() error = %v", err)
+	}
+
+	return sm
 }
 
 func TestNewMetaData(t *testing.T) {
@@ -44,7 +69,7 @@ func TestNewMetaData(t *testing.T) {
 func TestNewStageManager(t *testing.T) {
 	t.Parallel()
 
-	sm := newTestStageManager()
+	sm := newTestStageManager(t)
 
 	if sm.JobID != "job-1" || sm.JobTrigger != JobTriggerWebhook {
 		t.Fatalf("NewStageManager() stored job metadata incorrectly: %#v", sm)
@@ -59,10 +84,27 @@ func TestNewStageManager(t *testing.T) {
 	}
 }
 
+func TestNewStageManagerValidatesInputs(t *testing.T) {
+	t.Parallel()
+
+	if _, err := NewStageManager(Dependencies{}, RunInput{}); err == nil {
+		t.Fatal("NewStageManager() error = nil, want dependency validation error")
+	}
+
+	notifier, err := notification.New(notification.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := NewStageManager(Dependencies{AppConfig: &app.Config{}, Notifier: notifier}, RunInput{}); err == nil {
+		t.Fatal("NewStageManager() error = nil, want run input validation error")
+	}
+}
+
 func TestStageManagerGetStageMetaData(t *testing.T) {
 	t.Parallel()
 
-	sm := newTestStageManager()
+	sm := newTestStageManager(t)
 
 	tests := []StageName{StageInit, StagePreDeploy, StageDeploy, StageDestroy, StagePostDeploy, StagePostDestroy, StageCleanup}
 	for _, stageName := range tests {
@@ -88,22 +130,26 @@ func TestStageManagerGetStageMetaData(t *testing.T) {
 func TestStageManagerNotifyFailureIncludesTarget(t *testing.T) {
 	t.Parallel()
 
-	sm := newTestStageManager()
+	sm := newTestStageManager(t)
 	sm.Repository.Revision = "abc123"
 	sm.DeployConfig.Name = "app"
 	sm.DeployConfig.Context = "remote-vm"
 	sm.DeployConfig.Reference = "main"
 	sm.DeployConfig.Internal.ConfigTarget = "prod-vm"
 
-	var got notification.Metadata
-
-	sm.NotifyFailureFunc = func(_ *slog.Logger, _ error, metadata notification.Metadata) {
-		got = metadata
-	}
+	sent := make(chan notification.Metadata, 1)
+	sm.Notifier = recordingNotificationSender{metadata: sent}
 
 	boom := errors.New("boom")
 
 	returned := sm.NotifyFailure(boom)
+
+	var got notification.Metadata
+	select {
+	case got = <-sent:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for failure notification")
+	}
 
 	if got.Target != "prod-vm" {
 		t.Fatalf("expected target prod-vm, got %q", got.Target)
@@ -121,7 +167,7 @@ func TestStageManagerNotifyFailureIncludesTarget(t *testing.T) {
 func TestStageOrders(t *testing.T) {
 	t.Parallel()
 
-	sm := newTestStageManager()
+	sm := newTestStageManager(t)
 
 	deployOrder := sm.GetDeployStageOrder()
 	if want := []StageName{StageInit, StagePreDeploy, StageDeploy, StagePostDeploy, StageCleanup}; !slices.Equal(deployOrder.Order, want) {

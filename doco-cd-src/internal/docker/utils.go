@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -66,28 +65,13 @@ func (l Labels) getDeploymentComposeHash() (string, bool) {
 	return l.Get(DocoCDLabels.Deployment.ComposeHash)
 }
 
-// SwarmServiceLabels returns the labels of a swarm service, merged from the task
-// template and the service spec.
+// SwarmServiceLabels returns the labels of a swarm service.
 //
 // Deployment metadata is stored in the service spec labels, because labels in the
 // task template are part of the service definition and changing them makes swarm
 // recreate all tasks of the service on every deployment.
-//
-// Stacks deployed by earlier versions carry the metadata in the container spec
-// instead, so both label sets are merged, with the service spec taking precedence.
-// Note that this only helps sites that read labels from an inspected service:
-// server-side filtered listings (e.g. GetServicesByLabel) match service spec labels
-// only, so legacy stacks stay invisible to them until they are redeployed once.
-// The container spec fallback can be dropped in a future release, once stacks have
-// been redeployed at least once.
 func SwarmServiceLabels(service swarm.Service) Labels {
-	containerLabels := swarmContainerLabels(service)
-
-	labels := make(Labels, len(containerLabels)+len(service.Spec.Labels))
-	maps.Copy(labels, containerLabels)
-	maps.Copy(labels, service.Spec.Labels)
-
-	return labels
+	return service.Spec.Labels
 }
 
 // SwarmJobLabels returns the labels of a swarm service with the job configuration
@@ -101,10 +85,7 @@ func SwarmServiceLabels(service swarm.Service) Labels {
 // Job runtime metadata (last/next run timestamps) is written by doco-cd itself to the
 // service spec, so it is exempt from this rule.
 func SwarmJobLabels(service swarm.Service) Labels {
-	containerLabels := swarmContainerLabels(service)
-
-	labels := make(Labels, len(containerLabels)+len(service.Spec.Labels))
-	maps.Copy(labels, containerLabels)
+	labels := make(Labels, len(service.Spec.Labels))
 
 	for key, value := range service.Spec.Labels {
 		if isJobConfigLabel(key) {
@@ -112,6 +93,14 @@ func SwarmJobLabels(service swarm.Service) Labels {
 		}
 
 		labels[key] = value
+	}
+
+	if containerSpec := service.Spec.TaskTemplate.ContainerSpec; containerSpec != nil {
+		for key, value := range containerSpec.Labels {
+			if isJobConfigLabel(key) {
+				labels[key] = value
+			}
+		}
 	}
 
 	return labels
@@ -125,14 +114,6 @@ func isJobConfigLabel(key string) bool {
 	}
 
 	return key != docoCDJobLabelNames.JobLastRun && key != docoCDJobLabelNames.JobNextRun
-}
-
-func swarmContainerLabels(service swarm.Service) map[string]string {
-	if service.Spec.TaskTemplate.ContainerSpec == nil {
-		return nil
-	}
-
-	return service.Spec.TaskTemplate.ContainerSpec.Labels
 }
 
 // GetServiceLabels retrieves the Labels for each Service in a given stack.
@@ -177,6 +158,23 @@ func GetLabeledContainers(ctx context.Context, cli client.APIClient, key, value 
 	return result.Items, nil
 }
 
+// getContainersWithLabelKey retrieves all containers that carry labelKey,
+// regardless of its value. Unlike GetLabeledContainers, this does not
+// require knowing the label's value in advance - it is used for discovery
+// scans (e.g. garbage collection) that need every doco-cd-managed container
+// regardless of which value a label was stamped with.
+func getContainersWithLabelKey(ctx context.Context, cli client.APIClient, labelKey string, all bool) ([]container.Summary, error) {
+	result, err := cli.ContainerList(ctx, client.ContainerListOptions{
+		Filters: make(client.Filters).Add("label", labelKey),
+		All:     all,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return result.Items, nil
+}
+
 // GetLabeledServices retrieves all services with a specific label key and value, along with their labels.
 func GetLabeledServices(ctx context.Context, cli client.APIClient, swarmMode bool, key, value string) (map[Service]map[string]string, error) {
 	if swarmMode {
@@ -200,6 +198,84 @@ func GetLabeledServices(ctx context.Context, cli client.APIClient, swarmMode boo
 
 	result := make(map[Service]map[string]string)
 	for _, cont := range containers {
+		result[Service(cont.Names[0])] = cont.Labels
+	}
+
+	return result, nil
+}
+
+// GetDeploymentServices returns the labels of every swarm service or container of the deployment stackName,
+// including stopped containers.
+func GetDeploymentServices(ctx context.Context, cli client.APIClient, swarmMode bool, stackName string) (map[Service]map[string]string, error) {
+	if swarmMode {
+		services, err := GetLabeledServices(ctx, cli, true, DocoCDLabels.Deployment.Name, stackName)
+		if err != nil {
+			return nil, err
+		}
+
+		for name, labels := range services {
+			if labels[DocoCDJobLabels.JobEphemeral] == "true" {
+				delete(services, name)
+			}
+		}
+
+		return services, nil
+	}
+
+	containers, err := GetLabeledContainers(ctx, cli, DocoCDLabels.Deployment.Name, stackName, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get containers of deployment %s: %w", stackName, err)
+	}
+
+	result := make(map[Service]map[string]string, len(containers))
+	for _, cont := range containers {
+		if len(cont.Names) > 0 && cont.Labels[api.HookLabel] == "" &&
+			cont.Labels[DocoCDJobLabels.JobEphemeral] != "true" &&
+			cont.Labels["com.docker.swarm.service.name"] == "" {
+			result[Service(cont.Names[0])] = cont.Labels
+		}
+	}
+
+	return result, nil
+}
+
+// GetServicesWithLabelKey retrieves every container or swarm service that
+// carries labelKey, regardless of its value, along with its labels. Like
+// getContainersWithLabelKey/swarm.GetServicesByLabelKey, this is for
+// discovery scans (e.g. garbage collection) that need to enumerate every
+// doco-cd-managed deployment without knowing any label's value - or the
+// deployment's stack name - in advance.
+//
+// Containers are listed with all=true, so a stopped-but-still-deployed
+// stack is reported the same as a running one: it is still deployed and its
+// on-disk source artifact is still in use.
+func GetServicesWithLabelKey(ctx context.Context, cli client.APIClient, swarmMode bool, labelKey string) (map[Service]map[string]string, error) {
+	if swarmMode {
+		services, err := swarmInternal.GetServicesByLabelKey(ctx, cli, labelKey)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get services with label key %s: %w", labelKey, err)
+		}
+
+		result := make(map[Service]map[string]string)
+		for _, service := range services {
+			result[Service(service.Spec.Name)] = SwarmServiceLabels(service)
+		}
+
+		return result, nil
+	}
+
+	containers, err := getContainersWithLabelKey(ctx, cli, labelKey, true)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get containers with label key %s: %w", labelKey, err)
+	}
+
+	result := make(map[Service]map[string]string)
+
+	for _, cont := range containers {
+		if len(cont.Names) == 0 {
+			continue
+		}
+
 		result[Service(cont.Names[0])] = cont.Labels
 	}
 
@@ -243,9 +319,9 @@ func GetLabeledSecrets(ctx context.Context, cli client.APIClient, key, value str
 }
 
 // GetMountPointByDestination retrieves the mount point of a container volume/bind mount by its destination (mount point inside the container).
-func GetMountPointByDestination(cli client.APIClient, containerID, destination string) (container.MountPoint, error) {
+func GetMountPointByDestination(ctx context.Context, cli client.APIClient, containerID, destination string) (container.MountPoint, error) {
 	// Get the container info
-	result, err := cli.ContainerInspect(context.TODO(), containerID, client.ContainerInspectOptions{})
+	result, err := cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
 	if err != nil {
 		return container.MountPoint{}, fmt.Errorf("failed to inspect container %s: %w", containerID, err)
 	}
@@ -347,22 +423,19 @@ func MarshalAutoDiscoveryConfig(cfg deployConfig.AutoDiscoveryConfig) string {
 }
 
 // ParseAutoDiscoveryConfig deserializes an AutoDiscoveryConfig from a YAML container label value.
-// If the label is empty or invalid it returns a default config with Delete=true, RemoveVolumes=false, RemoveImages=true.
+// An empty or invalid label returns a config that deletes and removes nothing: the label decides whether
+// a stack may be removed, so a label that cannot be read must not allow it.
 func ParseAutoDiscoveryConfig(labelValue string) deployConfig.AutoDiscoveryConfig {
-	defaults := deployConfig.AutoDiscoveryConfig{
-		Delete:        true,
-		RemoveVolumes: false,
-		RemoveImages:  true,
-	}
-
-	if labelValue == "" {
-		return defaults
-	}
-
 	var cfg deployConfig.AutoDiscoveryConfig
-	if err := yaml.Unmarshal([]byte(labelValue), &cfg); err != nil {
-		return defaults
+	if labelValue == "" || yaml.Unmarshal([]byte(labelValue), &cfg) != nil {
+		return deployConfig.AutoDiscoveryConfig{}
 	}
 
 	return cfg
+}
+
+// AutoDiscoveryConfigsEqual reports whether two auto-discovery configs are equivalent.
+// Compare normalized label values to support future complex fields (#1818).
+func AutoDiscoveryConfigsEqual(a, b deployConfig.AutoDiscoveryConfig) bool {
+	return MarshalAutoDiscoveryConfig(a) == MarshalAutoDiscoveryConfig(b)
 }

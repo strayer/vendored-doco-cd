@@ -10,7 +10,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/docker"
-	"github.com/kimdre/doco-cd/internal/git"
 )
 
 func (s *StageManager) RunDeployStage(ctx context.Context, stageLog *slog.Logger) error {
@@ -20,26 +19,96 @@ func (s *StageManager) RunDeployStage(ctx context.Context, stageLog *slog.Logger
 		s.Stages.Deploy.FinishedAt = time.Now()
 	}()
 
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	if s.retryAttempt != nil {
+		s.retryAttempt.Start()
+	}
+
+	s.logAdmittedDeploymentRetry(ctx, stageLog)
+
 	var err error
 
-	latestCommit := strings.TrimSpace(s.Repository.Revision)
-	if s.Repository.Source != config.SourceTypeOCI {
-		latestCommit, err = git.GetLatestCommit(s.Repository.Git, s.DeployConfig.Reference)
+	// Migrate deployment mode if needed
+	if s.DeployState.modeMigrationNeeded {
+		_, err = docker.MigrateDeploymentMode(
+			ctx,
+			stageLog,
+			s.Docker.Cmd,
+			s.DeployConfig.Context,
+			s.DeployConfig.Name,
+			s.migrationSource(),
+			s.Docker.SwarmMode,
+			s.Docker.SwarmAvailable,
+		)
 		if err != nil {
-			return fmt.Errorf("failed to get latest commit: %w", err)
+			return fmt.Errorf("failed to migrate deployment mode: %w", err)
 		}
 	}
 
-	err = docker.DeployStack(stageLog, s.Repository.PathExternal, &ctx, s.Docker.Cmd,
-		s.Payload, s.DeployConfig,
-		s.DeployState.changedServices, s.DeployState.ignoredInfo.NeedSendSignal,
-		latestCommit, app.Version,
-		s.AppConfig.DockerSwarmConfigRetention, s.AppConfig.DockerSwarmSecretRetention,
-		s.Docker.SwarmMode,
-		pkiRoleNormMap(s.DeployConfig.ExternalSecrets, s.DeployConfig.Internal.Environment))
+	latestCommit := strings.TrimSpace(s.Repository.Revision)
+	if s.Repository.Source != config.SourceTypeOCI {
+		latestCommit = s.DeployState.latestCommit
+		if latestCommit == "" {
+			latestCommit, err = s.latestCommitFromMirror()
+			if err != nil {
+				return fmt.Errorf("failed to get latest commit: %w", err)
+			}
+		}
+	}
+
+	s.DeployConfig.Internal.ConfigSourceRevision = s.Repository.ConfigRevision
+	s.DeployConfig.Internal.ConfigSourceWorkingDir = s.Repository.ConfigPath
+
+	// Phase updates stop before this stage returns, so they can never
+	// overwrite the final commit status.
+	var phaseReporter docker.PhaseReporter
+	if reporter := s.startPhaseReporter(ctx, phaseReportDwell); reporter != nil {
+		phaseReporter = reporter
+
+		defer reporter.Stop()
+	}
+
+	err = docker.DeployStack(ctx, docker.DeployRequest{
+		JobLog:           stageLog,
+		ExternalRepoPath: s.Repository.PathExternal,
+		InternalRepoPath: s.Repository.PathInternal,
+		DockerCLI:        s.Docker.Cmd,
+		Payload:          s.Payload,
+		RepositoryName:   s.Repository.Name,
+		SourceURL:        sourceURLForLabels(s.Repository),
+		DeployConfig:     s.DeployConfig,
+		DetectedChanges:  s.DeployState.changedServices,
+		NeedSignal:       s.DeployState.ignoredInfo.NeedSendSignal,
+		LatestCommit:     latestCommit,
+		AppVersion:       app.Version,
+		ComposeLoad:      docker.NewComposeLoadOptions(s.AppConfig),
+		SwarmRetention:   docker.NewSwarmRetentionOptions(s.AppConfig),
+		SwarmMode:        s.Docker.SwarmMode,
+		HashNormMap:      pkiRoleNormMap(s.DeployConfig.ExternalSecrets, s.DeployConfig.Internal.Environment),
+		Project:          s.Docker.Project,
+		ProjectHash:      s.Docker.ProjectHash,
+		CommitStatus:     s.selfUpdateCommitStatus(),
+		PhaseReporter:    phaseReporter,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to deploy stack %s: %w", s.DeployConfig.Name, err)
 	}
 
 	return nil
+}
+
+func sourceURLForLabels(repository *RepositoryData) string {
+	if repository == nil {
+		return ""
+	}
+
+	if repository.ConfigSourceUrl != "" {
+		return repository.ConfigSourceUrl
+	}
+
+	// Preserve compatibility with callers that construct RepositoryData directly.
+	return repository.SourceUrl
 }

@@ -2,12 +2,13 @@ package docker
 
 import (
 	"fmt"
-	"log/slog"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-co-op/gocron/v2"
+
+	"github.com/kimdre/doco-cd/internal/common/cronexpr"
 )
 
 type JobExecutionMode string
@@ -15,12 +16,6 @@ type JobExecutionMode string
 const (
 	JobExecutionModeRestart JobExecutionMode = "restart"
 	JobExecutionModeOneOff  JobExecutionMode = "one_off"
-
-	// JobExecutionModeOneShotDeprecated is the deprecated alias for JobExecutionModeOneOff.
-	//
-	// Deprecated: still accepted for backward compatibility but will log a warning
-	// TODO: Remove in a future release.
-	JobExecutionModeOneShotDeprecated JobExecutionMode = "one_shot"
 )
 
 type JobNotifyOn string
@@ -33,13 +28,19 @@ const (
 )
 
 type JobScheduleConfig struct {
-	Enabled       bool
 	Schedule      string
-	SkipRunning   bool
 	ExecutionMode JobExecutionMode
 	NotifyOn      JobNotifyOn
-	SwarmReplicas uint64
 	StopServices  []StopServiceRef
+	SwarmReplicas uint64
+	Enabled       bool
+	SkipRunning   bool
+	// StopServicesTimeout is an explicit, user-configured timeout (in seconds)
+	// used when stopping the targets listed in StopServices.
+	// When nil, the target's own configured grace period is honored instead
+	// (falling back to a default if the target has none configured).
+	// See docker.DefaultStopServicesTimeout.
+	StopServicesTimeout *int
 }
 
 // StopServiceRef identifies a compose service (or swarm service) to be temporarily
@@ -67,28 +68,19 @@ func (c JobScheduleConfig) ShouldNotifyFailure() bool {
 	return c.NotifyOn == JobNotifyAll || c.NotifyOn == JobNotifyFailure
 }
 
-func NewJobScheduleParser() gocron.Cron {
-	// 5-field cron format with descriptors and @every durations. Seconds are intentionally unsupported.
-	return gocron.NewDefaultCron(false)
-}
-
+// ParseJobScheduleExpression parses a job schedule in the local timezone (TZ).
+// It uses the 5-field cron format with descriptors and @every durations;
+// seconds are intentionally unsupported.
 func ParseJobScheduleExpression(spec string) (gocron.Cron, error) {
-	schedule := NewJobScheduleParser()
-	if err := schedule.IsValid(strings.TrimSpace(spec), time.Local, time.Now()); err != nil {
+	schedule, err := cronexpr.Parse(spec, time.Local)
+	if err != nil {
 		return nil, fmt.Errorf("invalid job schedule %q: %w", spec, err)
 	}
 
 	return schedule, nil
 }
 
-func ParseJobScheduleLabels(labels map[string]string, log ...*slog.Logger) (JobScheduleConfig, bool, error) {
-	var logger *slog.Logger
-	if len(log) > 0 && log[0] != nil {
-		logger = log[0]
-	} else {
-		logger = slog.Default()
-	}
-
+func ParseJobScheduleLabels(labels map[string]string) (JobScheduleConfig, bool, error) {
 	cfg := JobScheduleConfig{
 		ExecutionMode: JobExecutionModeRestart,
 		NotifyOn:      JobNotifyAll,
@@ -136,12 +128,6 @@ func ParseJobScheduleLabels(labels map[string]string, log ...*slog.Logger) (JobS
 		switch mode {
 		case JobExecutionModeRestart, JobExecutionModeOneOff:
 			cfg.ExecutionMode = mode
-		case JobExecutionModeOneShotDeprecated:
-			logger.Warn(
-				fmt.Sprintf("label %s: value %q is deprecated, use %q instead", docoCDJobLabelNames.JobExecutionMode, JobExecutionModeOneShotDeprecated, JobExecutionModeOneOff),
-				slog.String("label", docoCDJobLabelNames.JobExecutionMode),
-			)
-			cfg.ExecutionMode = JobExecutionModeOneOff
 		default:
 			return cfg, false, fmt.Errorf("invalid %s label value %q", docoCDJobLabelNames.JobExecutionMode, modeRaw)
 		}
@@ -177,6 +163,26 @@ func ParseJobScheduleLabels(labels map[string]string, log ...*slog.Logger) (JobS
 		}
 
 		cfg.StopServices = refs
+	}
+
+	if timeoutRaw, ok := labels[docoCDJobLabelNames.JobStopServicesTimeout]; ok {
+		timeoutSecs, parseErr := strconv.Atoi(strings.TrimSpace(timeoutRaw))
+		if parseErr != nil {
+			return cfg, false, fmt.Errorf("invalid %s label value %q", docoCDJobLabelNames.JobStopServicesTimeout, timeoutRaw)
+		}
+
+		if timeoutSecs <= 0 {
+			return cfg, false, fmt.Errorf("%s must be > 0", docoCDJobLabelNames.JobStopServicesTimeout)
+		}
+
+		// Prevent overflow when converting seconds to time.Duration (which is int64 nanoseconds).
+		// The maximum duration in seconds is (2^63 - 1) / 1e9, which is the maximum int64 value divided by 1 second in nanoseconds.
+		maxDurationSeconds := int64(time.Duration(1<<63-1) / time.Second)
+		if int64(timeoutSecs) > maxDurationSeconds {
+			return cfg, false, fmt.Errorf("%s must be <= %d", docoCDJobLabelNames.JobStopServicesTimeout, maxDurationSeconds)
+		}
+
+		cfg.StopServicesTimeout = &timeoutSecs
 	}
 
 	return cfg, true, nil

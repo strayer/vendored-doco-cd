@@ -1,0 +1,318 @@
+package docker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
+
+	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/cli/cli/command"
+	"github.com/docker/compose/v5/pkg/api"
+	"github.com/docker/compose/v5/pkg/compose"
+
+	"github.com/kimdre/doco-cd/internal/common/types/set"
+	"github.com/kimdre/doco-cd/internal/common/types/slice"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/docker/registryauth"
+)
+
+// deployCompose deploys a project as specified by the Docker Compose specification (LoadCompose).
+// When the project contains this doco-cd instance it hands over to a self-update
+// strategy instead, because compose would otherwise stop this process halfway
+// through its own recreate.
+func deployCompose(ctx context.Context, dockerCli command.Cli, project *types.Project,
+	deployConfig *deploy.Config, recreateMode string, services []string,
+	needSignal []SignalService, setPhase func(string), self *SelfDeployInput,
+	opts composeDeployOptions,
+) error {
+	var (
+		err          error
+		beforeImages map[string]api.ImageSummary // Images used by stack before deployment
+		afterImages  map[string]api.ImageSummary // Images used by stack after deployment
+	)
+
+	service, err := compose.NewComposeService(dockerCli)
+	if err != nil {
+		return err
+	}
+
+	if recreateMode == "" {
+		recreateMode = api.RecreateDiverged
+	}
+
+	if deployConfig.ForceImagePull {
+		for i, s := range project.Services {
+			s.PullPolicy = types.PullPolicyAlways
+			project.Services[i] = s
+		}
+	}
+
+	// Validate the self-update strategy before signaling services or changing
+	// images/resources. Only after Pull and Build do we disable the self service
+	// in the project used for the pre-handover Create.
+	var (
+		selfPlan    selfUpdatePlan
+		selfService string
+	)
+
+	if target := selfUpdateFor(project, deployConfig.Context); target != nil {
+		if self != nil {
+			self.RecreateMode = recreateMode
+			self.Services = services
+			self.RemoveOrphans = deployConfig.RemoveOrphans
+		}
+
+		selfPlan, err = prepareSelfUpdate(ctx, dockerCli, project, deployConfig, target, services, self)
+		if err != nil {
+			return err
+		}
+
+		selfService = target.Service
+	}
+
+	live, err := prepareComposeLiveResources(project, opts.ArtifactRoot, deployConfig.Context)
+	if err != nil {
+		return fmt.Errorf("failed to prepare live files: %w", err)
+	}
+
+	if live != nil {
+		setDeploymentPhase(setPhase, "updating live files")
+
+		changedLive, err := live.sync(opts.SyncLive)
+		if err != nil {
+			return fmt.Errorf("failed to update live files: %w", err)
+		}
+
+		liveSignals, err := live.signalsFor(ctx, dockerCli.Client(), project.Name, changedLive, needSignal, recreateMode, services)
+		if err != nil {
+			return fmt.Errorf("failed to determine services to signal: %w", err)
+		}
+
+		needSignal = append(slices.Clone(needSignal), liveSignals...)
+	}
+
+	if len(needSignal) > 0 {
+		setDeploymentPhase(setPhase, "signaling services")
+
+		if err := ComposeSignal(ctx, dockerCli, project, needSignal); err != nil {
+			return err
+		}
+	}
+
+	if deployConfig.PruneImages {
+		beforeImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
+		if err != nil {
+			// No such image error is okay since we wanted to remove the image anyway
+			if !strings.Contains(strings.ToLower(err.Error()), ErrNoSuchImage.Error()) {
+				return fmt.Errorf("failed to get existing images: %w", err)
+			}
+		}
+	}
+
+	setDeploymentPhase(setPhase, "pulling images")
+
+	err = pullProjectImages(ctx, service, project, api.PullOptions{
+		Quiet:           true,
+		IgnoreBuildable: true,
+	})
+	if err != nil {
+		imageRefs := make([]string, 0, len(project.Services))
+		for _, svc := range project.Services {
+			if svc.Image == "" {
+				continue
+			}
+
+			imageRefs = append(imageRefs, svc.Image)
+		}
+
+		hint := registryauth.BuildFailureHint(dockerCli.ConfigFile(), imageRefs, err)
+		if hint != "" {
+			return fmt.Errorf("failed to pull images: %w; %s", err, hint)
+		}
+
+		return fmt.Errorf("failed to pull images: %w", err)
+	}
+
+	// Convert deployConfig.BuildOpts.Args to types.MappingWithEquals
+	buildArgs := make(types.MappingWithEquals)
+	for k, v := range deployConfig.BuildOpts.Args {
+		buildArgs[k] = &v
+	}
+
+	buildOpts := api.BuildOptions{
+		Pull:     deployConfig.BuildOpts.ForceImagePull,
+		Quiet:    deployConfig.BuildOpts.Quiet,
+		Progress: "auto",
+		Args:     buildArgs,
+		NoCache:  deployConfig.BuildOpts.NoCache,
+	}
+
+	setDeploymentPhase(setPhase, "building images")
+
+	err = service.Build(ctx, project, buildOpts)
+	if err != nil {
+		return err
+	}
+
+	// Pull and Build need the full project. Reduce it afterwards so it also
+	// contains any image changes made during Build. Disabled services are known
+	// to Compose, so RemoveOrphans cannot reap the self container.
+	if selfPlan.Step != nil {
+		project = project.WithServicesDisabled(selfService)
+		services = selfPlan.Services
+	}
+
+	// Recreating a network shared with this process is unsafe even with the
+	// self service disabled: Compose still plans that network's removal. The
+	// applier performs the *whole* create/start after it has detached from the
+	// project network and the predecessor can safely be stopped.
+	if selfPlan.DeferToApplier {
+		return selfPlan.Step()
+	}
+
+	// Pinning is an optimization: if it fails, services are simply recreated from the new artifact.
+	if err = pinUnchangedComposeServices(ctx, dockerCli.Client(), project, opts.ArtifactRoot, recreateMode, services, opts.logger()); err != nil {
+		opts.logger().Warn("failed to keep unchanged services on their current artifact", slog.Any("error", err))
+	}
+
+	createOpts := api.CreateOptions{
+		Services:             services,
+		RemoveOrphans:        deployConfig.RemoveOrphans,
+		Recreate:             recreateMode,
+		RecreateDependencies: api.RecreateDiverged,
+		QuietPull:            true,
+	}
+
+	autostartDisabledServices, err := getAutostartDisabledServices(project)
+	if err != nil {
+		return err
+	}
+
+	runningServices := set.New[string]()
+
+	if !autostartDisabledServices.IsEmpty() {
+		containers, err := GetProjectContainers(ctx, dockerCli, project.Name)
+		if err != nil {
+			return fmt.Errorf("failed to inspect existing services before deployment: %w", err)
+		}
+
+		runningServices = getRunningServices(containers)
+	}
+
+	startServices, err := getStartServicesForDeploy(project, autostartDisabledServices, runningServices)
+	if err != nil {
+		return err
+	}
+
+	jobServices, err := getJobServices(project)
+	if err != nil {
+		return err
+	}
+
+	oneShotServices, err := getOneShotServices(project)
+	if err != nil {
+		return err
+	}
+
+	addOneShotServiceLabels(project, oneShotServices)
+
+	stoppedAutostartServices := autostartDisabledServices.Difference(runningServices)
+
+	// Remove mismatched recreatable volumes (tmpfs, NFS, CIFS mounts) before create.
+	// Docker Compose then recreates them with the desired configuration during service.Create.
+	setDeploymentPhase(setPhase, "preparing deployment resources")
+
+	if selfPlan.Step != nil {
+		if err = validateSelfUpdateVolumes(ctx, dockerCli.Client(), project); err != nil {
+			return err
+		}
+	}
+
+	if err = removeMismatchedRecreatableVolumes(ctx, dockerCli.Client(), deployConfig.Name, project); err != nil {
+		return fmt.Errorf("failed to remove mismatched recreatable volumes: %w", err)
+	}
+
+	setDeploymentPhase(setPhase, "creating services")
+
+	err = service.Create(ctx, project, createOpts)
+	if err != nil {
+		return err
+	}
+
+	// The self service is only recreated by the self-update, so it may still use pruned files.
+	if live != nil && opts.SyncLive && selfPlan.Step == nil {
+		if err = live.prune(ctx, dockerCli.Client(), project.Name); err != nil {
+			opts.logger().Warn("failed to remove unused live files", slog.Any("error", err))
+		}
+	}
+
+	if len(startServices) > 0 {
+		setDeploymentPhase(setPhase, "starting services")
+
+		// Docker Compose's Start ignores StartOptions.Services and starts every
+		// service in the passed project (including containers in the "created" or
+		// "exited" state), so narrow the project to services allowed to start.
+		startProject, err := projectForStart(project, jobServices, stoppedAutostartServices)
+		if err != nil {
+			return err
+		}
+
+		startOpts := api.StartOptions{
+			Project:  startProject,
+			Wait:     false,
+			Services: startServices,
+		}
+
+		err = service.Start(ctx, startProject.Name, startOpts)
+		if err != nil {
+			if !errors.Is(err, ErrNoContainerToStart) {
+				return err
+			}
+		}
+
+		setDeploymentPhase(setPhase, "waiting for services to start")
+
+		err = waitForStartedServices(ctx, dockerCli, project.Name, startServices, jobServices, oneShotServices,
+			deployConfig.Timeout.Duration())
+		if err != nil {
+			return err
+		}
+	}
+
+	if deployConfig.PruneImages {
+		setDeploymentPhase(setPhase, "pruning unused images")
+
+		afterImages, err = service.Images(ctx, project.Name, api.ImagesOptions{})
+		if err != nil {
+			// No such image error is okay since we wanted to remove the image anyway
+			if !strings.Contains(strings.ToLower(err.Error()), ErrNoSuchImage.Error()) {
+				return fmt.Errorf("failed to get images after deployment: %w", err)
+			}
+		}
+
+		// Determine unused images by comparing image SHAs used by services before and after the deployment
+
+		var ids []string
+
+		for svc, beforeImg := range beforeImages {
+			afterImg, exists := afterImages[svc]
+			if !exists || beforeImg.ID != afterImg.ID {
+				ids = append(ids, beforeImg.ID)
+			}
+		}
+
+		_, err = pruneImages(ctx, dockerCli, slice.Unique(ids))
+		if err != nil {
+			return fmt.Errorf("failed to prune images: %w", err)
+		}
+	}
+
+	if selfPlan.Step != nil {
+		return selfPlan.Step()
+	}
+
+	return nil
+}

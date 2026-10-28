@@ -108,6 +108,16 @@ and then re-/started at the scheduled time without being removed after completio
     `configs` are applied when the job starts. Restart-mode services must have an effective scale of `1`; use
     [`one_off`](#one_off) for a multi-replica workload.
 
+    For a stopped service with `pre_start` hooks, doco-cd prepares fresh hook runners before each execution
+    without recreating the job's source container. This step pulls only missing images, even if the service
+    sets a `pull_policy` such as `always`. A failed hook prevents the workload from starting and is
+    retained for inspection. The next execution prepares fresh runners, so a failed hook can be retried.
+
+    An already running container is restarted like with `docker compose restart`: its `pre_stop` hooks run
+    before the restart and its `post_start` hooks run after it, but `pre_start` hooks do not run.
+    A failed `pre_stop` hook cancels the restart. A failed `post_start` hook fails the execution, but the
+    workload keeps running. See [Compose lifecycle hooks](Pre-Post-Deployment-Scripts.md#when-doco-cd-runs-lifecycle-hooks).
+
 !!! warning "Docker Swarm `global` + `restart` limitation"
     In Docker Swarm, restart-mode scheduled jobs are deployed with `0` replicas so they do not run on deployment.
     `global` services cannot be scaled to `0` (a global service always runs one task per node), so a `global` service
@@ -115,13 +125,36 @@ and then re-/started at the scheduled time without being removed after completio
 
 ### `one_off`
 
-Alternatively, you can configure scheduled jobs to run in `one_off` mode, which means a new ephemeral container will 
-be created for each scheduled run and removed after completion.
+Alternatively, you can configure scheduled jobs to run in `one_off` mode, which means a new ephemeral container will
+be created for each scheduled run and removed after completion and reporting.
+
+!!! warning "`pre_start` hooks require `restart` mode"
+    Docker Compose's one-off API does not execute [`pre_start` lifecycle hooks](Pre-Post-Deployment-Scripts.md#compose-lifecycle-hooks). doco-cd rejects standalone scheduled
+    services that combine `one_off` with `pre_start`, both during deployment and before an execution.
+    Use `#!yaml cd.doco.job.execution_mode: "restart"` if the workload needs these hooks. `post_start` hooks
+    remain supported by Compose's one-off API.
 
 !!! note
-    You won't be able to see the container or its logs after the job has completed, 
+    You won't be able to see the container or its logs after the job has completed,
     so make sure to configure appropriate logging (e.g., log to a persistent file or logging service like [Loki](https://grafana.com/docs/loki/latest/)) 
     if you need to keep track of job runs and [notifications](Notifications.md) if needed.
+
+For Compose jobs, the [scheduled-jobs API](../Endpoints/REST-API.md#scheduled-jobs) reports the active execution or
+the most recent recorded one-off exit status, not an older exit status of the stopped source service container.
+Exit results are kept in memory. When no result is available, the API falls back to the source container's state.
+
+??? info "Recovery after forced termination"
+    For `one_off` jobs, doco-cd labels the temporary container or Swarm service with the execution identity
+    and retains it until its result has been reported, and it has been cleaned up. 
+    It writes only the small finalization record needed to restore `stop_services` and avoid duplicate reporting to [`DATA_MOUNT_PATH`](../App-Settings.md#storage-settings).
+    If doco-cd is forcibly terminated and recreated with the same data mount, the replacement adopts the labeled execution, 
+    waits for it, restores dependencies, reports the result, and removes the artifact.
+
+
+    !!! note "Duplicate notifications"
+        This does not apply to `restart` mode. Notification delivery is best-effort at-least-once: a termination
+        after a notification is sent but before it is recorded can result in a duplicate notification. Keep a
+        single scheduler-enabled doco-cd instance per Docker host/context.
 
 ??? info "`one_off` behavior in Docker Swarm"
 
@@ -140,10 +173,6 @@ be created for each scheduled run and removed after completion.
     |------------------------------|----------------------|------------------------|
     | `restart`                    | Existing service     | Unchanged              |
     | `one_off`                    | Temporary clone      | Source unchanged       |
-
-??? warning "Deprecated: `one_shot` has been renamed to `one_off`"
-    `one_shot` has been renamed to `one_off` and will be removed in a future release.
-    Use `one_off` instead. The old value is still accepted for backward compatibility but will log a warning.
 
 ## Configuration
 
@@ -166,20 +195,23 @@ be created for each scheduled run and removed after completion.
 
 Use the following service labels to configure scheduled jobs:
 
-| Label                           | Type    | Description                                                                                                                                                                                 | Default   |
-|---------------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
-| `cd.doco.job.enabled`           | boolean | Enable scheduling for this service/container                                                                                                                                                | `false`   |
-| `cd.doco.job.schedule`          | string  | [Schedule format](#schedule-formats) to use                                                                                                                                                 |           |
-| `cd.doco.job.wait_running_jobs` | boolean | Override deploy-config-wide [`wait_running_jobs`](../Deploy-Settings.md#wait-for-running-scheduled-jobs-before-deployment) behavior for this job service during deployments                 | (inherit) |
-| `cd.doco.job.execution_mode`    | string  | [`restart`](#restart) (default behavior) or [`one_off`](#one_off) (ephemeral execution)                                                                                                     | `restart` |
-| `cd.doco.job.skip_running`      | boolean | Do not run the job if a previous scheduled run is still active/running                                                                                                                      | `false`   |
-| `cd.doco.job.notify_on`         | string  | [Notification](Notifications.md) behavior for scheduled runs: `none`, `success`, `failure`, `all`                                                                                           | `all`     |
-| `cd.doco.job.swarm.replicas`    | integer | Number of completions/concurrency for swarm one-off jobs in `replicated` [deploy mode](#swarm-deploymode)                                                                                   | `1`       |
-| `cd.doco.job.stop_services`     | string  | Comma-separated services to [temporarily stop during a job run](#temporarily-stop-services-during-a-job-run) (supports `service` and `project/service`; Swarm requires `execution_mode: one_off`) |           |
+| Label                               | Type    | Description                                                                                                                                                                                       | Default     |
+|-------------------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|
+| `cd.doco.job.enabled`               | boolean | Enable scheduling for this service/container                                                                                                                                                      | `false`     |
+| `cd.doco.job.schedule`              | string  | [Schedule format](#schedule-formats) to use                                                                                                                                                       |             |
+| `cd.doco.job.wait_running_jobs`     | boolean | Override deploy-config-wide [`wait_running_jobs`](../Deploy-Settings.md#wait-for-running-scheduled-jobs-before-deployment) behavior for this job service during deployments                       | (inherit)   |
+| `cd.doco.job.execution_mode`        | string  | [`restart`](#restart) (default behavior) or [`one_off`](#one_off) (ephemeral execution)                                                                                                           | `restart`   |
+| `cd.doco.job.skip_running`          | boolean | Do not run the job if a previous scheduled run is still active/running                                                                                                                            | `false`     |
+| `cd.doco.job.notify_on`             | string  | [Notification](Notifications.md) behavior for scheduled runs: `none`, `success`, `failure`, `all`                                                                                                 | `all`       |
+| `cd.doco.job.swarm.replicas`        | integer | Number of completions/concurrency for swarm one-off jobs in `replicated` [deploy mode](#swarm-deploymode)                                                                                         | `1`         |
+| `cd.doco.job.stop_services`         | string  | Comma-separated services to [temporarily stop during a job run](#temporarily-stop-services-during-a-job-run) (supports `service` and `project/service`; Swarm requires `execution_mode: one_off`) |             |
+| `cd.doco.job.stop_services.timeout` | integer | Timeout in seconds when stopping `stop_services` targets; see [stop timeout behavior](#stop-timeout-behavior)                                                                                     | (see below) |
 
 !!! note "Using scheduled jobs with multiple doco-cd instances"
-    `cd.doco.job.skip_running` only prevents overlapping runs within the same doco-cd process.
-    It does not coordinate scheduled runs across multiple doco-cd instances that share the same Docker host.
+    `cd.doco.job.skip_running` prevents overlapping runs within the same doco-cd process. For Swarm
+    `one_off` jobs, it also recognizes an active temporary execution left by a restarted process.
+    It does not coordinate simultaneously triggered runs across multiple doco-cd instances that share
+    the same Docker host.
 
     For multi-instance setups, prefer a single scheduler owner by disabling the scheduler on the other instances with [`SCHEDULER_ENABLED`](../App-Settings.md#:~:text=when%20not%20specified-,SCHEDULER_ENABLED,-boolean).
 
@@ -214,6 +246,8 @@ Behavior:
 - After the job finishes (success or failure), listed services are started again.
 - `service` targets the same project/stack as the job.
 - `project/service` targets another compose project (standalone) or stack (swarm).
+- Standalone compose: the [Compose lifecycle hooks](Pre-Post-Deployment-Scripts.md#when-doco-cd-runs-lifecycle-hooks) of the listed services run like with `docker compose stop` and `docker compose start`.
+  If a `pre_stop` hook fails, its container keeps running and the job does not run.
 
 !!! info "Execution mode support"
     `cd.doco.job.stop_services` is supported in both execution modes for **standalone compose**:
@@ -238,7 +272,33 @@ Behavior:
 ??? note "Concurrency and shared targets"
     While services are held stopped, doco-cd locks the job's own stack **and** every stack referenced by `cd.doco.job.stop_services`, so a concurrent deployment or another scheduled run cannot race with the reconciliation of those stacks.
 
-    If two scheduled jobs happen to list the same target service (e.g. two backup jobs sharing a cache), the target is only actually restarted once every job that stopped it has finished — it will not be brought back up prematurely while another job still needs it stopped.
+    If two scheduled jobs happen to list the same target service (e.g. two backup jobs sharing a cache), the target is only actually restarted once every job that stopped it has finished. It will not be brought back up prematurely while another job still needs it stopped.
+
+??? note "Stop window is not drift"
+    A service held stopped by a running job is doco-cd's own doing, so it is not treated as drift: reconciliation does not restart it, and a poll or webhook landing inside the stop window does not redeploy its stack because of the missing replicas. The suppression stays active for a short grace period after the service is started again.
+
+#### Stop timeout behavior
+
+By default, doco-cd honors each target's own configured shutdown grace period instead of a fixed timeout:
+
+- **Standalone compose**: the container's [`stop_grace_period`](https://docs.docker.com/reference/compose-file/services/#stop_grace_period) is respected, letting the Docker engine apply it natively. If the target has no `stop_grace_period` configured, a default of 30 seconds is used.
+- **Swarm**: the service's configured [`stop_grace_period`]([`stop_grace_period`](https://docs.docker.com/reference/compose-file/services/#stop_grace_period)), plus a small observation buffer, is used as the wait deadline so a long grace period is not treated as a timeout error prematurely. If unset, the default of 30 seconds is used.
+
+Set `cd.doco.job.stop_services.timeout` to a positive number of seconds to control the stop operation:
+
+- **Standalone compose**: overrides each target container's configured grace period.
+- **Swarm**: overrides how long doco-cd waits for tasks to stop. Swarm still applies the grace period embedded in each running task; doco-cd cannot rewrite that period during shutdown.
+
+```yaml title="docker-compose.yml"
+services:
+  backup:
+    labels:
+      cd.doco.job.enabled: "true"
+      cd.doco.job.schedule: "0 2 * * *"
+      cd.doco.job.execution_mode: "one_off"
+      cd.doco.job.stop_services: "db"
+      cd.doco.job.stop_services.timeout: "180"
+```
 
 ## Examples
 
@@ -291,6 +351,8 @@ When DST changes occur in the configured [timezone](#timezone), scheduled jobs w
 - If a scheduled time is skipped due to DST (e.g., clocks move forward), the job will not run at that time.
 - If a scheduled time occurs twice due to DST (e.g., clocks move backward), the job will run at both occurrences of that time.
 
-## Manual execution via Job API
+## Manual job execution
 
-Configured jobs can also be triggered manually outside their scheduled intervals by using the [Run Job API endpoint](../Endpoints/REST-API.md#scheduled-jobs).
+Scheduled jobs can also be triggered manually outside their schedule by using the [`Run Job` API endpoint](../Endpoints/REST-API.md#scheduled-jobs) or the [MCP server `trigger_scheduled_job` tool](../Endpoints/MCP-Server.md#available-tools).
+
+Manual execution does not consume or reschedule the next scheduled occurrence. For Compose `one_off` jobs, the job API reports the latest temporary execution's result even when the source container has never started and remains `created`.

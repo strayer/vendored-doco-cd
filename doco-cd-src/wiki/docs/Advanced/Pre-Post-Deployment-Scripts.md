@@ -88,22 +88,46 @@ services:
   
 - If you need commands from the app container, try to use the same image as your app container. Many app images also come with a shell (sh, ash, bash) 
 
+### Post-Init and Standalone One-Shot Services
+
+Services referenced by `#!yaml depends_on.condition: service_completed_successfully` are automatically treated as one-shot services.
+For a one-shot service that runs after another service or is not referenced by another service, add the `#!yaml cd.doco.deployment.one_shot: "true"` label:
+
+```yaml title="docker-compose.yml" hl_lines="14-15"
+services:
+  app:
+    image: backend
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 2s
+      timeout: 1s
+      retries: 10
+
+  post-init:  # Runs *after* the app service is healthy
+    image: backend
+    command: ["./create-initial-resources.sh"]
+    restart: on-failure:3
+    labels:
+      cd.doco.deployment.one_shot: "true"
+    depends_on:
+      app:
+        condition: service_healthy
+```
+
+Doco-CD waits for labeled one-shot services to exit.
+Exit code `0` completes the deployment successfully; a nonzero exit code fails the deployment.
+A one-shot service that does not finish before the deployment timeout also fails the deployment.
+
 ### Troubleshooting
 
 #### container exited (0)
 
-If the deployment fails with an error containing a message like `container <init-container-name> exited (0)`, try to add a short sleep at the end of the init container commands.
-This is a workaround for a known issue where the init container may exit before the main container starts waiting for it, causing the main container to miss the successful completion of the init container.
-Adding a short sleep ensures that the init container has time to exit properly before the main container checks its status.
+If a service is expected to exit successfully but the deployment reports `container <service-name> exited (0)`, make its lifecycle explicit:
 
-!!! example "Add a sleep command to the init container in your docker-compose.yml"
-     The sleep duration can be adjusted based on the expected time for the init commands to complete.
-    ```yaml title="docker-compose.yml"
-    entrypoint: ["/bin/sh", "-c"]
-    command: ["<your-commands-here> && sleep 3"] # (1)!
-    ```
+- For a pre-init service, reference it from the dependent service with `#!yaml condition: service_completed_successfully`
+- For a post-init or standalone service, add the `#!yaml cd.doco.deployment.one_shot: "true"` label.
 
-    1. Depending on the complexity of your init commands, you may need to adjust the sleep duration.
+Doco-cd evaluates declared one-shot services by their exit code even if they finish before the first status check.
 
 Related issue: [#1115](https://github.com/kimdre/doco-cd/issues/1115)
 
@@ -154,6 +178,41 @@ services:
 !!! info "Requires Docker Compose [2.30.0](https://github.com/docker/compose/releases/tag/v2.30.0) or later"
 
 Docker Compose lifecycle hooks allow you to run commands/scripts at specific points in the container lifecycle, such as before or after starting ([`pre_start`](https://docs.docker.com/reference/compose-file/services/#pre_start) and [`post_start`](https://docs.docker.com/reference/compose-file/services/#post_start)) or before stopping [`pre_stop`](https://docs.docker.com/reference/compose-file/services/#pre_stop) a container.
+
+### When doco-cd runs lifecycle hooks
+
+Deployments run the hooks through Docker Compose. doco-cd also stops, starts, and restarts containers of a
+deployed project outside of a deployment. For these operations, doco-cd runs the hooks of the deployed
+service definition with the same semantics as the matching Docker Compose command:
+
+| Operation (Docker Standalone)                                                                                  | Like                     | `pre_start` | `post_start` | `pre_stop` |
+|----------------------------------------------------------------------------------------------------------------|--------------------------|:-----------:|:------------:|:----------:|
+| [Scheduled job](Job-Scheduling.md#restart) start (`restart` mode)                                              | `docker compose start`   |      ✅      |      ✅       |     -      |
+| [Scheduled job](Job-Scheduling.md#restart) restart of a running container (`restart` mode)                     | `docker compose restart` |      ❌      |      ✅       |     ✅      |
+| [`stop_services`](Job-Scheduling.md#temporarily-stop-services-during-a-job-run) stop before a job              | `docker compose stop`    |      -      |      -       |     ✅      |
+| [`stop_services`](Job-Scheduling.md#temporarily-stop-services-during-a-job-run) start after a job              | `docker compose start`   |      ✅      |      ✅       |     -      |
+| [Reconciliation](../Deploy-Settings.md#reconciliation-settings) restart                                        | `docker compose restart` |      ❌      |      ✅       |     ✅      |
+
+- Like Docker Compose, `pre_start` hooks run only when no replica of the service is running.
+- A `pre_stop` hook is skipped if the container already stopped, for example after a `kill` event.
+- A failed `pre_stop` hook cancels the stop or restart of a scheduled job and of `stop_services`.
+  Reconciliation restarts the container anyway, because the restart is the recovery, and logs a warning.
+- After a failed `post_start` hook, the container keeps running. A scheduled job execution fails.
+  Reconciliation sends a warning [notification](Notifications.md) instead of the success notification.
+- Reconciliation waits at most 2 minutes for each group of hooks, because a hanging hook must not block other events of the repository.
+  A timeout stops waiting but does not terminate the hook process in the container.
+  Loading the service definition, including waiting for source locks, has the same limit.
+- doco-cd reloads the deployed service definition from the deployed revision to find the hooks.
+  The load also resolves the [external secrets](../External-Secrets/index.md) of the deployment.
+  If the definition cannot be loaded, for example for a container without doco-cd deployment labels, the operation continues without hooks.
+- doco-cd records the hook phases of each service in the `cd.doco.deployment.lifecycle_hooks` container label.
+  For a service without hooks, doco-cd does not load the definition.
+  Containers from doco-cd versions before this label do not have it, so doco-cd loads their definition until a deployment recreates them.
+- Swarm does not support lifecycle hooks.
+
+!!! warning "Project actions of the REST API and MCP server"
+    The `start`, `stop`, and `restart` project actions of the [REST API](../Endpoints/REST-API.md#compose-projects) and the
+    [MCP server](../Endpoints/MCP-Server.md) do not run lifecycle hooks yet.
 
 ### Example
 

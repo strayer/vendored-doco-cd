@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -15,13 +17,17 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 
+	"github.com/kimdre/doco-cd/internal/common/cronexpr"
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/config/poll"
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
+	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/reconciliation"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
+	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 	"github.com/kimdre/doco-cd/internal/test"
 
 	"github.com/kimdre/doco-cd/internal/git"
@@ -36,23 +42,61 @@ import (
 	"github.com/kimdre/doco-cd/internal/logger"
 )
 
+func TestPollConfigLogValueRedactsSensitiveFields(t *testing.T) {
+	t.Parallel()
+
+	const secret = "sentinel-secret"
+
+	var output bytes.Buffer
+
+	log := slog.New(slog.NewTextHandler(&output, nil))
+	config := poll.Config{
+		SourceUrl: "https://user:" + secret + "@example.com/repository.git",
+		Reference: "main",
+		Deployments: []*deploy.Config{{
+			Name:          "production",
+			RepositoryUrl: "https://user:" + secret + "@example.com/deployment.git",
+			Environment:   map[string]string{"TOKEN": secret},
+			ExternalSecrets: map[string]secrettypes.ExternalSecretRef{
+				"PASSWORD": {LegacyRef: secret},
+			},
+		}},
+	}
+
+	log.Info("polling", slog.Attr{Key: "config", Value: pollConfigLogValue(config)})
+
+	logged := output.String()
+
+	if strings.Contains(logged, secret) {
+		t.Fatalf("poll config log leaked secret: %q", logged)
+	}
+
+	if !strings.Contains(logged, "production") || !strings.Contains(logged, "reference:main") {
+		t.Fatalf("poll config log lost safe identifiers: %q", logged)
+	}
+}
+
 func TestPollHandlerAllowsConcurrentRunsForSameRepository(t *testing.T) {
 	log := logger.New(logger.LevelCritical)
 	started := make(chan notification.Metadata, 2)
 	release := make(chan struct{})
 
-	h := handlerData{
+	h := orchestrationHandler{
 		log: log,
-		runPoll: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
-			_ command.Cli, _ *slog.Logger, metadata notification.Metadata, _ *secretprovider.SecretProvider,
-			_ string,
-		) error {
-			started <- metadata
 
-			<-release
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, metadata notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				started <- metadata
 
-			return nil
-		},
+				<-release
+
+				return nil
+			},
+		}),
 	}
 
 	jobConfig := poll.Config{
@@ -114,6 +158,188 @@ func TestPollHandlerAllowsConcurrentRunsForSameRepository(t *testing.T) {
 	}
 }
 
+func TestPollHandlerRunOnceDoesNotStartLocalWatcher(t *testing.T) {
+	var output bytes.Buffer
+
+	log := &logger.Logger{
+		Logger: slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Level:  slog.LevelDebug,
+	}
+	srcPath := createLocalPollTestRepository(t)
+
+	h := orchestrationHandler{
+		log: log,
+
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				return nil
+			},
+		}),
+	}
+
+	pollJob := &poll.Job{Config: poll.Config{
+		Source:    config.SourceTypeGit,
+		SourceUrl: "file://" + srcPath,
+		Reference: "main",
+		RunOnce:   true,
+		Watch:     true,
+	}}
+	h.PollHandler(t.Context(), pollJob)
+
+	logged := output.String()
+	if strings.Contains(logged, "watching local repository for changes") {
+		t.Fatal("run_once poll started a local repository watcher")
+	}
+
+	if strings.Contains(logged, "falling back to safety-net poll interval") {
+		t.Fatal("run_once poll enabled watcher fallback polling")
+	}
+
+	if pollJob.NextRun != 0 {
+		t.Fatalf("run_once poll next run = %d, want 0", pollJob.NextRun)
+	}
+}
+
+func TestPollHandlerTracksCustomTarget(t *testing.T) {
+	log := logger.New(logger.LevelCritical)
+	h := orchestrationHandler{
+		log: log,
+
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				return nil
+			},
+		}),
+	}
+
+	h.PollHandler(t.Context(), &poll.Job{Config: poll.Config{
+		SourceUrl:    "https://github.com/kimdre/doco-cd_tests.git",
+		Reference:    "main",
+		CustomTarget: "prod-vm",
+		RunOnce:      true,
+	}})
+
+	runs := h.controlPlaneRuns.List(1, string(controlplane.RunTriggerPoll), "")
+	if len(runs) != 1 {
+		t.Fatalf("expected one tracked poll run, got %d", len(runs))
+	}
+
+	if runs[0].Target != "prod-vm" {
+		t.Fatalf("tracked target = %q, want %q", runs[0].Target, "prod-vm")
+	}
+}
+
+// TestWatcherClosedFallback deterministically covers both branches of the
+// watcher-closed handling: shutdown must stop the handler without the
+// fallback warning, while an unexpected watcher death must log the warning
+// and select the configured or safety-net interval.
+func TestWatcherClosedFallback(t *testing.T) {
+	t.Parallel()
+
+	for _, testCase := range []struct {
+		name         string
+		cancelled    bool
+		interval     time.Duration
+		wantStop     bool
+		wantInterval time.Duration
+		wantWarning  bool
+	}{
+		{name: "shutdown stops without fallback", cancelled: true, interval: 0, wantStop: true},
+		{name: "unexpected close falls back to safety net", interval: 0, wantInterval: pollWatcherlessFallbackInterval, wantWarning: true},
+		{name: "unexpected close keeps configured interval", interval: 5 * time.Minute, wantInterval: 5 * time.Minute, wantWarning: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := t.Context()
+			if testCase.cancelled {
+				cancelledCtx, cancel := context.WithCancel(ctx)
+				cancel()
+
+				ctx = cancelledCtx
+			}
+
+			var output bytes.Buffer
+
+			log := slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			gotInterval, gotStop := watcherClosedFallback(ctx, log, testCase.interval)
+			if gotStop != testCase.wantStop {
+				t.Fatalf("stop = %t, want %t", gotStop, testCase.wantStop)
+			}
+
+			if !gotStop && gotInterval != testCase.wantInterval {
+				t.Fatalf("interval = %s, want %s", gotInterval, testCase.wantInterval)
+			}
+
+			warned := strings.Contains(output.String(), "local repository watcher closed, continuing with interval polling")
+			if warned != testCase.wantWarning {
+				t.Fatalf("warning logged = %t, want %t: %q", warned, testCase.wantWarning, output.String())
+			}
+		})
+	}
+}
+
+func TestPollHandlerShutdownDoesNotEnableWatcherFallback(t *testing.T) {
+	for range 20 {
+		var output bytes.Buffer
+
+		log := &logger.Logger{
+			Logger: slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})),
+			Level:  slog.LevelDebug,
+		}
+		srcPath := createLocalPollTestRepository(t)
+		started := make(chan struct{})
+		release := make(chan struct{})
+		h := orchestrationHandler{
+			log: log,
+
+			controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+				log: log,
+				pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+					_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+					_ string,
+				) error {
+					close(started)
+					<-release
+
+					return nil
+				},
+			}),
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan struct{})
+
+		go func() {
+			defer close(done)
+
+			h.PollHandler(ctx, &poll.Job{Config: poll.Config{
+				Source:    config.SourceTypeGit,
+				SourceUrl: "file://" + srcPath,
+				Reference: "main",
+				Watch:     true,
+			}})
+		}()
+
+		<-started
+		cancel()
+		close(release)
+		<-done
+
+		if strings.Contains(output.String(), "local repository watcher closed, continuing with interval polling") {
+			t.Fatal("application shutdown enabled watcher fallback polling")
+		}
+	}
+}
+
 func TestRunPoll(t *testing.T) {
 	encryption.SetupAgeKeyEnvVar(t)
 
@@ -129,7 +355,7 @@ func TestRunPoll(t *testing.T) {
 
 	stackName := test.ConvertTestName(t.Name())
 
-	if swarm.GetModeEnabled() {
+	if SwarmModeEnabled {
 		pollConfig.Reference = git.SwarmModeBranch
 
 		t.Log("Testing in Swarm mode, using 'swarm-mode' reference")
@@ -139,6 +365,8 @@ func TestRunPoll(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	useConfiguredGitAuth(t, appConfig)
 
 	appConfig.GitCommitStatus = false
 
@@ -191,7 +419,7 @@ func TestRunPoll(t *testing.T) {
 	})
 
 	t.Cleanup(func() {
-		if swarm.GetModeEnabled() {
+		if SwarmModeEnabled {
 			err = docker.RemoveSwarmStack(ctx, dockerCli, stackName)
 		} else {
 			err = service.Down(ctx, stackName, downOpts)
@@ -209,14 +437,20 @@ func TestRunPoll(t *testing.T) {
 	}
 
 	// Run initial poll
-	if err := RunPoll(ctx, pollConfig, appConfig, dataMountPoint, dockerCli, log.With(), metadata, &secretProvider, pollTriggerDefault); err != nil {
+	deployment := newTestDeployment(t, appConfig, dataMountPoint, reconciliation.Dependencies{
+		AppConfig:      appConfig,
+		DataMountPoint: dataMountPoint,
+		DockerCLI:      dockerCli,
+		SecretProvider: secretProvider,
+	})
+	if err := RunPoll(ctx, pollConfig, appConfig, log.With(), metadata, pollTriggerDefault, deployment, newTestNotifier(t)); err != nil {
 		t.Fatalf("Initial poll deployment failed: %v", err)
 	}
 
 	pollConfig.Reference = "destroy"
 
 	// Run the second poll to destroy
-	if err := RunPoll(ctx, pollConfig, appConfig, dataMountPoint, dockerCli, log.With(), metadata, &secretProvider, pollTriggerDefault); err != nil {
+	if err := RunPoll(ctx, pollConfig, appConfig, log.With(), metadata, pollTriggerDefault, deployment, newTestNotifier(t)); err != nil {
 		t.Fatalf("Second poll deployment failed: %v", err)
 	}
 }
@@ -231,16 +465,20 @@ func TestPollHandlerFallsBackWhenWatcherFailsWithZeroInterval(t *testing.T) {
 
 	var runCount atomic.Int32
 
-	h := handlerData{
+	h := orchestrationHandler{
 		log: log,
-		runPoll: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
-			_ command.Cli, _ *slog.Logger, _ notification.Metadata, _ *secretprovider.SecretProvider,
-			_ string,
-		) error {
-			runCount.Add(1)
 
-			return nil
-		},
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				runCount.Add(1)
+
+				return nil
+			},
+		}),
 	}
 
 	jobConfig := poll.Config{
@@ -307,16 +545,20 @@ func TestPollHandlerReportsWatchTriggerReason(t *testing.T) {
 
 	reasons := make(chan string, 10)
 
-	h := handlerData{
+	h := orchestrationHandler{
 		log: log,
-		runPoll: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
-			_ command.Cli, _ *slog.Logger, _ notification.Metadata, _ *secretprovider.SecretProvider,
-			triggerReason string,
-		) error {
-			reasons <- triggerReason
 
-			return nil
-		},
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				triggerReason string,
+			) error {
+				reasons <- triggerReason
+
+				return nil
+			},
+		}),
 	}
 
 	jobConfig := poll.Config{
@@ -350,6 +592,44 @@ func TestPollHandlerReportsWatchTriggerReason(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for watch-triggered poll run")
 	}
+}
+
+func createLocalPollTestRepository(t *testing.T) string {
+	t.Helper()
+
+	srcPath := t.TempDir()
+
+	repo, err := gogit.PlainInit(srcPath, false)
+	if err != nil {
+		t.Fatalf("init repo: %v", err)
+	}
+
+	if err := repo.Storer.SetReference(plumbing.NewSymbolicReference(plumbing.HEAD, plumbing.NewBranchReferenceName("main"))); err != nil {
+		t.Fatalf("set HEAD: %v", err)
+	}
+
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatalf("worktree: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(srcPath, "initial.txt"), []byte("initial\n"), 0o600); err != nil {
+		t.Fatalf("write initial file: %v", err)
+	}
+
+	if _, err := wt.Add("initial.txt"); err != nil {
+		t.Fatalf("add initial file: %v", err)
+	}
+
+	if _, err := wt.Commit("initial commit", &gogit.CommitOptions{Author: &object.Signature{
+		Name:  "test",
+		Email: "test@example.com",
+		When:  time.Now(),
+	}}); err != nil {
+		t.Fatalf("commit initial file: %v", err)
+	}
+
+	return srcPath
 }
 
 // TestPollHandlerWatchDisabledFallsBackTo24h verifies that setting
@@ -391,16 +671,20 @@ func TestPollHandlerWatchDisabledFallsBackTo24h(t *testing.T) {
 
 	var runCount atomic.Int32
 
-	h := handlerData{
+	h := orchestrationHandler{
 		log: log,
-		runPoll: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
-			_ command.Cli, _ *slog.Logger, _ notification.Metadata, _ *secretprovider.SecretProvider,
-			_ string,
-		) error {
-			runCount.Add(1)
 
-			return nil
-		},
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				runCount.Add(1)
+
+				return nil
+			},
+		}),
 	}
 
 	jobConfig := poll.Config{
@@ -463,16 +747,20 @@ func TestPollHandlerWatcherOnlyModeHasNoPeriodicFallback(t *testing.T) {
 
 	var runCount atomic.Int32
 
-	h := handlerData{
+	h := orchestrationHandler{
 		log: log,
-		runPoll: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
-			_ command.Cli, _ *slog.Logger, _ notification.Metadata, _ *secretprovider.SecretProvider,
-			_ string,
-		) error {
-			runCount.Add(1)
 
-			return nil
-		},
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				runCount.Add(1)
+
+				return nil
+			},
+		}),
 	}
 
 	jobConfig := poll.Config{
@@ -490,5 +778,163 @@ func TestPollHandlerWatcherOnlyModeHasNoPeriodicFallback(t *testing.T) {
 
 	if got := runCount.Load(); got != 1 {
 		t.Fatalf("expected exactly 1 run (startup only, no periodic fallback) with a working watcher and no interval, got %d", got)
+	}
+}
+
+func TestPollNextDelay(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 5, 10, 7, 30, 0, time.UTC)
+
+	quarterHourly, err := cronexpr.Parse("*/15 * * * *", time.UTC)
+	if err != nil {
+		t.Fatalf("Parse() failed: %v", err)
+	}
+
+	if got, want := pollNextDelay(quarterHourly, 0, now), 7*time.Minute+30*time.Second; got != want {
+		t.Fatalf("pollNextDelay(schedule) = %s, want %s", got, want)
+	}
+
+	if got, want := pollNextDelay(nil, 3*time.Minute, now), 3*time.Minute; got != want {
+		t.Fatalf("pollNextDelay(interval) = %s, want %s", got, want)
+	}
+
+	if got := pollNextDelay(nil, 0, now); got != 0 {
+		t.Fatalf("pollNextDelay(watcher-only) = %s, want 0", got)
+	}
+}
+
+func TestPollHandlerScheduleSkipsStartupRunAndWatcher(t *testing.T) {
+	var output bytes.Buffer
+
+	log := &logger.Logger{
+		Logger: slog.New(slog.NewTextHandler(&output, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		Level:  slog.LevelDebug,
+	}
+	srcPath := createLocalPollTestRepository(t)
+
+	var runCount atomic.Int32
+
+	h := orchestrationHandler{
+		log: log,
+
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				runCount.Add(1)
+
+				return nil
+			},
+		}),
+	}
+
+	pollJob := &poll.Job{Config: poll.Config{
+		Source:    config.SourceTypeGit,
+		SourceUrl: "file://" + srcPath,
+		Reference: "main",
+		Schedule:  "@every 1h",
+		Watch:     true,
+	}}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+
+	h.PollHandler(ctx, pollJob)
+
+	if got := runCount.Load(); got != 0 {
+		t.Fatalf("scheduled poll ran %d times before its first occurrence, want 0", got)
+	}
+
+	if pollJob.NextRun == 0 {
+		t.Fatal("scheduled poll did not record its next run")
+	}
+
+	logged := output.String()
+	if strings.Contains(logged, "watching local repository for changes") {
+		t.Fatal("scheduled poll started a local repository watcher")
+	}
+
+	if !strings.Contains(logged, "local repository watcher disabled because a poll schedule is set") {
+		t.Fatal("scheduled poll did not log that the watcher is disabled")
+	}
+}
+
+func TestPollHandlerRunOnceIgnoresSchedule(t *testing.T) {
+	log := logger.New(logger.LevelCritical)
+
+	var runCount atomic.Int32
+
+	h := orchestrationHandler{
+		log: log,
+
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			log: log,
+			pollRunner: func(_ context.Context, _ poll.Config, _ *app.Config, _ container.MountPoint,
+				_ command.Cli, _ *docker.ContextRegistry, _ *slog.Logger, _ notification.Metadata, _ secretprovider.SecretProvider,
+				_ string,
+			) error {
+				runCount.Add(1)
+
+				return nil
+			},
+		}),
+	}
+
+	h.PollHandler(t.Context(), &poll.Job{Config: poll.Config{
+		SourceUrl: "https://github.com/kimdre/doco-cd_tests.git",
+		Reference: "main",
+		Schedule:  "@yearly",
+		RunOnce:   true,
+	}})
+
+	if got := runCount.Load(); got != 1 {
+		t.Fatalf("run_once poll with schedule ran %d times, want 1", got)
+	}
+}
+
+func TestStartPollKeepsScheduledJobWithoutInterval(t *testing.T) {
+	log := logger.New(logger.LevelCritical)
+
+	h := &orchestrationHandler{
+		log: log,
+
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{log: log}),
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+
+	var wg sync.WaitGroup
+
+	err := StartPoll(ctx, h, poll.Config{
+		SourceUrl: "https://github.com/kimdre/doco-cd_tests.git",
+		Reference: "main",
+		Schedule:  "@yearly",
+	}, &wg)
+	if err != nil {
+		t.Fatalf("StartPoll() failed: %v", err)
+	}
+
+	done := make(chan struct{})
+
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("scheduled poll job exited immediately, want it to wait for its schedule")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("scheduled poll job did not stop after cancellation")
 	}
 }

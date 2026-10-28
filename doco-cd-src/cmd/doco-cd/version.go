@@ -80,8 +80,23 @@ func getLatestAppReleaseVersionFromURL(releaseApiURL string, httpClient *http.Cl
 	return "", errors.New("no stable release found")
 }
 
-func notificationForNewAppVersion(log *slog.Logger) {
-	latestVersion, err := getLatestAppReleaseVersion()
+// notificationForNewAppVersion sends a notification if a new version of the application is available.
+func notificationForNewAppVersion(log *slog.Logger, notifier notification.Sender, enabled bool) {
+	notificationForNewAppVersionWithLookup(log, notifier, enabled, getLatestAppReleaseVersion)
+}
+
+// notificationForNewAppVersionWithLookup sends a notification if a new version of the application is available.
+func notificationForNewAppVersionWithLookup(
+	log *slog.Logger,
+	notifier notification.Sender,
+	enabled bool,
+	lookup func() (string, error),
+) {
+	if !enabled {
+		return
+	}
+
+	latestVersion, err := lookup()
 	if err != nil {
 		log.Error("failed to get latest application release version", logger.ErrAttr(err))
 	} else {
@@ -94,7 +109,7 @@ func notificationForNewAppVersion(log *slog.Logger) {
 			// App-level ping, not a deployment: it carries no stack/context/revision,
 			// so skip any custom body template and use the built-in body (just the
 			// message). Otherwise a deploy-shaped template renders empty fields.
-			err = notification.Send(notification.Info,
+			err = notifier.Send(notification.Info,
 				"New version of doco-cd is available",
 				fmt.Sprintf("Current Version: %s\nLatest Version: %s\n\nhttps://github.com/kimdre/doco-cd/releases", app.Version, latestVersion),
 				notification.Metadata{},

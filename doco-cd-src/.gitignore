@@ -13,12 +13,18 @@ bin/
 *.dll
 *.so
 *.dylib
+# anchored: a bare "doco-cd" also ignores the cmd/doco-cd/ directory
+/doco-cd
+/out/
 
 # Test binary, built with `go test -c`
 *.test
 
 # Output of the go coverage tool, specifically when used with LiteIDE
 *.out
+
+# Go profiling files
+*.pb.gz
 
 # Dependency directories (remove the comment below to include it)
 # vendor/
@@ -33,6 +39,9 @@ ed25519
 
 *.env
 .env
+# examples and e2e fixtures commit their env files on purpose (cleartext non-secret config)
+!examples/**/*.env
+!test/e2e/scenarios/**/*.env
 
 cover.out
 cover.html
@@ -43,3 +52,14 @@ git-auth-domains.yaml
 # Agents/Copilot files
 issue.md
 .github/AGENTS.md
+.github/mcp.json
+
+# e2e harness scratch dir
+test/e2e/.work/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated documentation schema
+/wiki/docs/schemas/deploy.schema.json

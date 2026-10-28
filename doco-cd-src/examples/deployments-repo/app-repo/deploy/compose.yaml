@@ -1,0 +1,25 @@
+# One compose, every env. Lives here in the app repo; each env includes it at a
+# pinned sha.
+#
+# Everything env-specific arrives as an interpolation var from .doco-cd.<host>.yml.
+# Relative paths resolve against the including stub's directory, so ./env/app.env
+# is that env's own file.
+services:
+  shop-be:
+    image: ${REGISTRY}/shop-be:${SHOP_BE_TAG}
+    restart: unless-stopped
+    ports:
+      - "80:8080"
+    environment:
+      DOMAIN: ${DOMAIN}
+    env_file:
+      - ./env/app.env
+      - ./secrets/app.sops.env   # decrypted by the daemon
+    post_start:
+      - command: ["/post-update.sh"]   # migrations etc., inside the container
+    healthcheck:
+      test: ["CMD", "/shop-be", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

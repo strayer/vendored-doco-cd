@@ -1,13 +1,23 @@
 GO_BIN?=$(shell pwd)/.bin
 BINARY_DIR=bin
 BINARY_NAME=doco-cd
-.PHONY: test test-verbose test-coverage test-run build build-bitwarden fmt lint update update-all download tools compose-up compose-down wiki-tools wiki-build wiki-serve wiki-version-publish
+
+.PHONY: test test-verbose test-coverage test-run test-e2e build build-bitwarden fmt lint update update-all download tools compose-up compose-down wiki-tools wiki-build wiki-serve wiki-version-publish
 
 .DEFAULT_GOAL := build
 
 ifneq (,$(wildcard ./.env))
     include .env
     export
+
+    # Make keeps quotes as part of a value. Strip one matching pair of single or
+    # double quotes like Docker Compose does, so quoted and unquoted values both work.
+    dotenv_space := $(subst ,, )
+    dotenv_mark := @@SPACE@@
+    dotenv_strip = $(if $(filter "%",$(1)),$(patsubst "%",%,$(1)),$(patsubst '%',%,$(1)))
+    dotenv_unquote = $(subst $(dotenv_mark),$(dotenv_space),$(call dotenv_strip,$(subst $(dotenv_space),$(dotenv_mark),$($(1)))))
+    dotenv_vars := $(shell sed -nE 's/^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)[[:space:]]*=.*/\2/p' .env)
+    $(foreach var,$(dotenv_vars),$(eval $(var):=$(subst $$,$$$$,$(call dotenv_unquote,$(var)))))
 endif
 
 BUILD_FLAGS:=
@@ -45,6 +55,11 @@ test-run:
 	@echo "Running tests: $(filter-out $@,$(MAKECMDGOALS))"
 	@WEBHOOK_SECRET="test_Secret1" API_SECRET="test_apiSecret1" ${COMPILER} go test ${BUILD_FLAGS} -cover ./... -timeout 10m -run $(filter-out $@,$(MAKECMDGOALS))
 
+# Run e2e scenarios against a real doco-cd built from the working tree.
+# Optionally filter scenarios: make test-e2e E2E_RUN=TestFailedDeployRetry
+test-e2e:
+	@go test -tags e2e ./test/e2e/... -v -timeout 30m -run '$(E2E_RUN)'
+
 build:
 	@echo "Building without bitwarden integration (no CGO)..."
 	mkdir -p $(BINARY_DIR)
@@ -57,7 +72,7 @@ build-bitwarden:
 
 lint fmt:
 	${GO_BIN}/golangci-lint run --fix ./...
-	@go fix ./...
+	go fix ./...
 
 update:
 	git pull origin main
@@ -111,4 +126,4 @@ wiki-tools:
 	.venv-wiki/bin/python -m pip install -r wiki/requirements.txt
 
 wiki-serve:
-	.venv-wiki/bin/zensical serve --config-file wiki/zensical.toml
+	PYTHONPATH=wiki .venv-wiki/bin/zensical serve --config-file wiki/zensical.toml

@@ -1,13 +1,16 @@
 package docker
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"reflect"
+	"path/filepath"
 	"strings"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/opencontainers/go-digest"
+
+	"github.com/kimdre/doco-cd/internal/common/types/clone"
 )
 
 // isScaledToZero reports whether a service is configured to run 0 replicas
@@ -17,65 +20,6 @@ import (
 // state is expected and must not be treated as drift.
 func isScaledToZero(svc types.ServiceConfig) bool {
 	return svc.GetScale() == 0
-}
-
-// deepCopy recursively copies src into dst using reflection.
-func deepCopy(dst, src reflect.Value) {
-	switch src.Kind() {
-	case reflect.Pointer:
-		if src.IsNil() {
-			return
-		}
-
-		dst.Set(reflect.New(src.Elem().Type()))
-		deepCopy(dst.Elem(), src.Elem())
-	case reflect.Struct:
-		for i := 0; i < src.NumField(); i++ {
-			field := src.Type().Field(i)
-			if field.PkgPath != "" { // unexported field
-				continue
-			}
-
-			deepCopy(dst.Field(i), src.Field(i))
-		}
-	case reflect.Slice:
-		if src.IsNil() {
-			return
-		}
-
-		dst.Set(reflect.MakeSlice(src.Type(), src.Len(), src.Cap()))
-
-		for i := 0; i < src.Len(); i++ {
-			deepCopy(dst.Index(i), src.Index(i))
-		}
-	case reflect.Map:
-		if src.IsNil() {
-			return
-		}
-
-		dst.Set(reflect.MakeMapWithSize(src.Type(), src.Len()))
-
-		for _, key := range src.MapKeys() {
-			val := reflect.New(src.MapIndex(key).Type()).Elem()
-			deepCopy(val, src.MapIndex(key))
-			dst.SetMapIndex(key, val)
-		}
-	default:
-		dst.Set(src)
-	}
-}
-
-// copyProject creates a deep copy of the given project struct by marshaling it to JSON and unmarshalling it back to a new struct.
-// This is necessary because some fields in the compose types are pointers, and we want to avoid modifying the original struct when adding labels.
-func copyProject(orig *types.Project) *types.Project {
-	if orig == nil {
-		return nil
-	}
-
-	clone := &types.Project{}
-	deepCopy(reflect.ValueOf(clone).Elem(), reflect.ValueOf(orig).Elem())
-
-	return clone
 }
 
 // behaviorLabelPrefixes lists the cd.doco.* label prefixes that configure behaviour and
@@ -105,7 +49,7 @@ func shouldIgnoreLabelInProjectHash(label string) bool {
 }
 
 // WithNormalizedEnvValues returns a copy of the project where any service
-// environment value or top-level config content matching a key in normMap is
+// environment value or top-level config/secret content matching a key in normMap is
 // replaced with the corresponding placeholder. Use this to produce a stable
 // project hash when secrets are re-issued on every resolution (e.g. pki-role certs),
 // so the hash only changes when the ref itself changes.
@@ -114,7 +58,7 @@ func WithNormalizedEnvValues(p *types.Project, normMap map[string]string) *types
 		return p
 	}
 
-	pCopy := copyProject(p)
+	pCopy := clone.New(p)
 
 	for name, svc := range pCopy.Services {
 		changed := false
@@ -143,12 +87,49 @@ func WithNormalizedEnvValues(p *types.Project, normMap map[string]string) *types
 		}
 	}
 
+	for secretName, secret := range pCopy.Secrets {
+		if placeholder, ok := normMap[secret.Content]; ok {
+			secret.Content = placeholder
+			pCopy.Secrets[secretName] = secret
+		}
+	}
+
 	return pCopy
 }
 
+// sourceRootPlaceholder replaces the on-disk source root inside hashed project data.
+//
+// Compose resolves every relative path in a project file (bind mount sources, env_file,
+// config/secret files, build contexts, …) against the directory the project was loaded
+// from. That directory is revision scoped (…/artifacts/<revision>/…), so the resolved
+// absolute paths change with every new commit even when the stack itself is untouched.
+// Replacing the source root with a fixed token keeps the hash tied to the project's
+// content instead of to the revision it happens to be published under.
+const sourceRootPlaceholder = "/__doco_cd_source_root__"
+
+// normalizeSourceRoot rewrites every occurrence of sourceRoot in the marshaled project
+// to sourceRootPlaceholder. It is a no-op for an empty, relative or filesystem root path.
+func normalizeSourceRoot(b []byte, sourceRoot string) []byte {
+	root := strings.TrimSpace(sourceRoot)
+	if root == "" {
+		return b
+	}
+
+	root = filepath.Clean(root)
+	if !filepath.IsAbs(root) || root == string(filepath.Separator) {
+		return b
+	}
+
+	return bytes.ReplaceAll(b, []byte(root), []byte(sourceRootPlaceholder))
+}
+
 // ProjectHash generates a SHA256 hash of the project configuration to be used for detecting changes in the project that may require a redeployment.
-func ProjectHash(p *types.Project) (string, error) {
-	pCopy := copyProject(p)
+//
+// sourceRoot is the on-disk directory the project was loaded from. When set, absolute
+// paths below it are normalized so the hash stays stable across revisions of the same
+// unchanged stack.
+func ProjectHash(p *types.Project, sourceRoot string) (string, error) {
+	pCopy := clone.New(p)
 
 	// Services scaled to zero never create containers, so they must not affect restart-time hash checks.
 	for name, svc := range pCopy.Services {
@@ -189,5 +170,5 @@ func ProjectHash(p *types.Project) (string, error) {
 		return "", fmt.Errorf("failed to marshal project for hashing: %w", err)
 	}
 
-	return digest.SHA256.FromBytes(b).Encoded(), nil
+	return digest.SHA256.FromBytes(normalizeSourceRoot(b, sourceRoot)).Encoded(), nil
 }

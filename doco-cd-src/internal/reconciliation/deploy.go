@@ -5,224 +5,290 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/docker/cli/cli/command"
-	"github.com/moby/moby/api/types/container"
 
+	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/common/validation"
 	"github.com/kimdre/doco-cd/internal/config"
-	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
-	dockerSwarm "github.com/kimdre/doco-cd/internal/docker/swarm"
 
 	"github.com/kimdre/doco-cd/internal/logger"
-	"github.com/kimdre/doco-cd/internal/notification"
-	"github.com/kimdre/doco-cd/internal/secretprovider"
+	"github.com/kimdre/doco-cd/internal/prometheus"
+	"github.com/kimdre/doco-cd/internal/selfupdate"
 	"github.com/kimdre/doco-cd/internal/stages"
 	"github.com/kimdre/doco-cd/internal/test"
-	"github.com/kimdre/doco-cd/internal/webhook"
 )
 
 var ErrOCIArtifactNotVerified = errors.New("OCI artifact is not verified")
 
-func Deploy(ctx context.Context,
-	jobLog *slog.Logger,
-	appConfig *app.Config,
-	dataMountPoint container.MountPoint,
-	dockerCli command.Cli,
-	secretProvider *secretprovider.SecretProvider,
-	metadata notification.Metadata,
-	jobTrigger stages.JobTrigger,
-	repoData stages.RepositoryData,
-	deployConfigs []*deployConfig.Config,
-	payload *webhook.ParsedPayload,
-	testName string,
-) error {
-	err := deploy(ctx, jobLog, appConfig,
-		dataMountPoint, dockerCli, secretProvider, metadata,
-		jobTrigger, repoData, deployConfigs, payload, testName)
+// Deploy validates req and runs a reconciliation deployment using the Manager's stable
+// dependencies (app config, Docker CLI, context registry, secret provider) together with req's
+// per-run trigger, repository, deploy configs, and notification metadata. Unless req.TestName is
+// set, it also registers a long-lived reconciliation job that watches for drift after the
+// initial deployment.
+func (m *Manager) Deploy(ctx context.Context, req DeployRequest) error {
+	if m == nil {
+		return errors.New("reconciliation manager is required")
+	}
+
+	if err := m.beginDeploy(); err != nil {
+		return err
+	}
+	defer m.deployWG.Done()
+
+	if err := validation.Validate(req); err != nil {
+		return fmt.Errorf("validate deploy request: %w", err)
+	}
+
+	// An unverified artifact must not change the observed pause intent or run cleanup.
+	if req.Repository.Source == config.SourceTypeOCI && !req.Repository.OCITrusted {
+		return fmt.Errorf("%w: refusing to use its deployment configuration before trust-policy verification", ErrOCIArtifactNotVerified)
+	}
+
+	req.pauseGeneration = m.observePause(req)
+	m.cancelCleanupRetry(req)
+
+	// Sync windows are evaluated once for the whole request, see syncWindowGate.
+	gate := m.newSyncWindowGate(req, time.Now())
+
+	results, err := m.deploy(ctx, req, gate)
 
 	// Skip long-lived reconciliation listeners for test-triggered deployments.
 	// Test runs use testName only to make stacks unique and do not need background
 	// Docker event watchers that can outlive the test and race with TempDir cleanup.
-	if testName == "" {
-		reconciliationHandler.addJob(ctx, jobInfo{
-			appConfig:      appConfig,
-			dataMountPoint: dataMountPoint,
-			dockerCli:      dockerCli,
-			secretProvider: secretProvider,
-			jobLog:         jobLog,
-			metadata:       metadata,
-			jobTrigger:     jobTrigger,
-			repoData:       repoData,
-			deployConfigs:  deployConfigs,
-			payload:        payload,
-			testName:       testName,
-		})
+	if req.TestName == "" {
+		if m.newerPauseObservation(req) {
+			// Keep the newer control intent, but remember operations admitted
+			// before it that actually completed.
+			completed := make(map[*deployConfig.Config]struct{})
+
+			for _, result := range results {
+				if result.err == nil && !result.config.Destroy.Enabled {
+					completed[result.config] = struct{}{}
+				}
+			}
+
+			if len(completed) == 0 {
+				return err
+			}
+
+			m.addJob(ctx, req, gate.deferred(), completed)
+
+			return err
+		}
+
+		m.addJob(ctx, req, gate.deferred(), successfulForcedDeployments(results))
 	}
 
 	return err
 }
 
-func deploy(ctx context.Context,
-	jobLog *slog.Logger,
-	appConfig *app.Config,
-	dataMountPoint container.MountPoint,
-	dockerCli command.Cli,
-	secretProvider *secretprovider.SecretProvider,
-	metadata notification.Metadata,
-	jobTrigger stages.JobTrigger,
-	repoData stages.RepositoryData,
-	deployConfigs []*deployConfig.Config,
-	payload *webhook.ParsedPayload,
-	testName string,
-) error {
-	if repoData.Source == config.SourceTypeOCI && !repoData.OCITrusted {
-		return fmt.Errorf("%w: refusing to run reconciliation cleanup before trust-policy verification", ErrOCIArtifactNotVerified)
+func (m *Manager) deploy(ctx context.Context, req DeployRequest, gate *syncWindowGate) ([]stackResult, error) {
+	pending, cleanupErr := m.cleanupObsolete(ctx, req, gate)
+	m.scheduleCleanupRetry(ctx, req, pending || cleanupErr != nil)
+
+	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, m.activeDeployConfigs(req))
+
+	results, err := m.deployWithContexts(ctx, req, contextCLIs, gate)
+	if cleanupErr != nil && errors.Is(err, stages.ErrSkipDeployment) {
+		return results, cleanupErr
 	}
 
-	configsByContext := map[string][]*deployConfig.Config{}
+	return results, errors.Join(cleanupErr, err)
+}
 
-	for _, dc := range deployConfigs {
-		contextName := strings.TrimSpace(dc.Context)
+func (m *Manager) cleanupObsolete(ctx context.Context, req DeployRequest, gate *syncWindowGate) (bool, error) {
+	if req.Repository.Source == config.SourceTypeOCI && !req.Repository.OCITrusted {
+		return false, fmt.Errorf("%w: refusing to run reconciliation cleanup before trust-policy verification", ErrOCIArtifactNotVerified)
+	}
+
+	if m.cleanupRetrySuperseded(req) {
+		return false, nil
+	}
+
+	cleanupReq := m.currentCleanupRequest(req)
+	configsByContext := map[string][]*deployConfig.Config{}
+	contextConfigs := m.activeDeployConfigs(req)
+
+	for _, origin := range cleanupReq.AutoDiscoveryOrigins {
+		if !origin.Pause {
+			contextConfigs = append(contextConfigs, &deployConfig.Config{Context: origin.Context})
+		}
+	}
+
+	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, contextConfigs)
+
+	for _, dc := range cleanupReq.DeployConfigs {
+		contextName := docker.NormalizeContextName(dc.Context)
 		configsByContext[contextName] = append(configsByContext[contextName], dc)
 	}
 
-	dockerQuiet := false
-	if appConfig != nil {
-		dockerQuiet = appConfig.DockerQuietDeploy
+	for _, origin := range cleanupReq.AutoDiscoveryOrigins {
+		contextName := docker.NormalizeContextName(origin.Context)
+		if _, exists := configsByContext[contextName]; !exists {
+			configsByContext[contextName] = nil
+		}
 	}
 
+	var (
+		pending bool
+		errs    []error
+	)
+
 	for contextName, groupedConfigs := range configsByContext {
-		cleanupCli, closeFn, err := dockerCliForContext(dockerCli, dockerQuiet, contextName)
-		if err != nil {
+		entry, available := contextCLIs[contextName]
+		if !available {
+			continue
+		}
+
+		if entry.err != nil {
 			// Isolate per-context failures: an unreachable context must not block
 			// cleanup/deploy for other (healthy) contexts. handleDeploy below fails
 			// only the affected deployments.
-			jobLog.Error("failed to create docker client for context, skipping cleanup for it",
-				slog.String("context", contextName), logger.ErrAttr(err))
+			req.Logger.Error("failed to create docker client for context, skipping cleanup for it",
+				slog.String("context", docker.DisplayContextName(contextName)), logger.ErrAttr(entry.err))
+
+			errs = append(errs, fmt.Errorf("cleanup context %q: %w", contextName, entry.err))
 
 			continue
 		}
 
-		// For the default context use the globally cached swarm mode; for a custom
-		// context probe the remote daemon directly.
-		var cleanupSwarmMode bool
-		if contextName == "" {
-			cleanupSwarmMode = dockerSwarm.GetModeEnabled()
-		} else {
-			cleanupSwarmMode, err = dockerSwarm.ResolveModeEnabled(ctx, cleanupCli.Client())
-			if err != nil {
-				jobLog.Error("failed to check swarm mode for context, skipping cleanup for it",
-					slog.String("context", contextName), logger.ErrAttr(err))
+		modes := groupDeployConfigsByMode(groupedConfigs, entry.swarmMode)
 
-				if closeFn != nil {
-					closeFn()
-				}
-
+		for _, origin := range cleanupReq.AutoDiscoveryOrigins {
+			if docker.NormalizeContextName(origin.Context) != contextName || origin.Pause {
 				continue
 			}
-		}
+			// Removed children can remain in either mode after a root mode change.
+			if _, exists := modes[false]; !exists {
+				modes[false] = nil
+			}
 
-		if err := cleanupObsoleteAutoDiscoveredContainers(ctx, jobLog,
-			cleanupCli, cleanupSwarmMode, repoData.SourceUrl,
-			groupedConfigs,
-			metadata); err != nil {
-			jobLog.Error("failed to clean up obsolete auto-discovered containers for context",
-				slog.String("context", contextName), logger.ErrAttr(err))
-		}
-
-		if closeFn != nil {
-			closeFn()
-		}
-	}
-
-	return handleDeploy(ctx, jobLog, appConfig,
-		dataMountPoint, dockerCli, secretProvider, metadata.JobID, jobTrigger,
-		repoData, deployConfigs, payload, testName, metadata)
-}
-
-func handleDeploy(ctx context.Context,
-	jobLog *slog.Logger,
-	appConfig *app.Config,
-	dataMountPoint container.MountPoint,
-	dockerCli command.Cli,
-	secretProvider *secretprovider.SecretProvider,
-	jobID string,
-	jobTrigger stages.JobTrigger,
-	repoData stages.RepositoryData,
-	deployConfigs []*deployConfig.Config,
-	payload *webhook.ParsedPayload,
-	testName string,
-	metadata notification.Metadata,
-) error {
-	dockerQuiet := false
-	if appConfig != nil {
-		dockerQuiet = appConfig.DockerQuietDeploy
-	}
-
-	// Build one Docker CLI per distinct context up front and share it across all
-	// deployments targeting that context, instead of creating a client per deployment.
-	contextCLIs := buildDeployContextCLIs(ctx, dockerCli, dockerQuiet, deployConfigs)
-
-	defer func() {
-		for contextName, entry := range contextCLIs {
-			if contextName != "" && entry.closeFn != nil {
-				entry.closeFn()
+			if entry.swarmMode {
+				if _, exists := modes[true]; !exists {
+					modes[true] = nil
+				}
 			}
 		}
-	}()
 
-	// We'll run each deployment concurrently but grouped by repo+reference and limited by the global deployerLimiter.
+		for swarmMode, modeConfigs := range modes {
+			deferred, err := cleanupObsoleteAutoDiscoveredContainersResult(ctx, req.Logger,
+				entry.cli, swarmMode, contextName, cleanupReq,
+				modeConfigs, m.notifier, m.removalPredicate(cleanupReq, contextName, gate))
+			pending = pending || deferred
+
+			if err != nil {
+				errs = append(errs, err)
+				req.Logger.Error("failed to clean up obsolete auto-discovered containers for context",
+					slog.String("context", docker.DisplayContextName(contextName)),
+					slog.Bool("swarm_mode", swarmMode),
+					logger.ErrAttr(err))
+			}
+		}
+	}
+
+	return pending, errors.Join(errs...)
+}
+
+// handleDeploy deploys req. It is used by reconciliation, whose requests are
+// only gated by sync windows for stacks that would not be restored to a
+// revision known to be deployed, see stackRevision.restoresDeployed.
+func (m *Manager) handleDeploy(ctx context.Context, req DeployRequest) error {
+	contextCLIs := buildDeployContextCLIs(ctx, m.contexts, m.activeDeployConfigs(req))
+
+	return m.handleDeployWithContexts(ctx, req, contextCLIs, m.newSyncWindowGate(req, time.Now()))
+}
+
+func (m *Manager) handleDeployWithContexts(ctx context.Context, req DeployRequest, contextCLIs map[string]deployContextCLI, gate *syncWindowGate) error {
+	_, err := m.deployWithContexts(ctx, req, contextCLIs, gate)
+
+	return err
+}
+
+func (m *Manager) deployWithContexts(ctx context.Context, req DeployRequest, contextCLIs map[string]deployContextCLI, gate *syncWindowGate) ([]stackResult, error) {
+	// Deployments run concurrently, grouped by repository and reference, and
+	// limited by this manager's deployment limiter.
 	var wg sync.WaitGroup
 
-	resultCh := make(chan error, len(deployConfigs))
+	resultCh := make(chan stackResult, len(req.DeployConfigs))
+	gitChanges := stages.NewGitChangeCache()
+	gitAncestry := stages.NewGitAncestryCache()
 
-	for _, deployCfg := range deployConfigs {
-		deployLog := jobLog.
+	for _, deployCfg := range req.DeployConfigs {
+		deployLog := req.Logger.
 			WithGroup("deploy").
 			With(slog.String("stack", deployCfg.Name))
 
-		if repoData.Source != config.SourceTypeOCI {
+		if req.Repository.Source != config.SourceTypeOCI {
 			deployLog = deployLog.With(slog.String("reference", deployCfg.Reference))
 		}
 
-		if ctx := strings.TrimSpace(deployCfg.Context); ctx != "" {
-			deployLog = deployLog.With(slog.String("context", ctx))
+		if ctxName := strings.TrimSpace(deployCfg.Context); ctxName != "" {
+			deployLog = deployLog.With(slog.String("context", ctxName))
 		}
 
 		// Used to make test deployments unique and prevent conflicts between tests when running in parallel.
 		// It is not used in production.
-		if testName != "" {
-			deployCfg.Name = test.ConvertTestName(testName)
+		if req.TestName != "" {
+			deployCfg.Name = test.ConvertTestName(req.TestName)
 		}
 
-		reconciliationHandler.startStackDeployment(repoData.Name, deployCfg.Name)
+		if err := m.admitPause(req, deployCfg, nil); err != nil {
+			deployLog.Debug("deployment skipped", logger.ErrAttr(err))
+			gate.record(deployCfg, err)
+
+			resultCh <- stackResult{config: deployCfg, name: deployCfg.Name, context: deployCfg.Context, err: err}
+
+			continue
+		}
+
+		m.deployments.start(req.Repository.Name, deployCfg.Context, deployCfg.Name)
 
 		wg.Add(1)
 
 		go func(dc *deployConfig.Config) {
 			defer wg.Done()
-			defer reconciliationHandler.finishStackDeployment(repoData.Name, dc.Name)
+			defer m.deployments.finish(req.Repository.Name, dc.Context, dc.Name)
 
-			entry, ok := contextCLIs[strings.TrimSpace(dc.Context)]
-			if !ok || entry.err != nil {
-				if ok && entry.err != nil {
-					resultCh <- entry.err
-				} else {
-					resultCh <- fmt.Errorf("no docker client available for context %q", strings.TrimSpace(dc.Context))
+			// A panic here (e.g. from a lower-level library bug) must never take
+			// down the whole process: it would abort every other concurrently
+			// running deployment too. Recover, log it, and report this stack's
+			// deployment as failed instead.
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					logger.LogRecoveredPanic(deployLog, "stack deployment", recovered)
+
+					resultCh <- stackResult{config: dc, name: dc.Name, context: dc.Context, err: fmt.Errorf("panic during deployment of stack %q: %v", dc.Name, recovered)}
 				}
+			}()
+
+			contextName := docker.NormalizeContextName(dc.Context)
+
+			entry, ok := contextCLIs[contextName]
+			if !ok || entry.err != nil {
+				err := entry.err
+				if !ok || err == nil {
+					err = fmt.Errorf("no docker client available for context %q", docker.DisplayContextName(contextName))
+				}
+
+				gate.record(dc, err)
+
+				resultCh <- stackResult{config: dc, name: dc.Name, context: dc.Context, err: err}
 
 				return
 			}
 
-			err := handleOneDeploy(ctx, deployLog,
-				appConfig, dataMountPoint, entry.cli, entry.swarmMode, secretProvider,
-				dc, jobID, jobTrigger, repoData, payload, metadata)
+			err := m.handleOneDeploy(ctx, req, deployLog, entry.cli, entry.swarmMode, dc, gitChanges, gitAncestry, gate)
 
-			resultCh <- err
+			gate.record(dc, err)
+
+			resultCh <- stackResult{config: dc, name: dc.Name, context: dc.Context, err: err}
 		}(deployCfg)
 	}
 
@@ -230,143 +296,412 @@ func handleDeploy(ctx context.Context,
 	wg.Wait()
 	close(resultCh)
 
-	var errs []error
-
+	results := make([]stackResult, 0, len(req.DeployConfigs))
 	for e := range resultCh {
-		if e != nil {
-			errs = append(errs, e)
-			// keep looping to drain channel
-		}
+		results = append(results, e)
 	}
 
-	return errors.Join(errs...)
+	if len(req.DeployConfigs) == 0 && len(req.AutoDiscoveryOrigins) > 0 &&
+		!slices.ContainsFunc(req.AutoDiscoveryOrigins, func(origin deployConfig.AutoDiscoveryOrigin) bool {
+			return !origin.Pause
+		}) {
+		var skipped []stages.SkippedStack
+		for _, origin := range req.AutoDiscoveryOrigins {
+			skipped = append(skipped, stages.NewSkippedStack(req.Repository.Name, origin.Context, stages.DeploymentPaused()))
+		}
+
+		return results, stages.NewSkippedRunError(skipped)
+	}
+
+	return results, summarizeDeployResults(results, len(req.DeployConfigs))
+}
+
+// stackResult is the result of deploying one stack of a request.
+type stackResult struct {
+	config  *deployConfig.Config
+	name    string
+	context string
+	err     error
+}
+
+func successfulForcedDeployments(results []stackResult) map[*deployConfig.Config]struct{} {
+	var deployed map[*deployConfig.Config]struct{}
+
+	for _, result := range results {
+		dc := result.config
+		if dc == nil || !dc.ForceRecreate || dc.Destroy.Enabled || result.err != nil {
+			continue
+		}
+
+		if deployed == nil {
+			deployed = make(map[*deployConfig.Config]struct{})
+		}
+
+		deployed[dc] = struct{}{}
+	}
+
+	return deployed
+}
+
+// summarizeDeployResults combines the results of the stacks of one request
+// into the request's result. total is the number of stacks in the request.
+//
+// If no stack was deployed and every stack was skipped, filtered out or
+// deferred by a sync window, the result is a merged
+// *stages.SyncWindowBlockedError if any stack was deferred, and a
+// *stages.SkippedRunError with the reason for each stack otherwise, which
+// wraps stages.ErrWebhookFilterMismatch if every stack was filtered out and
+// stages.ErrSkipDeployment otherwise.
+func summarizeDeployResults(results []stackResult, total int) error {
+	var (
+		errs            []error
+		blocked         []*stages.SyncWindowBlockedError
+		suppressed      []*stages.RetrySuppressedError
+		skipped         []stages.SkippedStack
+		successCount    int
+		skipCount       int
+		filterSkipCount int
+		handoverCount   int
+	)
+
+	for _, result := range results {
+		e := result.err
+		if e == nil {
+			successCount++
+			continue
+		}
+
+		if errors.Is(e, stages.ErrWebhookFilterMismatch) {
+			filterSkipCount++
+
+			skipped = append(skipped, stages.NewSkippedStack(result.name, result.context, e))
+
+			continue
+		}
+
+		retryErr, retrySuppressed := errors.AsType[*stages.RetrySuppressedError](e)
+		if retrySuppressed {
+			suppressed = append(suppressed, retryErr)
+		}
+
+		blockedErr, windowBlocked := errors.AsType[*stages.SyncWindowBlockedError](e)
+		if windowBlocked {
+			blocked = append(blocked, blockedErr)
+		}
+
+		if retrySuppressed || windowBlocked {
+			continue
+		}
+
+		if errors.Is(e, stages.ErrSkipDeployment) {
+			skipCount++
+
+			skipped = append(skipped, stages.NewSkippedStack(result.name, result.context, e))
+
+			continue
+		}
+
+		if errors.Is(e, selfupdate.ErrHandover) {
+			handoverCount++
+			continue
+		}
+
+		errs = append(errs, e)
+	}
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+
+	if handoverCount > 0 {
+		return selfupdate.ErrHandover
+	}
+
+	if len(suppressed) > 0 {
+		retryErr := stages.MergeRetrySuppressed(suppressed)
+
+		var outcomes []error
+		if len(blocked) > 0 {
+			outcomes = append(outcomes, stages.MergeSyncWindowBlocked(blocked))
+		}
+
+		if slices.ContainsFunc(skipped, func(stack stages.SkippedStack) bool {
+			return stack.Reason == stages.SkipReasonPaused
+		}) {
+			outcomes = append(outcomes, stages.NewSkippedRunError(skipped))
+		}
+
+		if len(outcomes) > 0 {
+			return errors.Join(append([]error{retryErr}, outcomes...)...)
+		}
+
+		return retryErr
+	}
+
+	if successCount == 0 && total > 0 && skipCount+filterSkipCount+len(blocked) == total {
+		if len(blocked) > 0 {
+			if slices.ContainsFunc(skipped, func(stack stages.SkippedStack) bool {
+				return stack.Reason == stages.SkipReasonPaused
+			}) {
+				return errors.Join(stages.MergeSyncWindowBlocked(blocked), stages.NewSkippedRunError(skipped))
+			}
+
+			return stages.MergeSyncWindowBlocked(blocked)
+		}
+
+		return stages.NewSkippedRunError(skipped)
+	}
+
+	return nil
 }
 
 // deployContextCLI holds a resolved Docker CLI (and its metadata) for a single Docker context,
 // shared across all deployments in a handleDeploy batch that target that context.
 type deployContextCLI struct {
 	cli       command.Cli
-	closeFn   func() // nil for the default context (which reuses the base CLI)
 	swarmMode bool
 	err       error // set when the context CLI could not be created/probed
 }
 
 // buildDeployContextCLIs creates one Docker CLI per distinct context referenced in deployConfigs.
-// The default context (empty string) reuses baseCli; custom contexts get a dedicated client whose
-// closeFn must be called by the caller. Errors are captured per context so only the affected
-// deployments fail rather than the whole batch.
-func buildDeployContextCLIs(ctx context.Context, baseCli command.Cli, quiet bool, deployConfigs []*deployConfig.Config) map[string]deployContextCLI {
+// Errors are captured per context so only the affected deployments fail rather
+// than the whole batch.
+func buildDeployContextCLIs(ctx context.Context, contexts *docker.ContextRegistry, deployConfigs []*deployConfig.Config) map[string]deployContextCLI {
 	contextCLIs := make(map[string]deployContextCLI)
 
 	for _, dc := range deployConfigs {
-		contextName := strings.TrimSpace(dc.Context)
+		contextName := docker.NormalizeContextName(dc.Context)
 		if _, exists := contextCLIs[contextName]; exists {
 			continue
 		}
 
-		if contextName == "" {
-			contextCLIs[contextName] = deployContextCLI{cli: baseCli, swarmMode: dockerSwarm.GetModeEnabled()}
-			continue
-		}
-
-		cli, closeFn, err := dockerCliForContext(baseCli, quiet, contextName)
-		if err != nil {
-			contextCLIs[contextName] = deployContextCLI{err: err}
-			continue
-		}
-
-		swarmMode, err := dockerSwarm.ResolveModeEnabled(ctx, cli.Client())
-		if err != nil {
-			if closeFn != nil {
-				closeFn()
-			}
-
-			contextCLIs[contextName] = deployContextCLI{err: fmt.Errorf("failed to check if docker host is running in swarm mode: %w", err)}
-
-			continue
-		}
-
-		contextCLIs[contextName] = deployContextCLI{cli: cli, closeFn: closeFn, swarmMode: swarmMode}
+		contextCLIs[contextName] = resolveDeployContext(ctx, contexts, contextName)
 	}
 
 	return contextCLIs
 }
 
-func handleOneDeploy(ctx context.Context, deployLog *slog.Logger,
-	appConfig *app.Config, dataMountPoint container.MountPoint,
-	deploymentDockerCli command.Cli, swarmMode bool,
-	secretProvider *secretprovider.SecretProvider,
-	dc *deployConfig.Config,
-	jobID string,
-	jobTrigger stages.JobTrigger,
-	repoData stages.RepositoryData,
-	payLad *webhook.ParsedPayload,
-	metadata notification.Metadata,
-) error {
-	if deployerLimiter != nil {
-		deployLog.Debug("queuing deployment")
+func resolveDeployContext(ctx context.Context, contexts *docker.ContextRegistry, contextName string) deployContextCLI {
+	contextName = docker.NormalizeContextName(contextName)
 
-		unlock, lErr := deployerLimiter.acquire(ctx, repoData.Name, NormalizeReference(dc.Reference))
-		if lErr != nil {
-			return lErr
-		}
-		defer unlock()
+	cc, err := contexts.Get(ctx, contextName)
+	if err != nil {
+		return deployContextCLI{err: err}
 	}
 
-	stageMgr := stages.NewStageManager(
-		jobID,
-		jobTrigger,
-		deployLog,
-		failNotifyFunc,
-		&repoData,
-		&stages.Docker{
-			Cmd:            deploymentDockerCli,
-			DataMountPoint: dataMountPoint,
-			SwarmMode:      swarmMode,
-		},
-		payLad,
-		appConfig,
-		dc,
-		secretProvider,
-		metadata,
-	)
+	return deployContextCLI{cli: cc.Cli, swarmMode: cc.SwarmMode}
+}
 
-	err := stageMgr.RunStages(ctx)
+func (m *Manager) handleOneDeploy(ctx context.Context, req DeployRequest, deployLog *slog.Logger,
+	deploymentDockerCli command.Cli, swarmAvailable bool, dc *deployConfig.Config, gitChanges *stages.GitChangeCache,
+	gitAncestry *stages.GitAncestryCache, gate *syncWindowGate,
+) error {
+	if err := m.admitPause(req, dc, nil); err != nil {
+		return err
+	}
+
+	swarmMode, err := dc.ResolveSwarmMode(swarmAvailable)
+	if err != nil {
+		return fmt.Errorf("failed to resolve swarm mode for deployment %q on docker context %q: %w",
+			dc.Name, docker.DisplayContextName(dc.Context), err)
+	}
+
+	// Init switches the stage repository to a repository_url override.
+	// Pause checks must keep the identity of the configuration source.
+	repository := req.Repository
+
+	stageMgr, err := stages.NewStageManager(
+		stages.Dependencies{
+			AppConfig:       m.appConfig,
+			SecretProvider:  m.secretProvider,
+			Notifier:        m.notifier,
+			SchedulerHolds:  m,
+			Contexts:        m.contexts,
+			LeftoverTracker: m.leftoverTracker,
+		},
+		stages.RunInput{
+			Log:        deployLog,
+			JobID:      req.Metadata.JobID,
+			JobTrigger: req.JobTrigger,
+			Origin:     req.Origin,
+			Repository: &repository,
+			Docker: &stages.Docker{
+				Cmd:            deploymentDockerCli,
+				DataMountPoint: m.dataMountPoint,
+				SwarmMode:      swarmMode,
+				SwarmAvailable: swarmAvailable,
+			},
+			Payload:      req.Payload,
+			DeployConfig: dc,
+			Metadata:     req.Metadata,
+			GitChanges:   gitChanges,
+			GitAncestry:  gitAncestry,
+			ProjectSkips: m.projectSkips,
+		},
+	)
 	if err != nil {
 		return err
 	}
 
-	return nil
-}
-
-func dockerCliForContext(baseCli command.Cli, quiet bool, contextName string) (command.Cli, func(), error) {
-	contextName = strings.TrimSpace(contextName)
-	if contextName == "" {
-		return baseCli, nil, nil
+	if !stageMgr.MatchesWebhookEventFilter() {
+		return stageMgr.WebhookFilterMismatch()
 	}
 
-	contextCli, err := docker.CreateDockerCliWithContext(quiet, contextName)
+	if dc.Destroy.Enabled {
+		// Destroy has no pre-deploy stage to confirm there is work to do, so
+		// check for the stack directly: a stack that is already gone must not
+		// be reported as deferred on every run.
+		if gate.blocks(dc) && destroyHasNothingToRemove(ctx, deployLog, deploymentDockerCli.Client(), swarmMode, dc) {
+			deployLog.Debug("stack to destroy does not exist, skipping destruction")
+
+			return stages.NothingToDestroy()
+		}
+
+		if err := gate.admit(deployLog, dc, nil); err != nil {
+			return err
+		}
+
+		release, admissionErr := m.acquireDeploymentPhase(ctx, deployLog, req.Repository.Name, phaseDeployment, m.limiter, true)
+		if admissionErr != nil {
+			return admissionErr
+		}
+		defer release()
+
+		if err := m.admitPause(req, dc, nil); err != nil {
+			return err
+		}
+
+		return stageMgr.RunStages(ctx, nil)
+	}
+
+	releasePreDeploy, err := m.acquireDeploymentPhase(ctx, deployLog, req.Repository.Name, phasePreDeploy, m.preDeployLimiter, true)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create docker client for context %q: %w", contextName, err)
+		return err
 	}
-
-	closeFn := func() {
-		_ = contextCli.Client().Close()
-	}
-
-	return contextCli, closeFn, nil
-}
-
-func failNotifyFunc(deployLog *slog.Logger, err error, metadata notification.Metadata) {
-	// Don't write to HTTP from goroutines — just send notification and log
-	go func() {
-		notifyErr := notification.Send(notification.Failure, "Deployment Failed", err.Error(), metadata)
-		if notifyErr != nil {
-			deployLog.Error("failed to send notification", logger.ErrAttr(notifyErr))
+	defer func() {
+		if releasePreDeploy != nil {
+			releasePreDeploy()
 		}
 	}()
 
-	deployLog.Error("deployment failed",
-		slog.String("stack", metadata.Stack),
-		logger.ErrAttr(err))
+	return stageMgr.RunStages(ctx, func(ctx context.Context) (func(), error) {
+		releasePreDeploy()
+		releasePreDeploy = nil
+
+		// Pre-deploy confirmed that the stack must change, so this is the
+		// point where a sync window defers it: before any notification,
+		// commit status or deployment admission.
+		rev := stackRevision{
+			revision: stageMgr.Repository.Revision,
+			deployed: stageMgr.DeployState.DeployedCommit,
+			own:      stageMgr.ResolvedOwnReference(),
+		}
+		if err := m.admitPause(req, dc, &rev); err != nil {
+			return nil, err
+		}
+
+		if err := gate.admitStack(deployLog, dc, rev, func(description string) {
+			stageMgr.PostCommitStatusWithOutcome(ctx, commitstatus.StatePending, description, commitstatus.OutcomeDeferred)
+		}); err != nil {
+			return nil, err
+		}
+
+		release, err := m.acquireQueuedDeploymentPhase(ctx, stageMgr)
+		if err != nil {
+			return nil, err
+		}
+
+		if err := m.admitPause(req, dc, &rev); err != nil {
+			release()
+			return nil, err
+		}
+
+		return release, nil
+	})
+}
+
+// acquireQueuedDeploymentPhase acquires a deploymentPhase (phaseDeployment) from the manager's limiter
+// and posts a queued commit status to the repository. It returns a release function that must be
+// called to release the acquired phase, and an error if the acquisition failed.
+func (m *Manager) acquireQueuedDeploymentPhase(ctx context.Context, stageMgr *stages.StageManager) (func(), error) {
+	stageMgr.PostQueuedCommitStatus(ctx)
+
+	return m.acquireDeploymentPhase(ctx, stageMgr.Log, stageMgr.Repository.Name, phaseDeployment, m.limiter, false)
+}
+
+// acquireDeploymentPhase acquires a deploymentPhase (phasePreDeploy or phaseDeployment) from the given limiter.
+// It returns a release function that must be called to release the acquired phase,
+// and an error if the acquisition failed.
+func (m *Manager) acquireDeploymentPhase(
+	ctx context.Context,
+	deployLog *slog.Logger,
+	repository string,
+	phase deploymentPhase,
+	limiter *DeployerLimiter,
+	recordLegacyQueue bool,
+) (func(), error) {
+	if limiter == nil {
+		return func() {}, nil
+	}
+
+	if phase == phaseDeployment {
+		deployLog.Debug("queuing deployment")
+	} else {
+		deployLog.Debug("queuing pre-deployment")
+	}
+
+	startedAt := time.Now()
+	release, err := limiter.acquire(ctx, repository)
+
+	outcome := "admitted"
+	if err != nil {
+		outcome = "canceled"
+	}
+
+	elapsed := time.Since(startedAt).Seconds()
+	metricRepository := resolveDeploymentQueueRepository(repository)
+
+	prometheus.DeploymentAdmissionDuration.WithLabelValues(metricRepository, string(phase), outcome).Observe(elapsed)
+
+	if recordLegacyQueue {
+		prometheus.DeploymentQueueDuration.WithLabelValues(metricRepository, outcome).Observe(elapsed)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	return release, nil
+}
+
+// resolveDeploymentQueueRepository returns a sanitized repository name for use in Prometheus metrics.
+func resolveDeploymentQueueRepository(repository string) string {
+	repository = strings.TrimSpace(repository)
+	if repository == "" {
+		return "unknown"
+	}
+
+	return repository
+}
+
+// groupDeployConfigsByMode partitions configs by their selected runtime mode.
+// Invalid explicit swarm requests are excluded here; handleOneDeploy reports
+// their descriptive error to the caller.
+func groupDeployConfigsByMode(dcs []*deployConfig.Config, swarmAvailable bool) map[bool][]*deployConfig.Config {
+	grouped := make(map[bool][]*deployConfig.Config)
+
+	for _, dc := range dcs {
+		if dc == nil {
+			continue
+		}
+
+		swarmMode, err := dc.ResolveSwarmMode(swarmAvailable)
+		if err != nil {
+			continue
+		}
+
+		grouped[swarmMode] = append(grouped[swarmMode], dc)
+	}
+
+	return grouped
 }

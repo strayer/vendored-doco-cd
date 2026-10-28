@@ -11,6 +11,7 @@ import (
 
 	openbao "github.com/openbao/openbao/api/v2"
 
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
 )
 
@@ -28,14 +29,41 @@ const (
 // expose the matching private key issued alongside the certificate (e.g. CERT -> CERT_KEY).
 const PKIRoleKeySuffix = secrettypes.PKIRoleKeySuffix
 
-// pkiRoleRefRegexp is a precompiled matcher for PKIRoleRefFormat, used where matching happens in a
-// loop (e.g. ResolveSecretReferences) to avoid recompiling the pattern on every call.
-var pkiRoleRefRegexp = regexp.MustCompile(PKIRoleRefFormat)
+// PKIFullChainSuffix is appended to the env var name of a pki or pki-role external secret
+// reference to expose the full certificate chain, i.e. the leaf certificate followed by its
+// issuing CA chain (e.g. CERT -> CERT_FULL), alongside the leaf-only certificate entry.
+const PKIFullChainSuffix = secrettypes.PKIFullChainSuffix
 
-var ErrInvalidSecretReference = errors.New("invalid secret reference")
+// pkiRefRegexp and pkiRoleRefRegexp are precompiled matchers for PKIRefFormat and
+// PKIRoleRefFormat, used where matching happens in a loop (e.g. ResolveSecretReferences) to avoid
+// recompiling the patterns on every call.
+var (
+	pkiRefRegexp     = regexp.MustCompile(PKIRefFormat)
+	pkiRoleRefRegexp = regexp.MustCompile(PKIRoleRefFormat)
+)
+
+var (
+	ErrInvalidSecretReference = errors.New("invalid secret reference")
+	ErrDuplicateSecretName    = errors.New("duplicate secret name")
+)
 
 type Provider struct {
+	// Client keeps the startup token. With a token file, operations use copies with the current token.
 	Client *openbao.Client
+
+	// issuer is used for non-idempotent certificate issuance and has client-side retries disabled,
+	// so a lost response can never cause a duplicate certificate to be issued.
+	issuer *openbao.Client
+
+	// tokenFile is nil when the token comes from SECRET_PROVIDER_ACCESS_TOKEN.
+	tokenFile *accessTokenFile
+}
+
+// pkiCertValues holds the resolved values of a read-only pki reference: the leaf certificate and
+// the full chain bundle exposed alongside it under PKIFullChainSuffix.
+type pkiCertValues struct {
+	Certificate string
+	FullChain   string
 }
 
 type deployedCertState struct {
@@ -50,8 +78,74 @@ func (p *Provider) Name() string {
 
 // NewProvider creates a new Provider instance for OpenBao and performs login using the provided address and access token.
 func NewProvider(_ context.Context, address, token string) (*Provider, error) {
-	config := openbao.DefaultConfig()
+	client, err := newClient(address, token)
+	if err != nil {
+		return nil, err
+	}
 
+	issuer, err := newClient(address, token)
+	if err != nil {
+		return nil, err
+	}
+
+	issuer.SetMaxRetries(0)
+
+	return &Provider{Client: client, issuer: issuer}, nil
+}
+
+// NewProviderWithConfig creates a Provider from cfg.
+// With a token file, it keeps the file so later operations can read rotated tokens.
+func NewProviderWithConfig(ctx context.Context, cfg *Config) (*Provider, error) {
+	var tokenFile *accessTokenFile
+
+	token := cfg.AccessToken
+	if cfg.AccessTokenFile != "" {
+		var err error
+
+		tokenFile = newAccessTokenFile(cfg.AccessTokenFile)
+
+		token, err = tokenFile.Token()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	provider, err := NewProvider(ctx, cfg.SiteUrl, token)
+	if err != nil {
+		return nil, err
+	}
+
+	provider.tokenFile = tokenFile
+
+	return provider, nil
+}
+
+// namespaceClient returns a new OpenBao client for the given namespace,
+// optionally using the issuer client for certificate issuance.
+func (p *Provider) namespaceClient(namespace string, issuance bool) (*openbao.Client, error) {
+	base := p.Client
+	if issuance {
+		base = p.issuer
+	}
+
+	c := base.WithNamespace(namespace)
+
+	if p.tokenFile != nil {
+		token, err := p.tokenFile.Token()
+		if err != nil {
+			return nil, err
+		}
+
+		// Each operation owns its token and namespace. Shared clients stay unchanged.
+		c.SetToken(token)
+	}
+
+	return c, nil
+}
+
+// newClient creates a new OpenBao client with the given address and token.
+func newClient(address, token string) (*openbao.Client, error) {
+	config := openbao.DefaultConfig()
 	config.Address = address
 
 	client, err := openbao.NewClient(config)
@@ -61,9 +155,7 @@ func NewProvider(_ context.Context, address, token string) (*Provider, error) {
 
 	client.SetToken(token)
 
-	provider := &Provider{Client: client}
-
-	return provider, nil
+	return client, nil
 }
 
 // GetSecret retrieves a secret value from the Secrets Manager using the provided secret reference.
@@ -73,7 +165,10 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 		return "", err
 	}
 
-	c := p.Client.WithNamespace(namespace)
+	c, err := p.namespaceClient(namespace, engineType == "pki-role")
+	if err != nil {
+		return "", err
+	}
 
 	var strValue string
 
@@ -92,7 +187,7 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 	case "pki-role":
 		issued, err := IssueCert(ctx, c, engineName, key, id)
 		if err != nil {
-			return "", fmt.Errorf("failed to issue certificate for common name %s using role %s: %w", id, key, err)
+			return "", fmt.Errorf("%w: failed to issue certificate for common name %s using role %s: %w", secrettypes.ErrNotRetryable, id, key, err)
 		}
 
 		strValue = issued.Certificate
@@ -109,9 +204,27 @@ func (p *Provider) GetSecret(ctx context.Context, ref string) (string, error) {
 	return strValue, nil
 }
 
+// GetSecretsByPath retrieves all values below a KVv2 path.
+// The path format is "kv:<namespace(optional)>:<secretEngine>:<path>". The path can be a secret
+// or a folder. See GetSecretsByPath in kv2.go for the returned names.
+func (p *Provider) GetSecretsByPath(ctx context.Context, path string, recursive bool) (map[string]string, error) {
+	namespace, engineName, secretPath, err := parseBulkPath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	c, err := p.namespaceClient(namespace, false)
+	if err != nil {
+		return nil, err
+	}
+
+	return GetSecretsByPath(ctx, c, engineName, secretPath, recursive)
+}
+
 // GetSecrets retrieves multiple secrets from Secrets Manager using the provided list of secret references.
 func (p *Provider) GetSecrets(ctx context.Context, refs []string) (map[string]string, error) {
 	resolvedSecrets := make(map[string]string)
+	containsPKIRole := false
 
 	var (
 		mu sync.Mutex
@@ -124,6 +237,10 @@ func (p *Provider) GetSecrets(ctx context.Context, refs []string) (map[string]st
 	errCh := make(chan error, 1)
 
 	for _, ref := range refs {
+		if pkiRoleRefRegexp.MatchString(ref) {
+			containsPKIRole = true
+		}
+
 		wg.Add(1)
 
 		go func(secretName string) {
@@ -152,6 +269,10 @@ func (p *Provider) GetSecrets(ctx context.Context, refs []string) (map[string]st
 	close(errCh)
 
 	if err, ok := <-errCh; ok {
+		if containsPKIRole && !errors.Is(err, secrettypes.ErrNotRetryable) {
+			return nil, fmt.Errorf("%w: pki-role batch may have partially issued certificates: %w", secrettypes.ErrNotRetryable, err)
+		}
+
 		return nil, err
 	}
 
@@ -161,25 +282,43 @@ func (p *Provider) GetSecrets(ctx context.Context, refs []string) (map[string]st
 // ResolveSecretReferences resolves the provided map of environment variable names to secret IDs
 // by fetching the corresponding secret values from the secret provider.
 //
-// A pki-role reference (see PKIRoleRefFormat) issues a fresh certificate and its matching private
-// key, and expands into two output entries: envVar holds the certificate PEM, and envVar + PKIRoleKeySuffix
-// (e.g. CERT_KEY) holds the private key PEM.
+// Certificate references expand into more than one output entry, all named after the env var the
+// reference is mapped to:
+//
+//   - A pki reference (see PKIRefFormat) reads an already-issued certificate and expands into two
+//     entries: envVar holds the leaf certificate PEM, and envVar + PKIFullChainSuffix (e.g.
+//     CERT_FULL) holds the leaf certificate followed by its issuing CA chain.
+//   - A pki-role reference (see PKIRoleRefFormat) issues a fresh certificate and its matching
+//     private key, and expands into three entries: envVar holds the leaf certificate PEM,
+//     envVar + PKIRoleKeySuffix (e.g. CERT_KEY) holds the private key PEM, and
+//     envVar + PKIFullChainSuffix (e.g. CERT_FULL) holds the full chain bundle.
 func (p *Provider) ResolveSecretReferences(ctx context.Context, secrets map[string]string) (secrettypes.ResolvedSecrets, error) {
 	plainSecrets := make(map[string]string, len(secrets))
+	pkiSecrets := make(map[string]string, len(secrets))
 	pkiRoleSecrets := make(map[string]string, len(secrets))
 
 	for envVar, ref := range secrets {
-		if pkiRoleRefRegexp.MatchString(ref) {
+		switch {
+		case pkiRoleRefRegexp.MatchString(ref):
 			pkiRoleSecrets[envVar] = ref
-			continue
+		case pkiRefRegexp.MatchString(ref):
+			pkiSecrets[envVar] = ref
+		default:
+			plainSecrets[envVar] = ref
 		}
-
-		plainSecrets[envVar] = ref
 	}
 
 	for envVar := range pkiRoleSecrets {
 		if _, exists := secrets[envVar+PKIRoleKeySuffix]; exists {
 			return nil, fmt.Errorf("external secret %q conflicts with the private key generated for pki-role secret %q", envVar+PKIRoleKeySuffix, envVar)
+		}
+	}
+
+	for _, certSecrets := range []map[string]string{pkiSecrets, pkiRoleSecrets} {
+		for envVar := range certSecrets {
+			if _, exists := secrets[envVar+PKIFullChainSuffix]; exists {
+				return nil, fmt.Errorf("external secret %q conflicts with the certificate chain generated for certificate secret %q", envVar+PKIFullChainSuffix, envVar)
+			}
 		}
 	}
 
@@ -205,6 +344,18 @@ func (p *Provider) ResolveSecretReferences(ctx context.Context, secrets map[stri
 		}
 	}
 
+	if len(pkiSecrets) > 0 {
+		resolved, err := p.resolvePKICerts(ctx, pkiSecrets)
+		if err != nil {
+			return nil, err
+		}
+
+		for envVar, cert := range resolved {
+			out[envVar] = cert.Certificate
+			out[envVar+PKIFullChainSuffix] = cert.FullChain
+		}
+	}
+
 	if len(pkiRoleSecrets) > 0 {
 		issued, err := p.issuePKIRoleCerts(ctx, pkiRoleSecrets)
 		if err != nil {
@@ -214,6 +365,7 @@ func (p *Provider) ResolveSecretReferences(ctx context.Context, secrets map[stri
 		for envVar, cert := range issued {
 			out[envVar] = cert.Certificate
 			out[envVar+PKIRoleKeySuffix] = cert.PrivateKey
+			out[envVar+PKIFullChainSuffix] = cert.FullChain()
 		}
 	}
 
@@ -237,7 +389,7 @@ func (p *Provider) DeploymentHasRevokedCertificate(ctx context.Context, certStat
 		engine    string
 	}
 
-	revokedByMount := make(map[mountKey]map[string]struct{}, len(deployed))
+	revokedByMount := make(map[mountKey]set.Set[string], len(deployed))
 
 	for _, cert := range deployed {
 		namespace, engineType, engineName, _, _, err := parseReference(cert.Ref)
@@ -252,25 +404,103 @@ func (p *Provider) DeploymentHasRevokedCertificate(ctx context.Context, certStat
 		key := mountKey{namespace: namespace, engine: engineName}
 
 		if _, ok := revokedByMount[key]; !ok {
-			serials, err := ListRevokedCertSerials(ctx, p.Client.WithNamespace(namespace), engineName)
+			c, err := p.namespaceClient(namespace, false)
+			if err != nil {
+				return false, err
+			}
+
+			serials, err := ListRevokedCertSerials(ctx, c, engineName)
 			if err != nil {
 				return false, fmt.Errorf("list revoked certificates for %s/%s: %w", namespace, engineName, err)
 			}
 
-			revoked := make(map[string]struct{}, len(serials))
+			revoked := set.New[string]()
 			for _, serial := range serials {
-				revoked[normalizeCertSerial(serial)] = struct{}{}
+				revoked.Add(normalizeCertSerial(serial))
 			}
 
 			revokedByMount[key] = revoked
 		}
 
-		if _, revoked := revokedByMount[key][normalizeCertSerial(cert.Serial)]; revoked {
+		if revokedByMount[key].Contains(normalizeCertSerial(cert.Serial)) {
 			return true, nil
 		}
 	}
 
 	return false, nil
+}
+
+// resolvePKICerts reads the already-issued certificate behind each read-only pki reference in
+// refs, together with its full chain bundle, keyed by the same env var name used in the input map.
+func (p *Provider) resolvePKICerts(ctx context.Context, refs map[string]string) (map[string]pkiCertValues, error) {
+	resolved := make(map[string]pkiCertValues, len(refs))
+
+	var (
+		mu sync.Mutex
+		wg sync.WaitGroup
+	)
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, 1)
+
+	// Each pki reference needs its mount's issuers to resolve its chain; share them between
+	// references on the same mount instead of listing and reading them once per reference.
+	issuers := newIssuerCache()
+
+	for envVar, ref := range refs {
+		wg.Add(1)
+
+		go func(envVar, ref string) {
+			defer wg.Done()
+
+			fail := func(err error) {
+				select {
+				case errCh <- err:
+					cancel()
+				default:
+				}
+			}
+
+			namespace, _, engineName, commonName, _, err := parseReference(ref)
+			if err != nil {
+				fail(err)
+				return
+			}
+
+			c, err := p.namespaceClient(namespace, false)
+			if err != nil {
+				fail(err)
+				return
+			}
+
+			serial, err := GetCertSerial(ctx, c, engineName, commonName)
+			if err != nil {
+				fail(fmt.Errorf("failed to retrieve certificate serial for common name %s: %w", commonName, err))
+				return
+			}
+
+			cert, fullChain, err := getCertWithFullChain(ctx, c, engineName, serial, issuers.loader(c, namespace, engineName))
+			if err != nil {
+				fail(fmt.Errorf("failed to retrieve certificate with serial %s: %w", serial, err))
+				return
+			}
+
+			mu.Lock()
+			resolved[envVar] = pkiCertValues{Certificate: cert, FullChain: fullChain}
+			mu.Unlock()
+		}(envVar, ref)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	if err, ok := <-errCh; ok {
+		return nil, err
+	}
+
+	return resolved, nil
 }
 
 // issuePKIRoleCerts issues a fresh certificate/key pair for each pki-role reference in refs,
@@ -305,12 +535,21 @@ func (p *Provider) issuePKIRoleCerts(ctx context.Context, refs map[string]string
 				return
 			}
 
-			c := p.Client.WithNamespace(namespace)
+			c, err := p.namespaceClient(namespace, true)
+			if err != nil {
+				select {
+				case errCh <- fmt.Errorf("%w: load certificate issuance credentials: %w", secrettypes.ErrNotRetryable, err):
+					cancel()
+				default:
+				}
+
+				return
+			}
 
 			cert, err := IssueCert(ctx, c, engineName, roleName, commonName)
 			if err != nil {
 				select {
-				case errCh <- fmt.Errorf("failed to issue certificate for common name %s: %w", commonName, err):
+				case errCh <- fmt.Errorf("%w: failed to issue certificate for common name %s: %w", secrettypes.ErrNotRetryable, commonName, err):
 					cancel()
 				default:
 				}
@@ -389,4 +628,28 @@ func parseReference(ref string) (namespace, engineType, engineName, id, key stri
 	}
 
 	return "", "", "", "", "", fmt.Errorf("%w: expected format 'kv:<namespace(optional)>:<secretEngine>:<secretName>:<key>', got %q", ErrInvalidSecretReference, ref)
+}
+
+// parseBulkPath parses a path with the format "kv:<namespace(optional)>:<secretEngine>:<path>".
+func parseBulkPath(path string) (namespace, engineName, secretPath string, err error) {
+	const defaultNamespace = "root"
+
+	const format = "expected format 'kv:<namespace(optional)>:<secretEngine>:<path>'"
+
+	parts := strings.Split(path, ":")
+
+	switch len(parts) {
+	case 3:
+		namespace, engineName, secretPath = defaultNamespace, parts[1], parts[2]
+	case 4:
+		namespace, engineName, secretPath = parts[1], parts[2], parts[3]
+	default:
+		return "", "", "", fmt.Errorf("%w: %s, got %q", ErrInvalidSecretReference, format, path)
+	}
+
+	if parts[0] != "kv" || namespace == "" || engineName == "" {
+		return "", "", "", fmt.Errorf("%w: %s, got %q", ErrInvalidSecretReference, format, path)
+	}
+
+	return namespace, engineName, secretPath, nil
 }

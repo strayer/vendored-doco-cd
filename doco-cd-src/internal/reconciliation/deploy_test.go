@@ -3,6 +3,7 @@ package reconciliation
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -11,12 +12,18 @@ import (
 	"time"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/cli/cli/command"
 	composeapi "github.com/docker/compose/v5/pkg/api"
+	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/moby/moby/api/types/container"
+	swarmTypes "github.com/moby/moby/api/types/swarm"
 	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/common/id"
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
@@ -37,30 +44,65 @@ import (
 func TestDeploy_RejectsUnverifiedOCIArtifact(t *testing.T) {
 	t.Parallel()
 
-	err := deploy(
-		t.Context(),
-		logger.New(logger.LevelCritical).Logger,
-		nil,
-		container.MountPoint{},
-		nil,
-		nil,
-		notification.Metadata{},
-		stages.JobTriggerWebhook,
-		stages.RepositoryData{
+	manager := newTestManager(t)
+
+	_, err := manager.deploy(t.Context(), DeployRequest{
+		Logger:     logger.New(logger.LevelCritical).Logger,
+		JobTrigger: stages.JobTriggerWebhook,
+		Repository: stages.RepositoryData{
 			Source:     config.SourceTypeOCI,
 			SourceUrl:  "ghcr.io/example/repo:latest",
 			OCITrusted: false,
 		},
-		nil,
-		nil,
-		"",
-	)
+	}, nil)
 	if err == nil {
 		t.Fatal("expected deploy to fail for unverified OCI artifact")
 	}
 
 	if !errors.Is(err, ErrOCIArtifactNotVerified) {
 		t.Fatalf("expected ErrOCIArtifactNotVerified, got %v", err)
+	}
+}
+
+func TestResolveDeploymentQueueRepository(t *testing.T) {
+	t.Parallel()
+
+	if got := resolveDeploymentQueueRepository(" owner/repo "); got != "owner/repo" {
+		t.Fatalf("resolveDeploymentQueueRepository() = %q, want owner/repo", got)
+	}
+
+	if got := resolveDeploymentQueueRepository(" "); got != "unknown" {
+		t.Fatalf("resolveDeploymentQueueRepository(empty) = %q, want unknown", got)
+	}
+}
+
+func TestGroupDeployConfigsByMode(t *testing.T) {
+	t.Parallel()
+
+	compose := deployConfig.New("compose", "main")
+	swarm := deployConfig.New("swarm", "main")
+	automatic := deployConfig.New("automatic", "main")
+	composeEnabled := false
+	swarmEnabled := true
+	compose.Swarm.Enabled = &composeEnabled
+	swarm.Swarm.Enabled = &swarmEnabled
+
+	grouped := groupDeployConfigsByMode([]*deployConfig.Config{compose, swarm, automatic}, true)
+	if got := grouped[false]; len(got) != 1 || got[0] != compose {
+		t.Fatalf("compose group = %#v, want only explicit compose config", got)
+	}
+
+	if got := grouped[true]; len(got) != 2 || got[0] != swarm || got[1] != automatic {
+		t.Fatalf("swarm group = %#v, want explicit and automatic swarm configs", got)
+	}
+
+	unavailable := groupDeployConfigsByMode([]*deployConfig.Config{compose, swarm, automatic}, false)
+	if got := unavailable[false]; len(got) != 2 || got[0] != compose || got[1] != automatic {
+		t.Fatalf("unavailable swarm compose group = %#v, want explicit compose and automatic config", got)
+	}
+
+	if len(unavailable[true]) != 0 {
+		t.Fatalf("unavailable swarm group = %#v, want no valid swarm config", unavailable[true])
 	}
 }
 
@@ -73,6 +115,8 @@ func TestDeploy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	c.ConfigureGitAuth()
 
 	c.GitCommitStatus = false
 
@@ -108,7 +152,7 @@ func TestDeploy(t *testing.T) {
 		})
 	}
 
-	jobId := id.GenID()
+	jobId := id.New()
 
 	p := webhook.ParsedPayload{
 		Ref:       "7be81e788a40724cee7542eec00a2af0c4340eba",
@@ -117,106 +161,268 @@ func TestDeploy(t *testing.T) {
 		CloneURL:  "https://github.com/kimdre/doco-cd_tests.git",
 		Private:   false,
 	}
+	swarmMode := resolveTestSwarmMode(t, dockerCli.Client())
 
 	tmpDir := t.TempDir()
-	// Use a test-unique repository name so this test's reconciliation job key does not
-	// collide with other package tests that may run in parallel.
-	repoName := test.ConvertTestName(t.Name()) + "-repo"
-	repoPath := filepath.Join(tmpDir, repoName)
 
-	_, err = git.CloneOrUpdateRepository(log, p.CloneURL, p.Ref,
-		repoPath, repoPath,
-		p.Private, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase, c.GitAccessToken, c.SkipTLSVerification,
-		c.HttpProxy, c.GitCloneSubmodules, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	stackName := test.ConvertTestName(t.Name())
-
-	dcs, err := deployConfig.GetConfigs(repoPath, c.DeployConfigBaseDir, "", p.Ref, nil)
-
-	// commit have 5 apps
-	// https://github.com/kimdre/doco-cd_tests/blob/7be81e788a40724cee7542eec00a2af0c4340eba/.doco-cd.yml
-	for _, dc := range dcs {
-		dc.Name = stackName + "-" + dc.Name
-	}
-
-	dcs[0].Reconciliation.Enabled = false
-	dcs[1].Reconciliation.Events = []string{"stop"}
-
-	// The default reconciliation events don't include "die".
-	// Explicitly enable it for dcs[2..4] so the test's forceful container
-	// removal (which emits a "die" event) triggers reconciliation as expected.
-	for _, dc := range dcs[2:] {
-		dc.Reconciliation.Events = []string{"die"}
-	}
-
-	t.Cleanup(func() {
-		for _, dc := range dcs {
-			waitForStackDeploymentToFinish(t, repoName, dc.Name, 20*time.Second)
-		}
-
-		reconciliationHandler.close()
-
-		for _, dc := range dcs {
-			ctx := context.Background()
-			if err := destroyTestStack(ctx, dockerCli.Client(), dc.Name); err != nil {
-				t.Error("destroyTestStack err", err)
-			}
-		}
-	})
-
-	if err := Deploy(ctx, log, c,
-		container.MountPoint{
+	manager := newTestManagerWithDependencies(t, Dependencies{
+		AppConfig: c,
+		DataMountPoint: container.MountPoint{
 			Type:        "bind",
 			Source:      tmpDir,
 			Destination: tmpDir,
 			Mode:        "rw",
 		},
-		dockerCli,
-		&secretProvider,
-		notification.Metadata{
+		DockerCLI:      dockerCli,
+		SecretProvider: secretProvider,
+	})
+
+	// Use a test-unique repository name so this test's reconciliation job key does not
+	// collide with other package tests that may run in parallel.
+	repoName := test.ConvertTestName(t.Name()) + "-repo"
+	// repoPath is the store root the deployment pipeline manages itself (mirror clone
+	// plus published artifacts, matching production's DataMountPoint.Destination/repoName
+	// layout) - it must stay empty until GitStore populates it. localRepoPath is a
+	// separate, test-only checkout used to read fixtures ahead of Deploy and, in Swarm
+	// mode, to serve the Swarm-compatible commit over a local file:// remote. Keeping
+	// them apart means Stage 5's legacy-leftover cleanup, which operates on repoPath,
+	// never mistakes localRepoPath's on-disk ".git" checkout for a legacy leftover of
+	// its own store.
+	repoPath := filepath.Join(tmpDir, repoName)
+	localRepoPath := filepath.Join(t.TempDir(), repoName)
+
+	auth, err := git.GetAuthMethod(p.CloneURL, c.SSHPrivateKey, c.SSHPrivateKeyPassphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if auth == nil && p.Private {
+		t.Fatal("missing auth for private repository")
+	}
+
+	// p.Ref is a raw commit hash here, possibly on a non-default branch, so clone all
+	// branches (no SingleBranch/ReferenceName restriction) and then check out that
+	// commit explicitly.
+	cloneOpts := &gogit.CloneOptions{
+		URL:             p.CloneURL,
+		Auth:            auth,
+		InsecureSkipTLS: c.SkipTLSVerification,
+	}
+
+	if c.HttpProxy != (transport.ProxyOptions{}) {
+		cloneOpts.ProxyOptions = c.HttpProxy
+	}
+
+	if c.GitCloneSubmodules {
+		cloneOpts.RecurseSubmodules = gogit.DefaultSubmoduleRecursionDepth
+	}
+
+	repo, err := gogit.PlainClone(localRepoPath, false, cloneOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := w.Checkout(&gogit.CheckoutOptions{
+		Hash: plumbing.NewHash(p.Ref),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if swarmMode {
+		makeDeployFixtureSwarmCompatible(t, localRepoPath)
+
+		// The deployment pipeline resolves Git sources from the CloneURL itself
+		// (via an immutable per-revision store), not from this on-disk checkout, so
+		// the Swarm-compatibility patch above only takes effect if it is committed
+		// and Deploy is pointed at this local repository instead of the upstream one.
+		hash, err := w.Commit("test: make fixtures Swarm-compatible", &gogit.CommitOptions{
+			All:    true,
+			Author: &object.Signature{Name: "doco-cd-tests", Email: "doco-cd-tests@example.com", When: time.Now()},
+		})
+		if err != nil {
+			t.Fatalf("failed to commit Swarm-compatible fixtures: %v", err)
+		}
+
+		// Move HEAD onto a branch pointing at the new commit instead of leaving it
+		// detached: go-git's client-side ref-advertisement fallback (used because our
+		// in-process file transport doesn't send the "symref" capability) guesses which
+		// branch HEAD points to by hash. With a detached HEAD, no branch matches, and it
+		// falls back to matching the synthetic "HEAD" ref against itself, producing a
+		// self-referential symbolic ref that sends go-git's reference resolution into
+		// unbounded recursion on the very next clone/fetch.
+		branchRef := plumbing.NewHashReference(plumbing.NewBranchReferenceName("swarm-compatible"), hash)
+		if err := repo.Storer.SetReference(branchRef); err != nil {
+			t.Fatalf("failed to create branch for Swarm-compatible commit: %v", err)
+		}
+
+		if err := w.Checkout(&gogit.CheckoutOptions{Branch: branchRef.Name()}); err != nil {
+			t.Fatalf("failed to check out Swarm-compatible branch: %v", err)
+		}
+
+		p.Ref = hash.String()
+		p.CommitSHA = hash
+		p.CloneURL = "file://" + localRepoPath
+	}
+
+	stackName := test.ConvertTestName(t.Name())
+
+	dcs, err := deployConfig.GetConfigs(ctx, localRepoPath, c.DeployConfigBaseDir, "", p.Ref, "", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if len(dcs) != 5 {
+		t.Fatalf("expected five deployment configs, got %d", len(dcs))
+	}
+
+	for _, dc := range dcs {
+		dc.Name = stackName + "-" + dc.Name
+	}
+
+	dcs[0].Reconciliation.Enabled = false
+	if swarmMode {
+		// Service removal emits "remove", normalized to "destroy". App2 subscribes
+		// to a different service event so only app3 through app5 are redeployed.
+		dcs[1].Reconciliation.Events = []string{"update"}
+		for _, dc := range dcs[2:] {
+			dc.Reconciliation.Events = []string{"destroy"}
+		}
+	} else {
+		// Force-removing a container emits "die", not "stop".
+		dcs[1].Reconciliation.Events = []string{"stop"}
+		for _, dc := range dcs[2:] {
+			dc.Reconciliation.Events = []string{"die"}
+		}
+	}
+
+	t.Cleanup(func() {
+		for _, dc := range dcs {
+			waitForStackDeploymentToFinish(t, manager, repoName, dc.Context, dc.Name, 20*time.Second)
+		}
+
+		manager.Close()
+
+		for _, dc := range dcs {
+			ctx := context.Background()
+			if swarmMode {
+				if err := removeTestSwarmStack(ctx, dockerCli, dc.Name); err != nil {
+					t.Error("removeTestSwarmStack err", err)
+				}
+			} else if err := destroyTestStack(ctx, dockerCli.Client(), dc.Name); err != nil {
+				t.Error("destroyTestStack err", err)
+			}
+		}
+	})
+
+	if err := manager.Deploy(ctx, DeployRequest{
+		Logger: log,
+		Metadata: notification.Metadata{
 			JobID:      jobId,
 			Repository: repoName,
 			Revision:   notification.GetRevision(p.Ref, p.CommitSHAString()),
 		},
-		stages.JobTriggerWebhook,
-		stages.RepositoryData{
+		JobTrigger: stages.JobTriggerWebhook,
+		Repository: stages.RepositoryData{
 			SourceUrl:    p.CloneURL,
 			Name:         repoName,
 			PathInternal: repoPath,
 			PathExternal: repoPath,
 		},
-		dcs,
-
-		&p,
-		"",
-	); err != nil {
+		DeployConfigs: dcs,
+		Payload:       &p,
+	}); err != nil {
 		t.Fatalf("Failed to deploy: %v", err)
 	}
 
-	wanted := []string{}
+	wanted := make([]string, 0, len(dcs))
 	for _, dc := range dcs {
-		wanted = append(wanted, dc.Name+"-test-1")
+		wanted = append(wanted, dc.Name)
 	}
 
 	firstPartWanted := []string{wanted[2], wanted[3], wanted[4]}
 
 	slices.Sort(wanted)
 
-	waitForRunningContainerNames(ctx, t, dockerCli.Client(), stackName, wanted, 20*time.Second)
-	waitForReconciliationJobReady(t, repoName, 5*time.Second)
+	waitForRunningDeploymentNames(ctx, t, dockerCli.Client(), swarmMode, stackName, wanted, 20*time.Second)
+	waitForReconciliationJobReady(t, manager, repoName, 5*time.Second)
 
-	if err := rmContainer(ctx, t, dockerCli.Client(), wanted); err != nil {
-		t.Fatal("rm container err:", err)
+	if swarmMode {
+		removeSwarmServices(ctx, t, dockerCli.Client(), dcs)
+	} else {
+		if err := rmContainersForDeployments(ctx, t, dockerCli.Client(), wanted); err != nil {
+			t.Fatal("rm container err:", err)
+		}
+
+		waitForRunningDeploymentNames(ctx, t, dockerCli.Client(), false, stackName, nil, 20*time.Second)
 	}
 
-	waitForRunningContainerNames(ctx, t, dockerCli.Client(), stackName, nil, 20*time.Second)
-	waitForRunningContainerNames(ctx, t, dockerCli.Client(), stackName, firstPartWanted, 20*time.Second)
+	reconciliationTimeout := 20 * time.Second
+	if swarmMode {
+		reconciliationTimeout = 60 * time.Second
+	}
+
+	waitForRunningDeploymentNames(ctx, t, dockerCli.Client(), swarmMode, stackName, firstPartWanted, reconciliationTimeout)
 }
 
-func getRunningContainerNames(ctx context.Context, cli client.APIClient, stackName string) ([]string, error) {
+func makeDeployFixtureSwarmCompatible(t *testing.T, repoPath string) {
+	t.Helper()
+
+	for _, relativePath := range []string{
+		"deploy/app1/docker-compose.yml",
+		"deploy/app2/docker-compose.yml",
+	} {
+		path := filepath.Join(repoPath, relativePath)
+
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("failed to read Compose fixture %q: %v", relativePath, err)
+		}
+
+		updated := strings.ReplaceAll(string(contents), "    scale: 1\n", "")
+		if updated == string(contents) {
+			t.Fatalf("Compose fixture %q no longer contains the expected Swarm-incompatible scale option", relativePath)
+		}
+
+		// #nosec G703: relativePath comes from the fixed test fixture list above.
+		if err := os.WriteFile(path, []byte(updated), 0o600); err != nil {
+			t.Fatalf("failed to update Compose fixture %q: %v", relativePath, err)
+		}
+	}
+}
+
+func getRunningDeploymentNames(ctx context.Context, cli client.APIClient, swarmMode bool, stackName string) ([]string, error) {
+	if swarmMode {
+		result, err := cli.ServiceList(ctx, client.ServiceListOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		names := set.New[string]()
+
+		for _, service := range result.Items {
+			name := docker.SwarmServiceLabels(service)[docker.DocoCDLabels.Deployment.Name]
+			if !strings.HasPrefix(name, stackName+"-") {
+				continue
+			}
+
+			running, err := swarmServiceHasRunningTask(ctx, cli, service.ID)
+			if err != nil {
+				return nil, err
+			}
+
+			if running {
+				names.Add(name)
+			}
+		}
+
+		return set.SortedSlice(names), nil
+	}
+
 	result, err := cli.ContainerList(ctx, client.ContainerListOptions{
 		All: false,
 	})
@@ -224,37 +430,65 @@ func getRunningContainerNames(ctx context.Context, cli client.APIClient, stackNa
 		return nil, err
 	}
 
-	stackContainerPrefix := stackName + "-"
-
-	got := []string{}
+	names := set.New[string]()
 
 	for _, c := range result.Items {
-		name := strings.TrimPrefix(c.Names[0], "/")
-		if strings.HasPrefix(name, stackContainerPrefix) {
-			got = append(got, name)
+		name := c.Labels[docker.DocoCDLabels.Deployment.Name]
+		if strings.HasPrefix(name, stackName+"-") {
+			names.Add(name)
 		}
 	}
 
-	slices.Sort(got)
-
-	return got, nil
+	return set.SortedSlice(names), nil
 }
 
-func rmContainer(ctx context.Context, t *testing.T, cli client.APIClient, containerNames []string) error {
+func swarmServiceHasRunningTask(ctx context.Context, cli client.APIClient, serviceID string) (bool, error) {
+	result, err := cli.TaskList(ctx, client.TaskListOptions{
+		Filters: make(client.Filters).Add("service", serviceID),
+	})
+	if err != nil {
+		return false, err
+	}
+
+	for _, task := range result.Items {
+		if task.DesiredState == swarmTypes.TaskStateRunning && task.Status.State == swarmTypes.TaskStateRunning {
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+func rmContainersForDeployments(ctx context.Context, t *testing.T, cli client.APIClient, deploymentNames []string) error {
+	result, err := cli.ContainerList(ctx, client.ContainerListOptions{
+		All:     false,
+		Filters: make(client.Filters).Add("label", docker.DocoCDLabels.Metadata.Manager+"="+app.Name),
+	})
+	if err != nil {
+		return err
+	}
+
+	deployments := set.New(deploymentNames...)
+
 	wg := sync.WaitGroup{}
-	for _, containerName := range containerNames {
+
+	for _, container := range result.Items {
+		if !deployments.Contains(container.Labels[docker.DocoCDLabels.Deployment.Name]) {
+			continue
+		}
+
 		wg.Add(1)
 
-		go func(name string) {
+		go func(containerID string) {
 			defer wg.Done()
 
-			_, err := cli.ContainerRemove(ctx, name, client.ContainerRemoveOptions{
+			_, err := cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{
 				Force: true,
 			})
 			if err != nil {
-				t.Errorf("rm container %s err: %v", name, err)
+				t.Errorf("rm container %s err: %v", containerID, err)
 			}
-		}(containerName)
+		}(container.ID)
 	}
 
 	wg.Wait()
@@ -262,13 +496,45 @@ func rmContainer(ctx context.Context, t *testing.T, cli client.APIClient, contai
 	return nil
 }
 
-func waitForStackDeploymentToFinish(t *testing.T, repository, stack string, timeout time.Duration) {
+func removeSwarmServices(ctx context.Context, t *testing.T, cli client.APIClient, dcs []*deployConfig.Config) {
+	t.Helper()
+
+	for _, dc := range dcs {
+		services, err := dockerSwarm.GetStackServices(ctx, cli, dc.Name)
+		if err != nil {
+			t.Fatalf("failed to list services for Swarm stack %q: %v", dc.Name, err)
+		}
+
+		for _, service := range services {
+			if _, err := cli.ServiceRemove(ctx, service.ID, client.ServiceRemoveOptions{}); err != nil {
+				t.Fatalf("failed to remove service %q from Swarm stack %q: %v", service.Spec.Name, dc.Name, err)
+			}
+		}
+	}
+}
+
+func removeTestSwarmStack(ctx context.Context, dockerCli command.Cli, stackName string) error {
+	var err error
+
+	for range 5 {
+		err = docker.RemoveSwarmStack(ctx, dockerCli, stackName)
+		if err == nil {
+			return nil
+		}
+
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	return err
+}
+
+func waitForStackDeploymentToFinish(t *testing.T, manager *Manager, repository, context, stack string, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
 
 	for {
-		if !reconciliationHandler.isStackDeploymentInProgress(repository, stack) {
+		if !manager.deployments.isInProgress(repository, context, stack) {
 			return
 		}
 
@@ -280,19 +546,24 @@ func waitForStackDeploymentToFinish(t *testing.T, repository, stack string, time
 	}
 }
 
-func waitForReconciliationJobReady(t *testing.T, repository string, timeout time.Duration) {
+func waitForReconciliationJobReady(t *testing.T, manager *Manager, repository string, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
 
 	for {
-		reconciliationHandler.m.Lock()
-		job := reconciliationHandler.repoJobs[repository]
-		ready := job != nil && job.contextCLIs != nil
-		reconciliationHandler.m.Unlock()
+		manager.jobs.mu.Lock()
+		job := manager.jobs.jobs[repository]
+		manager.jobs.mu.Unlock()
 
-		if ready {
-			return
+		// readyChan closes once the job's event listeners are subscribed. Unlike
+		// contextCLIs, it is safe to observe from outside the job goroutine.
+		if job != nil {
+			select {
+			case <-job.readyChan:
+				return
+			default:
+			}
 		}
 
 		if time.Now().After(deadline) {
@@ -303,15 +574,15 @@ func waitForReconciliationJobReady(t *testing.T, repository string, timeout time
 	}
 }
 
-func waitForRunningContainerNames(ctx context.Context, t *testing.T, cli client.APIClient, stackName string, want []string, timeout time.Duration) {
+func waitForRunningDeploymentNames(ctx context.Context, t *testing.T, cli client.APIClient, swarmMode bool, stackName string, want []string, timeout time.Duration) {
 	t.Helper()
 
 	deadline := time.Now().Add(timeout)
 
 	for {
-		got, err := getRunningContainerNames(ctx, cli, stackName)
+		got, err := getRunningDeploymentNames(ctx, cli, swarmMode, stackName)
 		if err != nil {
-			t.Fatal("get containers err:", err)
+			t.Fatal("get deployments err:", err)
 		}
 
 		if slices.Equal(want, got) {
@@ -319,7 +590,7 @@ func waitForRunningContainerNames(ctx context.Context, t *testing.T, cli client.
 		}
 
 		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for running containers %v, got %v", want, got)
+			t.Fatalf("timed out waiting for running deployments %v, got %v", want, got)
 		}
 
 		time.Sleep(250 * time.Millisecond)
@@ -353,7 +624,12 @@ func destroyTestStack(ctx context.Context, cli client.APIClient, stackName strin
 		}
 	}
 
-	if err := docker.RemoveLabeledVolumes(ctx, cli, dockerSwarm.GetModeEnabled(), stackName); err != nil {
+	swarmMode, err := dockerSwarm.ResolveModeEnabled(ctx, cli)
+	if err != nil {
+		return err
+	}
+
+	if err := docker.RemoveLabeledVolumes(ctx, cli, swarmMode, stackName); err != nil {
 		return err
 	}
 

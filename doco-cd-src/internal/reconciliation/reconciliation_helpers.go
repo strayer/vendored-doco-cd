@@ -3,13 +3,16 @@ package reconciliation
 import (
 	"context"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/containerd/errdefs"
+	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/types/clone"
 	"github.com/kimdre/doco-cd/internal/common/types/set"
 
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
@@ -25,6 +28,32 @@ func dockerEventTypeForMode(swarmMode bool) string {
 	}
 
 	return "container"
+}
+
+func swarmEventServiceName(ctx context.Context, cli command.Cli, event events.Message) (string, error) {
+	for _, key := range []string{"name", "com.docker.swarm.service.name", "service"} {
+		if name := strings.TrimSpace(event.Actor.Attributes[key]); name != "" {
+			return name, nil
+		}
+	}
+
+	if event.Actor.ID == "" || cli == nil {
+		return swarm.UnavailableIdentity, nil
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	result, err := cli.Client().ServiceInspect(lookupCtx, event.Actor.ID, client.ServiceInspectOptions{})
+	if err != nil {
+		return swarm.UnavailableIdentity, err
+	}
+
+	return swarm.OrUnavailable(result.Service.Spec.Name), nil
+}
+
+func withSwarmServiceIdentity(log *slog.Logger, name, id string) *slog.Logger {
+	return log.With(swarm.ServiceLogAttrs(name, id)...)
 }
 
 func dockerEventFiltersForActions(actions []string, swarmMode bool) []string {
@@ -63,7 +92,7 @@ const containerRemovalSettleTimeout = 15 * time.Second
 // (inspect returns not-found) or no longer reported as "removing", or until the
 // timeout elapses. This prevents a race between Docker's async container teardown
 // and docker compose trying to recreate the container.
-func waitForContainerRemovalSettled(ctx context.Context, jobLog *slog.Logger, cli client.APIClient, containerID string, timeout time.Duration) {
+func (j *job) waitForContainerRemovalSettled(ctx context.Context, jobLog *slog.Logger, cli client.APIClient, containerID string, timeout time.Duration) {
 	if containerID == "" || timeout <= 0 {
 		return
 	}
@@ -71,7 +100,7 @@ func waitForContainerRemovalSettled(ctx context.Context, jobLog *slog.Logger, cl
 	deadline := time.Now().Add(timeout)
 
 	for {
-		inspectResult, err := cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+		state, err := j.manager.runtimeQueries.InspectContainerState(ctx, cli, containerID)
 		if err != nil {
 			// Treat any inspect error (most importantly "no such container") as
 			// "container is gone, safe to proceed".
@@ -87,7 +116,6 @@ func waitForContainerRemovalSettled(ctx context.Context, jobLog *slog.Logger, cl
 			return
 		}
 
-		state := inspectResult.Container.State
 		if state == nil || !strings.EqualFold(strings.TrimSpace(string(state.Status)), "removing") {
 			return
 		}
@@ -109,6 +137,8 @@ func waitForContainerRemovalSettled(ctx context.Context, jobLog *slog.Logger, cl
 	}
 }
 
+// deployConfigsByName filters the given slice of deployConfig.Config pointers
+// to only those with a matching Name field.
 func deployConfigsByName(dcs []*deployConfig.Config, name string) []*deployConfig.Config {
 	result := make([]*deployConfig.Config, 0, len(dcs))
 
@@ -183,18 +213,23 @@ func matchCandidateStackName(identifier string, candidates []*deployConfig.Confi
 	return ""
 }
 
+// cloneDeployConfigsWithForcedRecreate creates a deep copy of the given slice of deployConfig.Config pointers,
+// setting the ForceRecreate field to true for each copied config. This is used to ensure that a reconciliation
+// deploy will forcefully recreate the associated containers/services.
 func cloneDeployConfigsWithForcedRecreate(dcs []*deployConfig.Config) []*deployConfig.Config {
 	reconcileDCs := make([]*deployConfig.Config, len(dcs))
 
 	for i, dc := range dcs {
-		dcCopy := *dc
+		dcCopy := clone.New(dc)
 		dcCopy.ForceRecreate = true
-		reconcileDCs[i] = &dcCopy
+		reconcileDCs[i] = dcCopy
 	}
 
 	return reconcileDCs
 }
 
+// shouldIgnoreRestartReconciliationForScheduledJob determines whether a reconciliation event for a scheduled job
+// that is stopping should be ignored. This is to prevent unnecessary redeploys for scheduled jobs that are stopping.
 func shouldIgnoreRestartReconciliationForScheduledJob(action string, labels map[string]string) bool {
 	action = normalizeReconciliationEventAction(action)
 	if action != "stop" {
@@ -209,6 +244,20 @@ func shouldIgnoreRestartReconciliationForScheduledJob(action string, labels map[
 	return true
 }
 
+// shouldIgnoreOneShotCompletionReconciliation determines whether a reconciliation event for a one-shot container
+// that exited successfully (exit code 0) should be ignored. This is to prevent unnecessary redeploys for
+// one-shot containers that complete their work successfully.
+func shouldIgnoreOneShotCompletionReconciliation(action string, labels map[string]string) bool {
+	if normalizeReconciliationEventAction(action) != "die" || strings.TrimSpace(labels["exitCode"]) != "0" {
+		return false
+	}
+
+	oneShot, err := strconv.ParseBool(strings.TrimSpace(labels[docker.DocoCDLabels.Deployment.OneShot]))
+
+	return err == nil && oneShot
+}
+
+// normalizeReconciliationEventAction normalizes the given Docker event action string to a canonical form.
 func normalizeReconciliationEventAction(action string) string {
 	action = strings.ToLower(strings.TrimSpace(action))
 	action = strings.Join(strings.Fields(action), " ")

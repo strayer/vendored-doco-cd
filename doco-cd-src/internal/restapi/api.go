@@ -1,6 +1,7 @@
 package restapi
 
 import (
+	"crypto/subtle"
 	"errors"
 	"net/http"
 )
@@ -8,8 +9,9 @@ import (
 const KeyHeader = "x-api-key" // Header for API key
 
 var (
-	ErrInvalidApiKey = errors.New("invalid api key")
-	ErrInvalidAction = errors.New("invalid action")
+	ErrInvalidApiKey     = errors.New("invalid api key")
+	ErrInvalidAction     = errors.New("invalid action")
+	ErrInvalidHTTPMethod = errors.New("invalid http method")
 )
 
 // ValidateApiKey checks if the provided API key matches the one in the request header.
@@ -18,5 +20,5 @@ func ValidateApiKey(r *http.Request, apiKey string) bool {
 		return false
 	}
 
-	return r.Header.Get(KeyHeader) == apiKey
+	return subtle.ConstantTimeCompare([]byte(r.Header.Get(KeyHeader)), []byte(apiKey)) == 1
 }

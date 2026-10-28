@@ -50,11 +50,11 @@ func TestAddSwarmServiceLabels_UsesServiceLevelLabels(t *testing.T) {
 		WebURL:    "https://github.com/kimdre/doco-cd_tests",
 	}
 
-	addSwarmServiceLabels(stack, nil, deployConfig, payload, "/repo", "dev", "2026-01-01T00:00:00Z", "def456", "projecthash")
+	addSwarmServiceLabels(stack, nil, deployConfig, payload, "", "/repo", "dev", "2026-01-01T00:00:00Z", "def456", "projecthash")
 
 	// Labels that may differ between deployments of the same stack must never end up
-	// in the task template. Source.URL is included because it differs between webhook
-	// and poll triggers for the same repository.
+	// in the task template. Source.URL is included because it can differ
+	// between webhook and poll triggers for the same repository.
 	unstableLabels := []string{
 		DocoCDLabels.Metadata.Version,
 		DocoCDLabels.Deployment.Timestamp,
@@ -65,13 +65,15 @@ func TestAddSwarmServiceLabels_UsesServiceLevelLabels(t *testing.T) {
 		DocoCDLabels.Deployment.AutoDiscovery,
 		DocoCDLabels.Deployment.AutoDiscoveryConfig,
 		DocoCDLabels.Source.URL,
+		// Every revision is deployed from its own artifact directory, see
+		// https://github.com/kimdre/doco-cd/issues/1909.
+		DocoCDLabels.Deployment.WorkingDir,
 	}
 
 	// Stable labels keep the containers identifiable on worker nodes.
 	stableLabels := []string{
 		DocoCDLabels.Metadata.Manager,
 		DocoCDLabels.Deployment.Name,
-		DocoCDLabels.Deployment.WorkingDir,
 		DocoCDLabels.Deployment.ConfigTarget,
 		DocoCDLabels.Deployment.TargetRef,
 		DocoCDLabels.Source.Type,
@@ -149,7 +151,7 @@ func TestAddSwarmServiceLabels_ScopesCertLabelsPerService(t *testing.T) {
 		FullName:  "kimdre/doco-cd_tests",
 	}
 
-	addSwarmServiceLabels(stack, project, deployConfig, payload, "/repo", "dev", "2026-01-01T00:00:00Z", "def456", "projecthash")
+	addSwarmServiceLabels(stack, project, deployConfig, payload, "", "/repo", "dev", "2026-01-01T00:00:00Z", "def456", "projecthash")
 
 	byName := make(map[string]composetypes.ServiceConfig, len(stack.Services))
 	for _, s := range stack.Services {
@@ -187,7 +189,7 @@ func TestAddSwarmVolumeLabels_OmitsUnstableLabels(t *testing.T) {
 	deployConfig := &deploy.Config{Name: "test-stack"}
 	payload := &webhook.ParsedPayload{CommitSHA: plumbing.NewHash(strings.Repeat("a", 40)), FullName: "kimdre/doco-cd_tests"}
 
-	addSwarmVolumeLabels(stack, deployConfig, payload, "/repo")
+	addSwarmVolumeLabels(stack, deployConfig, payload)
 
 	labels := stack.Volumes["data"].Labels
 	if len(labels) == 0 {
@@ -200,6 +202,7 @@ func TestAddSwarmVolumeLabels_OmitsUnstableLabels(t *testing.T) {
 		DocoCDLabels.Deployment.Trigger,
 		DocoCDLabels.Metadata.Version,
 		DocoCDLabels.Source.URL,
+		DocoCDLabels.Deployment.WorkingDir,
 	} {
 		if _, ok := labels[label]; ok {
 			t.Errorf("label %q must not be set on volumes, it changes between deployments", label)
@@ -226,19 +229,6 @@ func TestSwarmServiceLabels(t *testing.T) {
 			want: Labels{DocoCDLabels.Deployment.Name: "stack"},
 		},
 		{
-			name: "container spec labels of a stack deployed by an earlier version",
-			service: swarmTypes.Service{
-				Spec: swarmTypes.ServiceSpec{
-					TaskTemplate: swarmTypes.TaskSpec{
-						ContainerSpec: &swarmTypes.ContainerSpec{
-							Labels: map[string]string{DocoCDLabels.Deployment.Name: "legacy"},
-						},
-					},
-				},
-			},
-			want: Labels{DocoCDLabels.Deployment.Name: "legacy"},
-		},
-		{
 			name: "service spec labels take precedence",
 			service: swarmTypes.Service{
 				Spec: swarmTypes.ServiceSpec{
@@ -257,7 +247,6 @@ func TestSwarmServiceLabels(t *testing.T) {
 			},
 			want: Labels{
 				DocoCDLabels.Deployment.Timestamp: "new",
-				DocoCDJobLabels.JobEnabled:        "true",
 			},
 		},
 		{

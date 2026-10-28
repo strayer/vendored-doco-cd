@@ -2,7 +2,6 @@ package swarm
 
 import (
 	"context"
-	"sync/atomic"
 
 	"github.com/docker/cli/cli/compose/convert"
 	"github.com/moby/moby/api/types/network"
@@ -14,50 +13,8 @@ const (
 	StackNamespaceLabel = "com.docker.stack.namespace"
 )
 
-var (
-	// disable swarm feature even if the daemon is running in swarm mode.
-	disableSwarmFeature atomic.Bool
-	modeEnabled         atomic.Bool
-)
-
-// SetDisableSwarmFeature, disable swarm feature.
-func SetDisableSwarmFeature(ignore bool) {
-	disableSwarmFeature.Store(ignore)
-}
-
-// GetModeEnabled, Whether the docker host is running in swarm mode,
-// it will return false if ignoreSwarmFeature is true.
-func GetModeEnabled() bool {
-	return getModeEnabled(disableSwarmFeature.Load(), modeEnabled.Load())
-}
-
-func getModeEnabled(disableSwarmFeature, modeEnabled bool) bool {
-	return !disableSwarmFeature && modeEnabled
-}
-
-func RefreshModeEnabled(ctx context.Context, dockerClient client.APIClient) error {
-	// ignore swarm feature
-	if disableSwarmFeature.Load() {
-		return nil
-	}
-
-	enable, err := checkDaemonIsSwarmManager(ctx, dockerClient)
-	if err != nil {
-		return err
-	}
-
-	modeEnabled.Store(enable)
-
-	return nil
-}
-
-// ResolveModeEnabled returns whether swarm mode should be treated as enabled for
-// the provided docker client, honoring the global disable flag.
+// ResolveModeEnabled returns whether the provided Docker daemon is a Swarm manager.
 func ResolveModeEnabled(ctx context.Context, dockerClient client.APIClient) (bool, error) {
-	if disableSwarmFeature.Load() {
-		return false, nil
-	}
-
 	return checkDaemonIsSwarmManager(ctx, dockerClient)
 }
 
@@ -66,7 +23,7 @@ func getStackFilter(namespace string) client.Filters {
 }
 
 func GetStackServices(ctx context.Context, apiclient client.APIClient, namespace string) ([]swarm.Service, error) {
-	result, err := apiclient.ServiceList(ctx, client.ServiceListOptions{Filters: getStackFilter(namespace)})
+	result, err := apiclient.ServiceList(ctx, client.ServiceListOptions{Filters: getStackFilter(namespace), Status: true})
 	if err != nil {
 		return nil, err
 	}
@@ -78,6 +35,36 @@ func GetServicesByLabel(ctx context.Context, apiclient client.APIClient, labelKe
 	filter := make(client.Filters).Add("label", labelKey+"="+labelValue)
 
 	result, err := apiclient.ServiceList(ctx, client.ServiceListOptions{Filters: filter})
+	if err != nil {
+		return nil, err
+	}
+
+	return result.Items, nil
+}
+
+// GetServicesByLabelKey retrieves all services that carry labelKey,
+// regardless of its value. Unlike GetServicesByLabel, this does not require
+// knowing the label's value in advance - it is used for discovery scans
+// (e.g. garbage collection) that need every doco-cd-managed service
+// regardless of which value a label was stamped with.
+func GetServicesByLabelKey(ctx context.Context, apiclient client.APIClient, labelKey string) ([]swarm.Service, error) {
+	filter := make(client.Filters).Add("label", labelKey)
+
+	result, err := apiclient.ServiceList(ctx, client.ServiceListOptions{Filters: filter})
+	if err != nil {
+		return nil, err
+	}
+
+	return result.Items, nil
+}
+
+// GetServicesWithStatusByLabel retrieves the services that carry the label
+// with the given value. The result includes the task counts in ServiceStatus,
+// which Docker only fills on request.
+func GetServicesWithStatusByLabel(ctx context.Context, apiclient client.APIClient, labelKey, labelValue string) ([]swarm.Service, error) {
+	filter := make(client.Filters).Add("label", labelKey+"="+labelValue)
+
+	result, err := apiclient.ServiceList(ctx, client.ServiceListOptions{Filters: filter, Status: true})
 	if err != nil {
 		return nil, err
 	}
@@ -124,7 +111,7 @@ func getStackTasks(ctx context.Context, apiclient client.APIClient, namespace st
 func GetStacks(ctx context.Context, apiclient client.APIClient) (map[string][]swarm.Service, error) {
 	stacks := make(map[string][]swarm.Service)
 
-	result, err := apiclient.ServiceList(ctx, client.ServiceListOptions{})
+	result, err := apiclient.ServiceList(ctx, client.ServiceListOptions{Status: true})
 	if err != nil {
 		return nil, err
 	}

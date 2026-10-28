@@ -5,7 +5,9 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -37,7 +39,7 @@ func TestSend(t *testing.T) {
 		Repository: "test",
 		Stack:      "test-stack",
 		Revision:   "main",
-		JobID:      id.GenID(),
+		JobID:      id.New(),
 	}
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -57,16 +59,23 @@ func TestSend(t *testing.T) {
 
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Cannot run tests in parallel because SetAppriseConfig modifies global variables
-			if err := SetAppriseConfig(server.URL, tc.appriseURL, "info", ""); err != nil {
-				t.Fatalf("failed to set apprise config: %v", err)
+			t.Parallel()
+
+			notifier, err := New(Config{
+				APIURL:                server.URL,
+				NotifyURLs:            tc.appriseURL,
+				NotifyLevel:           "info",
+				FailureRepeatInterval: DefaultFailureRepeatInterval,
+			})
+			if err != nil {
+				t.Fatalf("failed to create notifier: %v", err)
 			}
 
-			err := Send(Info, "Test Notification", "This is a test message", metadata)
+			err = notifier.Send(Info, "Test Notification", "This is a test message", metadata)
 			if tc.expectedErr == nil {
 				if err != nil {
 					t.Fatalf("unexpected error: %v", err)
@@ -79,6 +88,123 @@ func TestSend(t *testing.T) {
 				t.Fatalf("expected error wrapping %q, got: %v", tc.expectedErr, err)
 			}
 		})
+	}
+}
+
+func TestNewValidatesBodyTemplate(t *testing.T) {
+	t.Parallel()
+
+	if _, err := New(Config{BodyTemplate: "{{.Missing}}"}); !errors.Is(err, ErrInvalidTemplate) {
+		t.Fatalf("New() error = %v, want ErrInvalidTemplate", err)
+	}
+}
+
+// TestNotifierEnabled pins which levels Send delivers, so callers can skip building
+// notifications that would be dropped.
+func TestNotifierEnabled(t *testing.T) {
+	t.Parallel()
+
+	levels := []Level{Info, Success, Warning, Failure}
+
+	testCases := []struct {
+		name   string
+		config Config
+		want   []bool // indexed like levels
+	}{
+		{
+			name:   "unconfigured",
+			config: Config{NotifyLevel: "info"},
+			want:   []bool{false, false, false, false},
+		},
+		{
+			name:   "missing notify URLs",
+			config: Config{APIURL: "http://apprise.test", NotifyLevel: "info"},
+			want:   []bool{false, false, false, false},
+		},
+		{
+			name:   "info level",
+			config: Config{APIURL: "http://apprise.test", NotifyURLs: "apprise://x", NotifyLevel: "info"},
+			want:   []bool{true, true, true, true},
+		},
+		{
+			name:   "success level",
+			config: Config{APIURL: "http://apprise.test", NotifyURLs: "apprise://x", NotifyLevel: "success"},
+			want:   []bool{false, true, true, true},
+		},
+		{
+			name:   "failure level",
+			config: Config{APIURL: "http://apprise.test", NotifyURLs: "apprise://x", NotifyLevel: "failure"},
+			want:   []bool{false, false, false, true},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			notifier, err := New(tc.config)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			for i, level := range levels {
+				if got := notifier.Enabled(level); got != tc.want[i] {
+					t.Errorf("Enabled(%s) = %v, want %v", logLevels[level], got, tc.want[i])
+				}
+
+				if got := WouldSend(notifier, level); got != tc.want[i] {
+					t.Errorf("WouldSend(%s) = %v, want %v", logLevels[level], got, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+type plainSender struct{}
+
+func (plainSender) Send(Level, string, string, Metadata, ...SendOption) error { return nil }
+
+// TestWouldSendWithoutLevelEnabler keeps senders that cannot tell their levels
+// receiving every notification, as they did before callers started checking.
+func TestWouldSendWithoutLevelEnabler(t *testing.T) {
+	t.Parallel()
+
+	if !WouldSend(plainSender{}, Info) {
+		t.Fatal("WouldSend() = false for a sender without Enabled, want true")
+	}
+
+	if WouldSend(nil, Failure) {
+		t.Fatal("WouldSend(nil) = true, want false")
+	}
+}
+
+func TestNotifierFailureStateIsIsolated(t *testing.T) {
+	t.Parallel()
+
+	first, err := New(Config{FailureRepeatInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := New(Config{FailureRepeatInterval: time.Hour})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	key := failureKey(Metadata{Repository: "acme/repo", Stack: "app"})
+	fingerprint := failureFingerprint("Deployment Failed", "pull access denied")
+
+	if !first.shouldSendFailure(key, fingerprint, now) {
+		t.Fatal("first notifier should send its initial failure")
+	}
+
+	if first.shouldSendFailure(key, fingerprint, now.Add(time.Second)) {
+		t.Fatal("first notifier should suppress its unchanged failure")
+	}
+
+	if !second.shouldSendFailure(key, fingerprint, now.Add(time.Second)) {
+		t.Fatal("second notifier should have independent failure state")
 	}
 }
 
@@ -111,6 +237,113 @@ func TestSendIncludesAppriseErrorDetails(t *testing.T) {
 
 	if strings.Contains(got, "discord://user:pass@discord.example/abcd") {
 		t.Fatalf("expected sensitive url to be redacted, got %q", got)
+	}
+}
+
+func TestSendTimesOutOnUnresponsiveApprise(t *testing.T) {
+	t.Parallel()
+
+	if appriseClient.Timeout != appriseRequestTimeout {
+		t.Fatalf("Apprise client timeout = %s, want %s", appriseClient.Timeout, appriseRequestTimeout)
+	}
+
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		<-release
+	}))
+
+	defer server.Close()
+	defer close(release)
+
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	start := time.Now()
+
+	err := sendWithClient(client, server.URL, "apprise://example.test", "Test Notification", "This is a test message", "info")
+
+	var urlErr *url.Error
+	if !errors.As(err, &urlErr) || !urlErr.Timeout() {
+		t.Fatalf("expected a timeout error, got %v", err)
+	}
+
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("send returned after %s, want it bounded by the client timeout", elapsed)
+	}
+}
+
+func TestSendRetriesFailureAfterDeliveryError(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	notifier, err := New(Config{
+		APIURL:                server.URL,
+		NotifyURLs:            "apprise://example.test",
+		NotifyLevel:           "info",
+		FailureRepeatInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := Metadata{Repository: "acme/repo", Stack: "app"}
+	if err := notifier.Send(Failure, "Deployment Failed", "pull access denied", metadata); err == nil {
+		t.Fatal("first delivery should fail")
+	}
+
+	if err := notifier.Send(Failure, "Deployment Failed", "pull access denied", metadata); err != nil {
+		t.Fatalf("retry delivery failed: %v", err)
+	}
+
+	if requests.Load() != 2 {
+		t.Fatalf("failure delivery attempts = %d, want 2", requests.Load())
+	}
+}
+
+func TestSendSuppressesFailureAfterPartialDelivery(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusFailedDependency)
+	}))
+	defer server.Close()
+
+	notifier, err := New(Config{
+		APIURL:                server.URL,
+		NotifyURLs:            "apprise://example.test",
+		NotifyLevel:           "info",
+		FailureRepeatInterval: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	metadata := Metadata{Repository: "acme/repo", Stack: "app"}
+
+	err = notifier.Send(Failure, "Deployment Failed", "pull access denied", metadata)
+	if !errors.Is(err, ErrNotifyPartial) {
+		t.Fatalf("first delivery error = %v, want ErrNotifyPartial", err)
+	}
+
+	if err := notifier.Send(Failure, "Deployment Failed", "pull access denied", metadata); err != nil {
+		t.Fatalf("repeated failure should be suppressed: %v", err)
+	}
+
+	if requests.Load() != 1 {
+		t.Fatalf("failure delivery attempts = %d, want 1", requests.Load())
 	}
 }
 
@@ -248,7 +481,21 @@ func TestDefaultBody(t *testing.T) {
 			AffectedActorID:     "abc123def456",
 			AffectedActorName:   "prod_api",
 		})
-		expected := "Deployment triggered\n\nrepository: acme/api\nstack: prod\nreconciliation:\n  event: unhealthy\n  service_id: abc123def456\n  service_name: prod_api\n  trace_id: trace-123"
+		expected := "Deployment triggered\n\ncontext: default\nrepository: acme/api\nstack: prod\nreconciliation:\n  event: unhealthy\n  service_id: abc123def456\n  service_name: prod_api\n  trace_id: trace-123"
+
+		if message != expected {
+			t.Errorf("expected %q, got %q", expected, message)
+		}
+	})
+
+	t.Run("named docker context is included", func(t *testing.T) {
+		t.Parallel()
+
+		message := defaultBody("Deployment completed", Metadata{
+			Stack:   "prod",
+			Context: "remote",
+		})
+		expected := "Deployment completed\n\ncontext: remote\nstack: prod"
 
 		if message != expected {
 			t.Errorf("expected %q, got %q", expected, message)
@@ -362,7 +609,7 @@ func TestRenderTemplate(t *testing.T) {
 	t.Run("renders metadata fields and trims trailing newlines", func(t *testing.T) {
 		t.Parallel()
 
-		tmpl, err := validateTemplate("{{.Emoji}} {{.Title}} — {{.Target}}/{{.Stack}} @ {{.Revision}}\n")
+		tmpl, err := validateTemplate("{{.Emoji}} {{.Title}} - {{.Target}}/{{.Stack}} @ {{.Revision}}\n")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -373,7 +620,7 @@ func TestRenderTemplate(t *testing.T) {
 			Revision: "main (abc123)",
 			JobID:    "job-1",
 		})
-		expected := "✅ Deployment completed — prod-vm/app @ main (abc123)"
+		expected := "✅ Deployment completed - prod-vm/app @ main (abc123)"
 
 		if got != expected {
 			t.Errorf("expected %q, got %q", expected, got)

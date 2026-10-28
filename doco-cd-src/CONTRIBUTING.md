@@ -49,6 +49,22 @@ The CI pipeline will fail, if the code is not formatted correctly.
 Always add unit tests to verify your code. 
 Run the tests with `make test` or `make test-verbose` and run specific tests with `make test-run <testName>` (Verbose with `make test-run "-v <testName>"`).
 
+#### Deployment configuration schema
+
+The editor schema in `wiki/docs/schemas/deploy.schema.json` is generated from the deployment configuration types, their Go field comments, and `default` tags.
+The `hooks.deploy_schema` Markdown extension generates the schema automatically during documentation builds and serving, including `make wiki-serve` and the CI publishing workflow.
+The generated JSON is ignored by Git; commit changes to its Go sources and descriptions instead.
+For standalone regeneration without building the docs, run from the repository root:
+
+```bash
+go run ./cmd/deploy-schema
+```
+
+The generator handles YAML shorthand forms and editor constraints in `cmd/deploy-schema/`.
+Update those rules when changing custom unmarshaling or runtime validation.
+The existing Go test workflow checks deterministic generation, schema fields and defaults, and the published deployment examples without requiring a prebuilt JSON file.
+Run the focused tests with `go test ./cmd/deploy-schema`.
+
 #### With registry credentials
 
 You can provide container registry credentials to avoid rate limiting issues when running tests.
@@ -63,11 +79,15 @@ For example
 
 ```dotenv
 GIT_ACCESS_TOKEN=xxx
+GIT_AUTH_DOMAINS=- domains: [github.com]
 WEBHOOK_SECRET=test_secret
 SOPS_AGE_KEY=AGE-SECRET-KEY-xxx
 APPRISE_NOTIFY_URLS=xxx
 API_SECRET=xxx
 ```
+
+Doco-CD sends `GIT_ACCESS_TOKEN` only to the hosts in `GIT_AUTH_DOMAINS`, and it does not start if a token is set without them.
+The Makefile test targets read the `.env` file too, so the tests need `GIT_AUTH_DOMAINS` as well.
 
 Run the following command to build and run the doco-cd dev container:
 

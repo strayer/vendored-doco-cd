@@ -21,12 +21,11 @@ import (
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/moby/buildkit/frontend/dockerfile/dfgitutil"
 
-	"github.com/kimdre/doco-cd/internal/config/app"
-
-	"github.com/kimdre/doco-cd/internal/git"
+	"github.com/kimdre/doco-cd/internal/filesystem"
+	"github.com/kimdre/doco-cd/internal/source/store"
 )
 
-const gitIncludeCacheDirectory = "compose-git-cache"
+const gitIncludeCacheDirectory = store.ComposeGitCacheSubdir
 
 var gitIncludeLocks sync.Map
 
@@ -38,7 +37,6 @@ type gitResourceLoader struct {
 	cloneDepth      int
 	privateKey      string
 	keyPassphrase   string
-	accessToken     string
 	known           map[string]string
 	knownMu         sync.RWMutex
 }
@@ -80,31 +78,29 @@ type gitResourceLoaderConfig struct {
 	CloneDepth      int
 	PrivateKey      string
 	KeyPassphrase   string
-	AccessToken     string
 }
 
 // newRemoteResourceLoaders configures Git includes independently of the Docker CLI.
 // OCI includes require the Docker CLI for registry credentials.
-func newRemoteResourceLoaders(c *app.Config, dockerCli command.Cli, repoPath string) []loader.ResourceLoader {
-	cacheBase := resolveIncludeCacheBase(c, repoPath)
+func newRemoteResourceLoaders(opts ComposeLoadOptions, dockerCli command.Cli, repoPath string) []loader.ResourceLoader {
+	cacheBase := resolveIncludeCacheBase(opts, repoPath)
 
 	remoteLoaders := []loader.ResourceLoader{
 		newGitResourceLoader(gitResourceLoaderConfig{
 			CacheBase:       cacheBase,
-			SkipTLSVerify:   c.SkipTLSVerification,
-			ProxyOptions:    c.HttpProxy,
-			CloneSubmodules: c.GitCloneSubmodules,
-			CloneDepth:      c.GitCloneDepth,
-			PrivateKey:      c.SSHPrivateKey,
-			KeyPassphrase:   c.SSHPrivateKeyPassphrase,
-			AccessToken:     c.GitAccessToken,
+			SkipTLSVerify:   opts.SkipTLSVerify,
+			ProxyOptions:    opts.HttpProxy,
+			CloneSubmodules: opts.GitCloneSubmodules,
+			CloneDepth:      opts.GitCloneDepth,
+			PrivateKey:      opts.SSHPrivateKey,
+			KeyPassphrase:   opts.SSHPrivateKeyPassphrase,
 		}),
 	}
 	if dockerCli != nil {
 		remoteLoaders = append(remoteLoaders, loggingResourceLoader{
 			kind: "oci",
 			loader: remote.NewOCIRemoteLoader(dockerCli, false, api.OCIOptions{
-				InsecureRegistries: c.OciInsecureRegistries,
+				InsecureRegistries: opts.OciInsecureRegistries,
 			}),
 		})
 	}
@@ -112,7 +108,7 @@ func newRemoteResourceLoaders(c *app.Config, dockerCli command.Cli, repoPath str
 	return remoteLoaders
 }
 
-func resolveIncludeCacheBase(c *app.Config, repoPath string) string {
+func resolveIncludeCacheBase(opts ComposeLoadOptions, repoPath string) string {
 	repoPath = strings.TrimSpace(repoPath)
 	if repoPath != "" {
 		absRepoPath, err := filepath.Abs(repoPath)
@@ -121,14 +117,12 @@ func resolveIncludeCacheBase(c *app.Config, repoPath string) string {
 		}
 	}
 
-	if c != nil {
-		if base := strings.TrimSpace(c.DataHostPath); base != "" {
-			return base
-		}
+	if base := strings.TrimSpace(opts.DataHostPath); base != "" {
+		return base
+	}
 
-		if base := strings.TrimSpace(c.DataMountPath); base != "" {
-			return base
-		}
+	if base := strings.TrimSpace(opts.DataMountPath); base != "" {
+		return base
 	}
 
 	return os.TempDir()
@@ -149,7 +143,6 @@ func newGitResourceLoader(cfg gitResourceLoaderConfig) *gitResourceLoader {
 		cloneDepth:      cfg.CloneDepth,
 		privateKey:      cfg.PrivateKey,
 		keyPassphrase:   cfg.KeyPassphrase,
-		accessToken:     cfg.AccessToken,
 		known:           map[string]string{},
 	}
 }
@@ -198,19 +191,24 @@ func (g *gitResourceLoader) Load(ctx context.Context, resource string) (string, 
 	// The cache is keyed by remote and ref so that concurrently loaded includes
 	// of the same repository never switch the checkout under each other.
 	repoPath := filepath.Join(g.cacheDirectory, cacheKey(ref.Remote, ref.Ref))
+
+	if !filesystem.InBasePath(g.cacheDirectory, repoPath) {
+		return "", fmt.Errorf("%w: cache path escape detected %s", filesystem.ErrPathTraversal, repoPath)
+	}
+
 	slog.Debug("resolved git include cache path", slog.String("cache_path", repoPath))
 
 	lock, _ := gitIncludeLocks.LoadOrStore(repoPath, &sync.Mutex{})
 	repoLock := lock.(*sync.Mutex)
 	repoLock.Lock()
-	err = g.checkout(repoPath, ref.Remote, ref.Ref)
+	artifactPath, err := g.checkout(ctx, repoPath, ref.Remote, ref.Ref)
 	repoLock.Unlock()
 
 	if err != nil {
 		return "", err
 	}
 
-	localPath, err := gitIncludePath(repoPath, ref.SubDir)
+	localPath, err := gitIncludePath(artifactPath, ref.SubDir)
 	if err != nil {
 		return "", err
 	}
@@ -223,7 +221,7 @@ func (g *gitResourceLoader) Load(ctx context.Context, resource string) (string, 
 			return "", err
 		}
 
-		localPath, err = validateGitIncludePath(repoPath, localPath, localPath)
+		localPath, err = validateGitIncludePath(artifactPath, localPath, localPath)
 		if err != nil {
 			return "", err
 		}
@@ -268,38 +266,42 @@ func (g *gitResourceLoader) Dir(resource string) string {
 	return ""
 }
 
-// checkout clones or updates the Git repository at the given path.
-func (g *gitResourceLoader) checkout(path, remote, ref string) error {
-	auth, err := git.GetAuthMethod(remote, g.privateKey, g.keyPassphrase, g.accessToken)
+// checkout resolves ref against remote using a store.GitStore rooted at path, publishing
+// (or reusing an already-published) artifact for the resolved revision, and returns that artifact's directory.
+func (g *gitResourceLoader) checkout(ctx context.Context, path, remote, ref string) (string, error) {
+	gitStore, err := store.NewGitStore(store.GitStoreOptions{
+		Log:                     slog.Default(),
+		CloneURL:                remote,
+		BaseDir:                 path,
+		SSHPrivateKey:           g.privateKey,
+		SSHPrivateKeyPassphrase: g.keyPassphrase,
+		SkipTLSVerify:           g.skipTLSVerify,
+		ProxyOptions:            g.proxyOptions,
+		CloneSubmodules:         g.cloneSubmodules,
+		SkipAbsoluteSymlinks:    true,
+		Depth:                   g.cloneDepth,
+	})
 	if err != nil {
-		return fmt.Errorf("authenticate git include %q: %w", remote, err)
+		return "", fmt.Errorf("initialize git store for include %q: %w", remote, err)
 	}
 
-	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
-		slog.Debug("git include repository not cached, cloning", slog.String("remote_host", gitRemoteHostForLog(remote)), slog.String("ref", ref), slog.String("cache_path", path))
-
-		_, err = git.CloneRepository(path, remote, ref, g.skipTLSVerify, g.proxyOptions, auth, g.cloneSubmodules, g.cloneDepth)
-		if err != nil {
-			return fmt.Errorf("clone git include %q: %w", remote, err)
-		}
-
-		slog.Debug("cloned git include repository", slog.String("remote_host", gitRemoteHostForLog(remote)), slog.String("ref", ref), slog.String("cache_path", path))
-
-		return nil
-	} else if err != nil {
-		return fmt.Errorf("stat git include cache: %w", err)
-	}
-
-	slog.Debug("git include repository already cached, updating", slog.String("remote_host", gitRemoteHostForLog(remote)), slog.String("ref", ref), slog.String("cache_path", path))
-
-	_, err = git.UpdateRepository(path, remote, ref, g.skipTLSVerify, g.proxyOptions, auth, g.cloneSubmodules, g.cloneDepth)
+	revision, err := gitStore.Resolve(ctx, ref)
 	if err != nil {
-		return fmt.Errorf("update git include %q: %w", remote, err)
+		return "", fmt.Errorf("resolve git include %q: %w", remote, err)
 	}
 
-	slog.Debug("updated git include repository", slog.String("remote_host", gitRemoteHostForLog(remote)), slog.String("ref", ref), slog.String("cache_path", path))
+	artifact, err := gitStore.Publish(ctx, revision)
+	if err != nil {
+		return "", fmt.Errorf("publish git include %q: %w", remote, err)
+	}
 
-	return nil
+	slog.Debug("synchronized git include repository",
+		slog.String("remote_host", gitRemoteHostForLog(remote)),
+		slog.String("ref", ref),
+		slog.String("cache_path", path),
+		slog.String("revision", string(revision)))
+
+	return artifact.Path, nil
 }
 
 // cacheKey returns a unique key for the given remote and ref, suitable for use as a directory name.

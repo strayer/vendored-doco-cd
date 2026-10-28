@@ -7,6 +7,7 @@ import (
 
 	onepassword "github.com/kimdre/doco-cd/internal/secretprovider/1password"
 	"github.com/kimdre/doco-cd/internal/secretprovider/awssecretsmanager"
+	"github.com/kimdre/doco-cd/internal/secretprovider/azurekeyvault"
 	"github.com/kimdre/doco-cd/internal/secretprovider/bitwardensecretsmanager"
 	"github.com/kimdre/doco-cd/internal/secretprovider/infisical"
 	"github.com/kimdre/doco-cd/internal/secretprovider/openbao"
@@ -42,6 +43,14 @@ type DeploymentCertificateRevocationChecker interface {
 	DeploymentHasRevokedCertificate(ctx context.Context, certState string) (bool, error)
 }
 
+// BulkSecretProvider is an optional capability for secret providers that can fetch all
+// secrets below a path in one call. The returned map holds the secret name relative to
+// the path as key and the secret value as value. Providers without this capability
+// return secrettypes.ErrBulkNotSupported.
+type BulkSecretProvider interface {
+	GetSecretsByPath(ctx context.Context, path string, recursive bool) (map[string]string, error)
+}
+
 // The SecretValueProviderFunc type is an adapter to allow the use of ordinary
 // functions as secret providers. If f is a function with the appropriate signature,
 // SecretValueProviderFunc(f) is a SecretValueProvider that calls f.
@@ -75,6 +84,18 @@ func Initialize(ctx context.Context, provider, version string) (SecretProvider, 
 		}
 
 		p, err = awssecretsmanager.NewProvider(ctx, cfg.Region, cfg.AccessKeyID, cfg.SecretAccessKey)
+	case azurekeyvault.Name:
+		cfg, cfgErr := azurekeyvault.GetConfig()
+		if cfgErr != nil {
+			return nil, cfgErr
+		}
+
+		prov, provErr := azurekeyvault.NewValueProvider(cfg)
+		if provErr != nil {
+			return nil, provErr
+		}
+
+		p = AdaptSecretValueProvider(azurekeyvault.Name, prov)
 	case bitwardensecretsmanager.Name:
 		cfg, cfgErr := bitwardensecretsmanager.GetConfig()
 		if cfgErr != nil {
@@ -102,7 +123,7 @@ func Initialize(ctx context.Context, provider, version string) (SecretProvider, 
 			return nil, cfgErr
 		}
 
-		p, err = openbao.NewProvider(ctx, cfg.SiteUrl, cfg.AccessToken)
+		p, err = openbao.NewProviderWithConfig(ctx, cfg)
 	case webhook.Name:
 		cfg, cfgErr := webhook.GetConfig()
 		if cfgErr != nil {

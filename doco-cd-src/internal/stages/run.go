@@ -3,45 +3,24 @@ package stages
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/common/lifecycle"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/prometheus"
+	"github.com/kimdre/doco-cd/internal/selfupdate"
+	"github.com/kimdre/doco-cd/internal/syncwindow"
 )
 
 type StageFunc func(ctx context.Context, stageLog *slog.Logger) error
 
-const maxCommitStatusDescriptionLength = 140
-
-func successfulCommitStatusDescription(startedAt, finishedAt time.Time) string {
-	if startedAt.IsZero() || finishedAt.IsZero() || finishedAt.Before(startedAt) {
-		return "Successful"
-	}
-
-	duration := finishedAt.Sub(startedAt)
-	if duration < time.Second {
-		return "Successful in <1s"
-	}
-
-	return fmt.Sprintf("Successful in %s", duration.Round(time.Second))
-}
-
-func failureCommitStatusDescription(err error) string {
-	if err == nil {
-		return "Failed"
-	}
-
-	description := strings.Join(strings.Fields(err.Error()), " ")
-	if len([]rune(description)) <= maxCommitStatusDescriptionLength {
-		return description
-	}
-
-	truncated := []rune(description)
-
-	return string(truncated[:maxCommitStatusDescriptionLength-3]) + "..."
-}
+// MutationAdmission is invoked after pre-deploy confirms that a deployment
+// requires mutation. The returned function releases the mutation admission.
+type MutationAdmission func(context.Context) (func(), error)
 
 func shouldPostPendingCommitStatus(stageName StageName, destroyEnabled, pendingPosted bool) bool {
 	return !destroyEnabled && !pendingPosted && stageName == StagePreDeploy
@@ -53,6 +32,10 @@ func shouldSendDeploymentStartedNotification(stageName StageName, destroyEnabled
 
 func shouldPostFailureCommitStatus(destroyEnabled bool) bool {
 	return !destroyEnabled
+}
+
+func shouldPostWebhookCommitStatus(jobTrigger JobTrigger, destroyEnabled bool) bool {
+	return jobTrigger == JobTriggerWebhook && !destroyEnabled
 }
 
 func failureCommitStatusState(stageName StageName) commitstatus.State {
@@ -108,20 +91,57 @@ func (s *StageManager) GetDestroyStageOrder() StageOrder {
 	}
 }
 
-// RunStages executes the stages in the defined order.
-func (s *StageManager) RunStages(ctx context.Context) error {
+// RunStages executes the stages in the defined order. For regular deployments,
+// admitMutation runs after a successful pre-deploy stage and before any
+// deployment-side notifications or mutations.
+func (s *StageManager) RunStages(ctx context.Context, admitMutation MutationAdmission) error {
 	stageOrder := s.GetDeployStageOrder()
 	if s.DeployConfig.Destroy.Enabled {
 		stageOrder = s.GetDestroyStageOrder()
 	}
 
+	return s.runStageOrder(ctx, admitMutation, stageOrder)
+}
+
+func (s *StageManager) runStageOrder(ctx context.Context, admitMutation MutationAdmission, stageOrder StageOrder) error {
+	defer func() {
+		if s.releaseGCLock != nil {
+			s.releaseGCLock()
+		}
+	}()
+
+	var (
+		releaseMutation func()
+		releaseRetry    func()
+	)
+
+	defer func() {
+		if releaseMutation != nil {
+			releaseMutation()
+		}
+
+		if releaseRetry != nil {
+			releaseRetry()
+		}
+	}()
+
 	pendingPosted := false
 	startedNotified := false
+	queuedByAdmission := admitMutation != nil
 
 	var finishedAt time.Time
 
 	for _, stageName := range stageOrder.Order {
 		stageLog := s.Log.With(slog.String("stage", string(stageName)))
+
+		if stageName == StagePreDeploy && s.DeployConfig.Retry.Configured() {
+			var err error
+
+			releaseRetry, err = docker.DeploymentFailures.Acquire(ctx, s.deploymentFailureTarget())
+			if err != nil {
+				return err
+			}
+		}
 
 		metadata, err := s.GetStageMetaData(stageName)
 		if err != nil {
@@ -131,27 +151,63 @@ func (s *StageManager) RunStages(ctx context.Context) error {
 		stageLog.Debug(string("begin stage: " + stageName))
 
 		err = stageOrder.Funcs[stageName](ctx, stageLog)
+
+		outcome := "success"
+		if err != nil {
+			outcome = "failure"
+
+			switch {
+			case errors.Is(err, selfupdate.ErrHandover):
+				outcome = "handover"
+			case errors.Is(err, ErrSkipDeployment), errors.Is(err, ErrWebhookFilterMismatch):
+				outcome = "skipped"
+			}
+		}
+
+		prometheus.DeploymentStageDuration.WithLabelValues(
+			deploymentMetricsRepository(s.Repository),
+			string(stageName),
+			outcome,
+		).Observe(metadata.FinishedAt.Sub(metadata.StartedAt).Seconds())
+
 		if err != nil {
 			stageLog.Debug(string("end stage early: "+stageName),
 				slog.String("reason", err.Error()),
 				slog.String("duration", metadata.FinishedAt.Sub(metadata.StartedAt).Truncate(time.Millisecond).String()))
-			// If the error is ErrSkipDeployment, we don't treat it as a failure
-			if errors.Is(err, ErrSkipDeployment) {
-				return nil
+			// Skip outcomes propagate without failure reporting so callers can
+			// distinguish an intentional no-op from a successful deployment.
+			// A handover does the same: the successor reports the result once it
+			// has proven itself, so recording a failure here would be wrong.
+			if errors.Is(err, ErrSkipDeployment) || errors.Is(err, selfupdate.ErrHandover) {
+				if s.retryAttempt != nil {
+					s.retryAttempt.Cancel()
+				}
+
+				return err
 			}
 
-			notifiedErr := s.NotifyFailure(err)
-
-			if shouldPostFailureCommitStatus(s.DeployConfig.Destroy.Enabled) {
-				s.PostCommitStatus(ctx, failureCommitStatusState(stageName), failureCommitStatusDescription(err))
-			}
-
-			return notifiedErr
+			return s.handleStageFailure(ctx, stageName, stageLog, err)
 		}
 
 		stageLog.Debug(string("completed stage: "+stageName),
 			slog.String("duration", metadata.FinishedAt.Sub(metadata.StartedAt).Truncate(time.Millisecond).String()))
 		finishedAt = metadata.FinishedAt
+
+		if stageName == StagePreDeploy && admitMutation != nil {
+			var admissionErr error
+
+			releaseMutation, admissionErr = admitMutation(ctx)
+			if admissionErr != nil {
+				if !errors.Is(admissionErr, ErrSkipDeployment) && !lifecycle.IsCanceled(admissionErr) &&
+					shouldPostFailureCommitStatus(s.DeployConfig.Destroy.Enabled) {
+					s.postStatus(ctx, commitstatus.FailureStatus(failureCommitStatusState(stageName), admissionErr))
+				}
+
+				return admissionErr
+			}
+
+			admitMutation = nil
+		}
 
 		if shouldSendDeploymentStartedNotification(stageName, s.DeployConfig.Destroy.Enabled, startedNotified) {
 			if err := s.NotifyDeploymentStarted(); err != nil {
@@ -161,17 +217,129 @@ func (s *StageManager) RunStages(ctx context.Context) error {
 			startedNotified = true
 		}
 
-		// Post "pending" once the repository/commit has been resolved.
+		// Post pending statuses only after pre-deploy confirms work is required.
 		if shouldPostPendingCommitStatus(stageName, s.DeployConfig.Destroy.Enabled, pendingPosted) {
-			s.PostCommitStatus(ctx, commitstatus.StatePending, "In Progress")
+			if !queuedByAdmission {
+				s.PostQueuedCommitStatus(ctx)
+			}
+
+			s.inProgressPosted = s.postCommitStatus(ctx, commitstatus.StatePending, "In Progress", "")
 
 			pendingPosted = true
 		}
 	}
 
 	if !s.DeployConfig.Destroy.Enabled {
-		s.PostCommitStatus(ctx, commitstatus.StateSuccess, successfulCommitStatusDescription(s.Stages.Init.StartedAt, finishedAt))
+		s.postStatus(ctx, commitstatus.Status{
+			State:       commitstatus.StateSuccess,
+			Description: commitstatus.SuccessDescription(s.Stages.Init.StartedAt, finishedAt),
+		})
 	}
 
+	// Success (deploy or destroy) closes any recorded failure, retries stop.
+	s.clearDeploymentFailure()
+
 	return nil
+}
+
+// handleStageFailure preserves retry safety for interrupted deploys without
+// reporting the process's own shutdown as an operator-actionable failure.
+func (s *StageManager) handleStageFailure(ctx context.Context, stageName StageName, stageLog *slog.Logger, err error) error {
+	// A handover is not a failure: the successor reports the deployment once it
+	// is healthy. Recording one here would make the next poll force-recreate the
+	// stack and fight the handover it is part of.
+	if errors.Is(err, selfupdate.ErrHandover) {
+		if s.retryAttempt != nil {
+			s.retryAttempt.Cancel()
+		}
+
+		stageLog.Info("self-update handover in progress", slog.String("stage", string(stageName)))
+
+		return err
+	}
+
+	s.recordDeploymentFailure(stageName, err)
+
+	if lifecycle.IsCanceled(err) {
+		stageLog.Debug("deployment canceled during application shutdown", slog.String("reason", err.Error()))
+
+		return err
+	}
+
+	notifiedErr := s.NotifyFailure(err)
+
+	if shouldPostFailureCommitStatus(s.DeployConfig.Destroy.Enabled) {
+		s.postStatus(ctx, commitstatus.FailureStatus(failureCommitStatusState(stageName), err))
+	}
+
+	return notifiedErr
+}
+
+func deploymentMetricsRepository(repository *RepositoryData) string {
+	if repository == nil || strings.TrimSpace(repository.Name) == "" {
+		return "unknown"
+	}
+
+	return strings.TrimSpace(repository.Name)
+}
+
+// PostQueuedCommitStatus reports a resolved webhook deployment that requires
+// work. Poll and destroy operations do not publish queued statuses.
+func (s *StageManager) PostQueuedCommitStatus(ctx context.Context) {
+	if shouldPostWebhookCommitStatus(s.JobTrigger, s.DeployConfig.Destroy.Enabled) {
+		s.PostCommitStatusWithOutcome(ctx, commitstatus.StatePending, "Queued", commitstatus.OutcomeQueued)
+	}
+}
+
+// stageRecordsDeploymentFailure reports whether a failure of the stage must be
+// recorded for retry. From the deploy stage on, the environment can be half
+// mutated with the new commit already stamped on the containers, so without a
+// record the next run sees "no changes" and never retries (#1702). Init and
+// pre-deploy failures leave the old state in place and retry naturally.
+func stageRecordsDeploymentFailure(stageName StageName) bool {
+	switch stageName {
+	case StageDeploy, StagePostDeploy, StageCleanup:
+		return true
+	default:
+		return false
+	}
+}
+
+// recordDeploymentFailure records the failure so the next run retries the
+// deployment instead of skipping it as already deployed.
+func (s *StageManager) recordDeploymentFailure(stageName StageName, cause error) {
+	if s.DeployConfig.Destroy.Enabled || !stageRecordsDeploymentFailure(stageName) {
+		return
+	}
+
+	attempt := s.retryAttempt
+	if attempt == nil {
+		desired, err := s.deploymentDesiredState()
+		if err != nil {
+			s.Log.Warn("failed to fingerprint deployment failure", slog.Any("error", err))
+			desired.Revision = s.Repository.Revision
+		}
+
+		attempt, _ = docker.DeploymentFailures.Admit(s.deploymentFailureTarget(), desired, deploy.RetryConfig{}, s.Origin == syncwindow.OriginManual)
+		attempt.Start()
+	}
+
+	attempt.Fail(docker.DeploymentFailure{
+		Repository: s.Repository.Name,
+		Stack:      s.DeployConfig.Name,
+		CommitSHA:  s.Repository.Revision,
+		Stage:      string(stageName),
+		Error:      cause.Error(),
+	}, lifecycle.IsCanceled(cause))
+}
+
+// lastDeploymentFailure returns the recorded failure of the stack's last
+// deployment attempt, if any.
+func (s *StageManager) lastDeploymentFailure() (docker.DeploymentFailure, bool) {
+	return docker.DeploymentFailures.Get(s.deploymentFailureTarget())
+}
+
+// clearDeploymentFailure removes the failure record of the stack, if present.
+func (s *StageManager) clearDeploymentFailure() {
+	docker.DeploymentFailures.Clear(s.deploymentFailureTarget())
 }
