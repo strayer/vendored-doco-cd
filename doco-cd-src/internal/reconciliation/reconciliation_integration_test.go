@@ -12,10 +12,12 @@ import (
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/types/duration"
+
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/docker"
-	dockerSwarm "github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/logger"
 	"github.com/kimdre/doco-cd/internal/notification"
 	"github.com/kimdre/doco-cd/internal/stages"
@@ -165,16 +167,16 @@ func TestReconciliationStopEventRestartSuppressionIntegration(t *testing.T) {
 	dc := deployConfig.New(stackName, "main")
 	dc.Reconciliation.Enabled = true
 	dc.Reconciliation.Events = []string{"stop"}
-	dc.Reconciliation.RestartTimeout = 1
+	dc.Reconciliation.RestartTimeout = duration.Duration(time.Second)
 
 	jobLog := logger.New(slog.LevelError).Logger
-	reconcileJob := newJob(jobInfo{
-		jobLog:        jobLog,
-		dockerCli:     stack.DockerCli,
-		metadata:      notification.Metadata{Repository: repositoryName, Stack: stackName, JobID: "test-job"},
-		repoData:      stages.RepositoryData{SourceUrl: "https://github.com/kimdre/doco-cd_tests.git", Name: repositoryName},
-		payload:       &webhook.ParsedPayload{FullName: repositoryName},
-		deployConfigs: []*deployConfig.Config{dc},
+	reconcileJob := newJob(newTestManagerWithDependencies(t, Dependencies{DockerCLI: stack.DockerCli}), DeployRequest{
+		Logger:        jobLog,
+		Metadata:      notification.Metadata{Repository: repositoryName, Stack: stackName, JobID: "test-job"},
+		JobTrigger:    stages.JobTriggerWebhook,
+		Repository:    stages.RepositoryData{SourceUrl: "https://github.com/kimdre/doco-cd_tests.git", Name: repositoryName},
+		Payload:       &webhook.ParsedPayload{FullName: repositoryName},
+		DeployConfigs: []*deployConfig.Config{dc},
 	}, getDeployConfigGroupByEvent([]*deployConfig.Config{dc}))
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -241,10 +243,16 @@ func TestCleanupObsoleteAutoDiscoveredContainers_EmptyDiscoveredConfigs_RemovesS
 		ctx,
 		jobLog,
 		stack.DockerCli,
-		dockerSwarm.GetModeEnabled(),
-		repoURL,
+		resolveTestSwarmMode(t, stack.DockerCli.Client()),
+		"",
+		DeployRequest{
+			JobTrigger: stages.JobTriggerPoll,
+			Repository: stages.RepositoryData{SourceUrl: repoURL},
+			Metadata:   notification.Metadata{Repository: "kimdre/doco-cd_tests", Stack: stackName, JobID: "cleanup-empty-discovered-configs"},
+		},
 		[]*deployConfig.Config{},
-		notification.Metadata{Repository: "kimdre/doco-cd_tests", Stack: stackName, JobID: "cleanup-empty-discovered-configs"},
+		newTestNotifier(t),
+		nil,
 	)
 	if err != nil {
 		t.Fatalf("cleanupObsoleteAutoDiscoveredContainers returned error: %v", err)
@@ -273,11 +281,7 @@ func requireDockerIntegrationTestGate(t *testing.T) {
 		_ = dockerCli.Client().Close()
 	}()
 
-	if err := dockerSwarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("failed to inspect Docker swarm mode: %v", err)
-	}
-
-	if dockerSwarm.GetModeEnabled() {
+	if resolveTestSwarmMode(t, dockerCli.Client()) {
 		t.Skip("reconciliation Docker event integration tests require non-Swarm mode")
 	}
 }
@@ -333,42 +337,34 @@ func waitForExpectedDockerEvent(ctx context.Context, t *testing.T, cli client.AP
 
 	trigger()
 
-	seen := map[string]struct{}{}
+	seen := set.New[string]()
 
 	for {
 		select {
 		case msg, ok := <-eventsResult.Messages:
 			if !ok {
-				t.Fatalf("docker events channel closed before observing %q, seen=%v", wantAction, mapKeys(seen))
+				t.Fatalf("docker events channel closed before observing %q, seen=%v", wantAction, seen.ToSlice())
 			}
 
 			action := normalizeReconciliationEventAction(string(msg.Action))
 
-			seen[action] = struct{}{}
+			seen.Add(action)
+
 			if action == wantAction {
 				return
 			}
 		case err, ok := <-eventsResult.Err:
 			if !ok {
-				t.Fatalf("docker events error channel closed before observing %q, seen=%v", wantAction, mapKeys(seen))
+				t.Fatalf("docker events error channel closed before observing %q, seen=%v", wantAction, seen.ToSlice())
 			}
 
 			if err != nil {
-				t.Fatalf("docker events listener failed while waiting for %q: %v (seen=%v)", wantAction, err, mapKeys(seen))
+				t.Fatalf("docker events listener failed while waiting for %q: %v (seen=%v)", wantAction, err, seen.ToSlice())
 			}
 		case <-listenerCtx.Done():
-			t.Fatalf("timed out waiting for docker event %q, seen=%v", wantAction, mapKeys(seen))
+			t.Fatalf("timed out waiting for docker event %q, seen=%v", wantAction, seen.ToSlice())
 		}
 	}
-}
-
-func mapKeys(m map[string]struct{}) []string {
-	ret := make([]string, 0, len(m))
-	for key := range m {
-		ret = append(ret, key)
-	}
-
-	return ret
 }
 
 func waitForBootMarkerCount(ctx context.Context, t *testing.T, stack *internaltest.ComposeStack, since time.Time, want int, timeout time.Duration) {

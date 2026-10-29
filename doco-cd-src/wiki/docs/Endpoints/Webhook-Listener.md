@@ -9,16 +9,30 @@ tags:
 
 The webhook payload is expected to be in JSON format and must contain the payload from a [supported Git Provider](../index.md#supported-git-providers) or for a [OCI artifact](../Advanced/OCI/Webhooks.md).
 
-The application listens for incoming webhooks on the `/v1/webhook` endpoint with the port specified by the `HTTP_PORT` environment variable, see [App Settings](../App-Settings.md#general-settings).
-Set both `HTTP_TLS_CERT_FILE` and `HTTP_TLS_KEY_FILE` to serve the endpoint over HTTPS directly from doco-cd.
+The application listens for incoming webhooks on the `/v1/webhook` endpoint with the port specified by the `HTTP_PORT` environment variable, see [App Settings](../App-Settings.md#api-and-webhook-settings).
+Set both [`HTTP_TLS_CERT_FILE`](../App-Settings.md#http-and-network-settings) and [`HTTP_TLS_KEY_FILE`](../App-Settings.md#http-and-network-settings) to serve the endpoint over HTTPS directly from doco-cd.
 
 !!! info "Source URL Rewrites"
-    Webhook deployments support rewriting git clone URLs to internal addresses via [`SOURCE_URL_REWRITES`](../App-Settings.md#source-url-rewrites). This is useful when the Git provider advertises a public URL in webhooks but doco-cd should clone via an internal network path.
+    Webhook deployments support rewriting git clone URLs to internal addresses via [`SOURCE_URL_REWRITES`](../Advanced/Source-URL-Rewrites.md). This is useful when the Git provider advertises a public URL in webhooks but doco-cd should clone via an internal network path.
 
 ## Allow/deny trigger events
 
 By default, all incoming webhooks are accepted and trigger deployments if they match a deployment configuration.
 See [Webhook Filter](../Deploy-Settings.md#webhook-filter) for more granular control over which webhooks should trigger deployments.
+
+Webhooks are automatic triggers and obey the deployment's [retry budget and delay](../Deploy-Settings.md#retry-settings).
+Neither `#!ini wait=true` nor `#!yaml force_recreate: true` makes a webhook a manual retry.
+When an unchanged failed release is suppressed by the retry delay or budget exhaustion, the attempt is skipped without marking that release successful.
+Use a [REST API-triggered poll](REST-API.md#polling) or [MCP `trigger_poll`](MCP-Server.md#poll-input) for an explicit manual retry.
+
+## Inline deployment configuration
+
+Git webhooks automatically reuse inline deployments from matching [`POLL_CONFIG`](../Poll-Settings.md#inline-deploy-configs) entries. Matching uses the repository, reference, and webhook target. Short branch names such as `main` match their full `refs/heads/main` form.
+
+If multiple poll entries match, their inline deployments are combined in configuration order. Deployment names must be unique within each Docker context.
+
+!!! warning "Inline configuration overrides repository configuration"
+    If a matching inline deployment exists, `.doco-cd.yml` in the repository is ignored. The inline and repository configurations are never merged. The webhook reads repository configuration files only when no inline poll entry matches.
 
 ## With custom Target
 

@@ -5,15 +5,35 @@ tags:
 
 # Git Settings
 
-Settings to configure Git authentication and clone behavior.
+Settings to configure Git authentication, clone behavior, and deployment reporting.
+
+## Supported transports
+
+Doco-CD accepts HTTP(S), SSH, [native Git](Advanced/Tips-and-Tricks.md#polling-via-native-git) (`git://host/path`), and [local filesystem](Advanced/Local-Filesystem-Polling.md) repository URLs.
+
+!!! tip "HTTPS and SSH are recommended for remote repositories."
+
+??? note "Native Git (`git://`) transport"
+
+    Native Git uses anonymous access. HTTP tokens, SSH keys, and GitHub App credentials are not sent over this transport,
+    even when configured for other repositories. It cannot authenticate access to private repositories,
+    so webhook events for private repositories fail when their clone URL is [rewritten](Advanced/Source-URL-Rewrites.md) to `git://`.
+    The default TCP port is `9418`; use `git://host:port/path` for a custom port.
+    Native Git connects directly and does not use `HTTP_PROXY` or TLS verification settings.
+    
+    !!! warning "Native Git does not protect deployment content"
+        The `git://` protocol has no encryption or authentication. An attacker on the network can replace repository
+        content before doco-cd deploys it. Plain `http://` has the same transport-integrity risk.
+        Use HTTPS or SSH unless you accept this risk. A private network alone does not provide cryptographic protection.
+        Doco-CD does not automatically downgrade HTTPS or SSH URLs to native Git.
 
 ## General
 
-| Key                               | Type    | Description                                                                                                                                                                                                                                                                                                                                        | Default                                          |
-|-----------------------------------|---------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
-| `GIT_CLONE_DEPTH`                 | number  | Limits the number of commits fetched during clone/fetch operations (shallow clone). `0` means full clone (no depth limit). Can be overridden per deployment via the [`git_depth`](Deploy-Settings.md) setting. When a requested ref is outside the shallow depth, doco-cd automatically deepens incrementally before falling back to a full fetch. | `0`                                              |
-| `GIT_CLONE_SUBMODULES`            | boolean | Whether Git submodules are cloned too.                                                                                                                                                                                                                                                                                                             | `true`                                           |
-| `SKIP_TLS_VERIFICATION`           | boolean | Skip TLS verification when cloning repositories.                                                                                                                                                                                                                                                                                                   | `false`                                          |
+| Key                     | Type    | Description                                                                                                                                                                                                                                    | Default |
+|-------------------------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `GIT_CLONE_DEPTH`       | number  | Limits commits fetched for shallow clones and fetches. `0` means full clone; [`git_depth`](Deploy-Settings.md) can override it per deployment. Synchronization focuses on the requested ref and broadens or deepens automatically when needed. | `0`     |
+| `GIT_CLONE_SUBMODULES`  | boolean | Whether Git submodules are initialized and updated after the parent repository is checked out.                                                                                                                                                 | `true`  |
+| `SKIP_TLS_VERIFICATION` | boolean | Skip TLS verification when cloning repositories.                                                                                                                                                                                               | `false` |
 
 !!! info "Submodule URL format"
     Relative submodule URLs (for example `../other-repo.git`) are resolved against the parent repository remote URL.
@@ -30,17 +50,147 @@ Supported authentication methods:
 - SSH authentication with private keys.
 - If you need different credentials for different hosts, use [Domain-scoped Authentication](#domain-scoped-authentication).
 
-| Key                               | Type   | Description                                                                                                                                                                                                                                                                             | Default                                          |
-|-----------------------------------|--------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
-| `GIT_ACCESS_TOKEN`                | string | Access token for cloning repositories (required for private repositories) via **HTTP**. See [Setup Access Token](Setup-Access-Token.md), [Required Token Permissions](#required-token-permissions), and [Domain-scoped Authentication](#domain-scoped-authentication). | Optional for public repositories but recommended |
-| `GIT_ACCESS_TOKEN_USER`           | string | Username paired with `GIT_ACCESS_TOKEN` for **HTTP(S)** clone/fetch. Most providers accept any non-empty value, but some require a specific username for their token (e.g. a GitLab **deploy token** uses `gitlab+deploy-token-1234567`). Set it when your provider needs one.          | `oauth2`                                         |
-| `GIT_ACCESS_TOKEN_FILE`           | string | Path to the file containing the Git Access Token (mutually exclusive with `GIT_ACCESS_TOKEN`).                                                                                                                                                                                          |                                                  |
-| `GIT_AUTH_DOMAINS`                | list   | YAML list of domain-scoped Git credentials (HTTP token, SSH key, and GitHub App credentials). Supports exact domains and wildcard subdomains like `*.example.com` (see [Domain-scoped authentication](#domain-scoped-authentication)). Mutually exclusive with `GIT_AUTH_DOMAINS_FILE`. |                                                  |
-| `GIT_AUTH_DOMAINS_FILE`           | string | Path to a file containing the YAML configuration for `GIT_AUTH_DOMAINS` (mutually exclusive with `GIT_AUTH_DOMAINS`).                                                                                                                                                                   |                                                  |
-| `SSH_PRIVATE_KEY`                 | string | The private key used for cloning repositories via SSH. See [Setup SSH Key](Setup-SSH-Key.md) and [Domain-scoped Authentication](#domain-scoped-authentication).                                                                                                                    |                                                  |
-| `SSH_PRIVATE_KEY_FILE`            | string | Path to the file containing the SSH private key.                                                                                                                                                                                                                                        |                                                  |
-| `SSH_PRIVATE_KEY_PASSPHRASE`      | string | Passphrase for the SSH private key (if the key was generated with a passphrase).                                                                                                                                                                                                        |                                                  |
-| `SSH_PRIVATE_KEY_PASSPHRASE_FILE` | string | Path to the file containing the SSH private key passphrase.                                                                                                                                                                                                                             |                                                  |
+!!! warning "HTTP(S) credentials are scoped to hosts"
+    By default, Doco-CD sends an HTTP(S) credential only to hosts that match an entry in `GIT_AUTH_DOMAINS`.
+    This includes the global `GIT_ACCESS_TOKEN` and the global [GitHub App](#github-apps).
+    A repository URL can come from a webhook payload, an API or MCP poll trigger, a deployment config, a Compose `include`, or a submodule.
+    The host scope prevents a credential from going to a host that you did not approve.
+
+    If you set a global HTTP(S) credential, you must also set `GIT_AUTH_DOMAINS` with at least one entry that the credential applies to.
+    Otherwise doco-cd does not start. See [Credential Scope](#credential-scope) for the rules and the migration steps.
+    You can turn off the scope with `GIT_AUTH_ALLOW_ANY_HOST`, but this is insecure (see [Disabling the Scope](#disabling-the-scope)).
+
+| Key                               | Type   | Description                                                                                                                                                                                                                                                                                                      | Default                                          |
+|-----------------------------------|--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------|
+| `GIT_ACCESS_TOKEN`                | string | Access token for cloning repositories (required for private repositories) via **HTTP**. Requires `GIT_AUTH_DOMAINS` to set the hosts that receive it (see [Credential Scope](#credential-scope)). See [Setup Access Token](Setup-Access-Token.md) and [Required Token Permissions](#required-token-permissions). | Optional for public repositories but recommended |
+| `GIT_ACCESS_TOKEN_USER`           | string | Username paired with `GIT_ACCESS_TOKEN` for **HTTP(S)** clone/fetch. Most providers accept any non-empty value, but some require a specific username for their token (e.g. a GitLab **deploy token** uses `gitlab+deploy-token-1234567`). Set it when your provider needs one.                                   | `oauth2`                                         |
+| `GIT_ACCESS_TOKEN_FILE`           | string | Path to the file containing the Git Access Token (mutually exclusive with `GIT_ACCESS_TOKEN`).                                                                                                                                                                                                                   |                                                  |
+| `GIT_AUTH_DOMAINS`                | list   | YAML list of domain-scoped Git credentials (HTTP token, SSH key, and GitHub App credentials). Supports exact domains and wildcard subdomains like `*.example.com` (see [Domain-scoped authentication](#domain-scoped-authentication)). Mutually exclusive with `GIT_AUTH_DOMAINS_FILE`.                          |                                                  |
+| `GIT_AUTH_DOMAINS_FILE`           | string | Path to a file containing the YAML configuration for `GIT_AUTH_DOMAINS` (mutually exclusive with `GIT_AUTH_DOMAINS`).                                                                                                                                                                                            |                                                  |
+| `GIT_AUTH_ALLOW_ANY_HOST`         | bool   | **Insecure.** Sends the global `GIT_ACCESS_TOKEN` or global GitHub App to every HTTP(S) host that no `GIT_AUTH_DOMAINS` entry matches. Use it only if you accept the risk (see [Disabling the Scope](#disabling-the-scope)).                                                                                     | `false`                                          |
+| `SSH_PRIVATE_KEY`                 | string | The private key used for cloning repositories via SSH. See [Setup SSH Key](Setup-SSH-Key.md) and [Domain-scoped Authentication](#domain-scoped-authentication).                                                                                                                                                  |                                                  |
+| `SSH_PRIVATE_KEY_FILE`            | string | Path to the file containing the SSH private key.                                                                                                                                                                                                                                                                 |                                                  |
+| `SSH_PRIVATE_KEY_PASSPHRASE`      | string | Passphrase for the SSH private key (if the key was generated with a passphrase).                                                                                                                                                                                                                                 |                                                  |
+| `SSH_PRIVATE_KEY_PASSPHRASE_FILE` | string | Path to the file containing the SSH private key passphrase.                                                                                                                                                                                                                                                      |                                                  |
+| `SSH_KNOWN_HOSTS_FILE`            | string | Optional path to an operator-managed `known_hosts` file for Git SSH servers. When set, doco-cd never changes this file and rejects unknown or changed host keys.                                                                                                                                                 |                                                  |
+
+### Credential Scope
+
+Doco-CD selects the HTTP(S) credential for each URL by its host:
+
+1. Doco-CD finds the `GIT_AUTH_DOMAINS` entry that matches the host (see [Matching Behavior](#matching-behavior)).
+2. If the entry has its own `git_access_token` or GitHub App, doco-cd uses it.
+3. If the entry has no HTTP(S) credential of its own (only `domains`, or only an SSH key), doco-cd uses the global `GIT_ACCESS_TOKEN` or the global GitHub App.
+4. If no entry matches the host, doco-cd sends no HTTP(S) credential. Public repositories still work anonymously. Private repositories fail with an error that names the host. [`GIT_AUTH_ALLOW_ANY_HOST`](#disabling-the-scope) changes this step.
+
+The port is not part of the match. An entry for `git.example.com` applies to `https://git.example.com:8443/...` too.
+
+SSH keys are not affected by these rules. SSH URLs use the matched entry key, then the global `SSH_PRIVATE_KEY`.
+
+#### Migrating from Global Credentials
+
+Versions before v0.130.0 sent the global `GIT_ACCESS_TOKEN` or global GitHub App credentials to every HTTP(S) host, 
+see the [Git credential security advisory](https://github.com/kimdre/doco-cd/security/advisories/GHSA-ggcr-c46c-q2gj).
+By default, doco-cd now refuses to start with an error like this if a global HTTP(S) credential has no scope:
+
+```text
+global Git HTTP(S) credentials must be scoped with GIT_AUTH_DOMAINS: GIT_ACCESS_TOKEN is set, but no GIT_AUTH_DOMAINS entry lists the hosts that may receive it. ...
+```
+
+To fix it, add an entry with only `domains` for each host that the global credential is for:
+
+```yaml title="docker-compose.yml"
+services:
+  doco-cd:
+    environment:
+      GIT_ACCESS_TOKEN: xxx
+      GIT_AUTH_DOMAINS: |
+        - domains:
+            - github.com
+```
+
+Things to check during the migration:
+
+- Add every host that you clone from with the global credential. This includes hosts of Compose Git `include` URLs and submodules.
+- If you use [`SOURCE_URL_REWRITES`](Advanced/Source-URL-Rewrites.md), doco-cd selects the credential for the host **after** the rewrite. Add the rewritten host, not the original host.
+- An entry with its own `git_access_token` or GitHub App now takes precedence over the global credential for its hosts. Before, the global `GIT_ACCESS_TOKEN` won over a domain-scoped GitHub App.
+- Every entry must have at least one valid domain. Domains with a scheme, path, port, or a wildcard that is not a leading `*.` are rejected at startup.
+- If you [roll back](Advanced/Self-Updating.md) to an older version, that version ignores the scope and sends the global credential to every HTTP(S) host again.
+- For a [self-updating](Advanced/Self-Updating.md) installation, add `GIT_AUTH_DOMAINS` to the managed Compose file before or together with the version upgrade. Older versions accept an entry with only `domains`, so you can add it first. If the new version does not start because the scope is missing, doco-cd rolls back and does not retry until a new commit arrives. Push a commit that adds the scope to retry the update.
+- If you run `bootstrap.sh` from the [self-updating example](https://github.com/kimdre/doco-cd/tree/main/examples/self-updating), it forwards `GIT_AUTH_DOMAINS` and uses `github.com` if you do not set it.
+
+#### Limits of the Scope
+
+The scope controls which hosts receive a credential. It does not control which repositories doco-cd deploys from.
+
+- Doco-CD still clones public repositories from unlisted hosts anonymously.
+- A scoped wildcard such as `*.example.com` trusts every subdomain. Use exact domains if other people can create subdomains.
+- An attacker who can make a listed host serve content, or who can intercept plain `http://` traffic to it, can still get the credential. Use HTTPS.
+- Webhook requests still need a valid `WEBHOOK_SECRET`. Keep it secret, because anyone with it can trigger deployments of any repository URL.
+
+#### Disabling the Scope
+
+If you do not want to maintain `GIT_AUTH_DOMAINS`, you can turn off the scope for the global credential:
+
+```yaml title="docker-compose.yml"
+services:
+  doco-cd:
+    environment:
+      GIT_ACCESS_TOKEN: xxx
+      GIT_AUTH_ALLOW_ANY_HOST: "true"
+```
+
+??? danger "This brings back the [credential leak](https://github.com/kimdre/doco-cd/security/advisories/GHSA-ggcr-c46c-q2gj)"
+    With `GIT_AUTH_ALLOW_ANY_HOST`, doco-cd sends the global `GIT_ACCESS_TOKEN` or global GitHub App to every HTTP(S) host that no `GIT_AUTH_DOMAINS` entry matches.
+    Anyone who can choose a repository URL can then get the credential. This includes webhook senders with the `WEBHOOK_SECRET`, API and MCP clients, and everyone who can change a deployed repository, its Compose `include` URLs, or its submodules.
+    For a GitHub App, doco-cd sends a short-lived signed App JWT to the API of that host, not the App's private key. The JWT can be used to create installation tokens for the App.
+    Doco-CD logs a warning at every start while this setting is active and a global HTTP(S) credential is configured, including `apply-self` runs.
+
+Use it only if every source of repository URLs is trusted, and if the credential has the smallest possible permissions (for example a fine-grained token with read-only access to selected repositories).
+
+The setting changes only hosts without a matching entry. `GIT_AUTH_DOMAINS` entries keep their rules, the redirect protection of the API clients stays active, and commit status reporting still uses the credential of the repository host.
+
+The repository's `docker-compose.yml` forwards `GIT_AUTH_ALLOW_ANY_HOST` from `.env` with a default of `false`.
+For a self-updating installation, set the option in the managed Compose service too. `bootstrap.sh` forwards it only to the one-shot bootstrap container.
+
+### SSH Host-Key Verification
+
+Doco-CD supports two host-key trust modes for Git SSH remotes:
+
+- **Operator-managed:** Set `SSH_KNOWN_HOSTS_FILE` to a mounted `known_hosts` file. Doco-CD treats it as authoritative and read-only. Add both the old and new server keys before a planned rotation, then remove the old key after the rotation.
+- **Automatic (default):** Leave `SSH_KNOWN_HOSTS_FILE` unset. Doco-CD obtains a host key on first use and automatically replaces a changed key for the same host and port. This avoids interruption when providers rotate keys, but it trusts the key returned by the network and therefore does not protect against a host-key substitution attack.
+
+Example using a read-only Docker config:
+
+```yaml title="docker-compose.yml"
+services:
+  doco-cd:
+    environment:
+      SSH_KNOWN_HOSTS_FILE: /run/configs/git_known_hosts
+    configs:
+      - source: git_known_hosts
+        target: /run/configs/git_known_hosts
+
+configs:
+  git_known_hosts:
+    file: ./known_hosts
+```
+
+#### Rotating a Mounted Host Key
+
+When a Git server reports a changed key, obtain the new key from a trusted source and add it to the mounted `known_hosts` file. Doco-CD will then accept the new key on the next connection.
+
+For hosted providers, use the official host-keys. For example [GitHub.com](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/githubs-ssh-key-fingerprints) or [GitLab.com](https://docs.gitlab.com/user/gitlab_com/#ssh-known_hosts-entries).
+
+Use `ssh-keyscan` to obtain the host key:
+
+```bash title="Default SSH port (22)"
+ssh-keyscan -t ed25519 git.example.com
+```
+
+```bash title="Custom SSH port (2222)"
+ssh-keyscan -p 2222 -t ed25519 git.example.com
+```
 
 ### Required Token Permissions
 
@@ -67,7 +217,7 @@ Each entry in the list has the following structure:
     - domain1.com
     - domain2.com
     - '*.example.com'
-  git_access_token: xxx             # (Optional) HTTP token for git access
+  git_access_token: xxx             # (Optional) HTTP token for git access. If omitted, the global credential is used
   git_access_token_user: oauth2     # (Optional) Username for git_access_token (e.g. gitlab+deploy-token-1234567)
   ssh_private_key: |                # (Optional) SSH private key content
     -----BEGIN OPENSSH PRIVATE KEY-----
@@ -80,7 +230,7 @@ Each entry in the list has the following structure:
 
 | Field                        | Type   | Required | Description                                                                                                                                                                                       |
 |------------------------------|--------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `domains`                    | list   | Yes      | List of domain names to apply these credentials to. Supports exact domains and wildcard patterns.                                                                                                 |
+| `domains`                    | list   | Yes      | List of host names to apply these credentials to. Supports exact domains and wildcard patterns. Must not contain a scheme, path, or port. An entry with only `domains` scopes the global HTTP(S) credential to these hosts. |
 | `git_access_token`           | string | No       | HTTP(S) access token for authenticating with the Git provider. Cannot be used with `ssh_private_key`.                                                                                             |
 | `git_access_token_user`      | string | No       | Username paired with `git_access_token`. Defaults to `oauth2`. Set it when your provider needs a specific username for the token (e.g. a GitLab deploy token uses `gitlab+deploy-token-1234567`). |
 | `ssh_private_key`            | string | No       | SSH private key content (multi-line). Cannot be used with `git_access_token`.                                                                                                                     |
@@ -101,7 +251,8 @@ Each entry in the list has the following structure:
 - Exact domain match wins over wildcard entries.
 - If multiple wildcard patterns match, the longest suffix wins (most specific).
 - Wildcards only match subdomains. Example: `*.example.com` matches `git.example.com`, but not `example.com`.
-- If no domain entry matches, doco-cd falls back to global `GIT_ACCESS_TOKEN` / `SSH_PRIVATE_KEY` values if set.
+- If the matched entry has no HTTP(S) credential of its own, doco-cd uses the global `GIT_ACCESS_TOKEN` or GitHub App for HTTP(S) URLs.
+- If no domain entry matches, doco-cd sends no HTTP(S) credential. For SSH URLs, it uses the global `SSH_PRIVATE_KEY` if set.
 - Submodule remotes are resolved independently, so each submodule can use credentials for its own domain.
 
 #### Examples
@@ -141,6 +292,13 @@ Each entry in the list has the following structure:
 
 [GitHub Apps](https://docs.github.com/en/apps) are supported natively and can be configured globally (see below) or [per domain](#domain-scoped-authentication). 
 Doco-CD will auto-detect the installation by repository _owner/name_ and mint short-lived installation access tokens.
+The detected installation ID is cached for an hour, and looked up again earlier if the App is reinstalled; set `GITHUB_APP_INSTALLATION_ID` to skip the lookup entirely.
+
+A global GitHub App needs a `GIT_AUTH_DOMAINS` entry without its own HTTP(S) credential, for example `#!yaml - domains: [github.com]`, the same as a global `GIT_ACCESS_TOKEN` (see [Credential Scope](#credential-scope)).
+Doco-CD calls the GitHub API with the App credentials only for hosts in that scope. These calls do not follow redirects to another host.
+
+!!! note "Installation tokens cannot access [gists](https://docs.github.com/en/get-started/writing-on-github/editing-and-sharing-content-with-gists)"
+    gist URLs (for example, gist submodules) use a configured access token or anonymous access instead.
 
 | Key                             | Type   | Description                                                                                                                                                                  | Default value     |
 |---------------------------------|--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------|
@@ -152,41 +310,156 @@ Doco-CD will auto-detect the installation by repository _owner/name_ and mint sh
 
 ## Commit Status Reporting
 
-Doco-CD can post a commit status back to the source Git provider after each deployment, making the result visible directly on the commit or pull request in the Git web UI.
+Doco-CD can report deployment outcomes to the source Git provider, making the result visible directly on the commit or pull request in the Git web UI. 
+Reporting is disabled by default. Enable it with `#!ini GIT_COMMIT_STATUS=true`.
 
-This closes the GitOps feedback loop: instead of only seeing success or failure in container logs or Apprise notifications, the commit itself is marked with the deployment outcome.
+This closes the GitOps feedback loop: instead of only seeing success or failure in container logs or Apprise notifications, 
+the commit itself is marked with the deployment outcome.
 
-Three states are reported:
+Once pre-deployment checks confirm work is needed, Doco-CD reports each deployment under its existing name, 
+`doco-cd/<stack>` or `doco-cd/<target>/<stack>` when a target is configured. 
+Queued reporting is published before waiting for a mutation admission slot.
 
-- **pending** — set once after the repository is cloned and the deployment begins.
-- **success** — set when all deployment stages complete successfully.
-- **failure** — set when any stage fails after initialisation.
+Deployments excluded by a webhook reference filter or requiring no changes do not receive deployment-specific checks or statuses. 
+When the entire webhook run is skipped, Doco-CD reports a run-level result under `doco-cd/<target>/deploy` when a target is configured, or `doco-cd/deploy` otherwise.
+The same target-aware name is used for Git clone failures and failures before deployment configuration can be resolved, including polling runs.
+This keeps failures and skipped runs for different targets separate on the same commit.
 
-| Key                 | Type    | Description                                                                                                                                                                                                                                                                                                                                                                                                                                           | Default |
-|---------------------|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
-| `GIT_COMMIT_STATUS` | boolean | Enable commit status reporting. When `true`, doco-cd posts a status to the source provider for every deployment. Requires [`GIT_ACCESS_TOKEN`](#authentication) (or [domain-scoped token](#domain-scoped-authentication) via `GIT_AUTH_DOMAINS`), or a configured [GitHub App](#github-apps) with the **Commit statuses: Read and write** permission. Doco-cd reuses the same installation token minted for git operations, no separate token needed. | `false` |
-| `GIT_SCM_PROVIDER`  | string  | Override automatic SCM provider detection. Accepted values: `auto`, `github`, `gitlab`, `gitea`, `forgejo`, `azuredevops`. Set to `auto` to detect the provider from the repository URL. Required when your self-hosted instance hostname does not reveal the product (e.g. `git.mycompany.com` running GitLab must set `gitlab`).                                                                                                                    | `auto`  |
-| `GIT_SCM_API_URL`   | string  | Optional override for the SCM API base URL used by commit status requests (must be `http://` or `https://`). Use this for self-hosted instances when the API endpoint cannot be inferred from the clone URL (for example when SSH and HTTPS use different hosts/ports: `https://gitea.example.com:8443`).                                                                                                                                             |         |
+While a deployment runs, its check or status also shows the current deployment phase, the same one logged by the `deployment in progress` heartbeat, for example _pulling images_ or _waiting for services to start_.
+A phase is only published once it has lasted 3 seconds, so short phases cost no API requests.
+Phase updates are best-effort: each is sent once without retries, a provider rate limit pauses them for the rest of the deployment, and the final result always replaces them.
+
+=== "GitHub"
+
+    The resolved authentication method selects the reporting backend:
+
+    - **GitHub App installation authentication** uses native check runs.
+    - **Token-only authentication** (classic or fine-grained PAT, or OAuth token) keeps using commit statuses, not native Checks.
+
+    Each attempt uses only one backend; configuring an App elsewhere does not change reporting for a repository whose resolved credentials are token-only.
+
+    | Deployment state                           | GitHub App check run                        | GitHub commit status (token-only)     |
+    |--------------------------------------------|---------------------------------------------|---------------------------------------|
+    | Waiting for deployment admission           | `queued`                                    | **pending / Queued**                  |
+    | Deferred by a [sync window]                  | `queued`                                    | **pending / Deferred by sync window** |
+    | Admitted and deploying                     | `in_progress`                               | **pending / In Progress**             |
+    | Deployment phase lasting 3s or longer      | `in_progress`, titled _Deploying: phase_    | **pending / In Progress: _phase_**    |
+    | All deployment stages succeeded            | `completed` / `success`                     | **success**                           |
+    | Deployment failed                          | `completed` / `failure`                     | **error / failure**                   |
+    | Deployment deadline or readiness timed out | `completed` / `timed_out`                   | **error / failure**                   |
+    | Entire webhook run skipped                 | `completed` / `skipped`                     | **success / Skipped: _reason_**       |
+
+    The check run of a skipped webhook run also lists every stack with its skip reason and details in its summary, such as the webhook filter that did not match.
+
+    Successful check runs keep the title _Deployed_ and show a summary of the stack, configuration target (when set), Docker context, deployed reference and commit, deployment mode, trigger, and detected changed services.
+
+    The reference and commit describe the revision actually deployed, which can differ from the triggering webhook. Service names reflect detected changes, including image changes; they are not an exhaustive list of recreated services. When no individual names were recorded, such as for a first deployment or a whole-stack recreation, the summary shows _Not individually tracked_. Unavailable optional metadata is omitted. Token-only GitHub authentication and other providers retain their short commit-status descriptions.
+
+    Native `timed_out` is reserved for an actual deployment deadline or readiness timeout, not errors whose text merely mentions a timeout. A deployment deferred by a [sync window](Advanced/Sync-Windows.md) resumes its original check run on retry.
+
+    !!! note "Skipped checks and branch protection"
+        GitHub displays the native `skipped` conclusion separately, but treats it as passing for a required check. The overall **Checks passed** banner can therefore remain.
+
+        Check runs and commit statuses with the same name can have different source-bound branch protection requirements. Review and, if necessary, update required checks manually when switching backends; doco-cd does not change branch protection settings.
+
+=== "GitLab"
+
+    | Deployment state                           | Commit status | Description              |
+    |--------------------------------------------|---------------|--------------------------|
+    | Waiting for deployment admission           | `pending`     | Queued                   |
+    | Deferred by a [sync window]                | `pending`     | Deferred by sync window  |
+    | Admitted and deploying                     | `running`     | In Progress              |
+    | All deployment stages succeeded            | `success`     | Successful in _duration_ |
+    | Deployment failed                          | `failed`      | _Failure reason_         |
+    | Deployment deadline or readiness timed out | `failed`      | _Failure reason_         |
+    | Entire webhook run skipped                 | `skipped`     | Skipped: _reason_        |
+
+    GitLab has no timed-out state, so timeouts are reported as `failed`. GitLab cannot move a status that is already pending or running back into the same state, so a later queued or deferred update keeps the existing description. For the same reason, deployment phases are not shown and a running deployment keeps the description _In Progress_.
+
+    !!! note "Skipped pipelines and merge checks"
+        If doco-cd's status is the only job in a commit's pipeline, a skipped webhook run makes that pipeline _skipped_. With **Pipelines must succeed** enabled, also enable **Skipped pipelines are considered successful** to merge such commits.
+
+=== "Gitea / Forgejo"
+
+    | Deployment state                           | Commit status                                            | Description              |
+    |--------------------------------------------|----------------------------------------------------------|--------------------------|
+    | Waiting for deployment admission           | `pending`                                                | Queued                   |
+    | Deferred by a [sync window]                | `pending`                                                | Deferred by sync window  |
+    | Admitted and deploying                     | `pending`                                                | In Progress              |
+    | Deployment phase lasting 3s or longer      | `pending`                                                | In Progress: _phase_     |
+    | All deployment stages succeeded            | `success`                                                | Successful in _duration_ |
+    | Deployment failed                          | `error` / `failure`                                      | _Failure reason_         |
+    | Deployment deadline or readiness timed out | `error` / `failure`                                      | _Failure reason_         |
+    | Entire webhook run skipped                 | `skipped` on Gitea 1.25+ and Forgejo 16+, else `success` | Skipped: _reason_        |
+
+    Gitea and Forgejo have no separate queued, running, or timed-out states. Their versions are detected through `/api/v1/version` and cached for one hour. Older versions store unknown states without validation, which would leave required checks pending, so they keep receiving `success` for skipped runs.
+
+=== "Azure DevOps"
+
+    | Deployment state                           | Commit status       | Description              |
+    |--------------------------------------------|---------------------|--------------------------|
+    | Waiting for deployment admission           | `pending`           | Queued                   |
+    | Deferred by a [sync window]                | `pending`           | Deferred by sync window  |
+    | Admitted and deploying                     | `pending`           | In Progress              |
+    | Deployment phase lasting 3s or longer      | `pending`           | In Progress: _phase_     |
+    | All deployment stages succeeded            | `succeeded`         | Successful in _duration_ |
+    | Deployment failed                          | `error` / `failed`  | _Failure reason_         |
+    | Deployment deadline or readiness timed out | `error` / `failed`  | _Failure reason_         |
+    | Entire webhook run skipped                 | `notApplicable`     | Skipped: _reason_        |
+
+    Azure DevOps has no separate queued, running, timed-out, or skipped states. Skipped webhook runs use `notApplicable`, its closest equivalent.
+
+When doco-cd [updates itself](Advanced/Self-Updating.md), the instance that finishes the handover completes the original reporting backend and target, even if the update disables `GIT_COMMIT_STATUS`. The finishing instance must still have credentials with the required permissions.
+
+| Key                 | Type    | Description                                                                                                                                                                                                                                                                                                                                                       | Default |
+|---------------------|---------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `GIT_COMMIT_STATUS` | boolean | Enable deployment reporting. Resolved [GitHub App installation authentication](#github-apps) uses native Checks and requires **Checks: Read and write**; token-only GitHub authentication and other providers use commit statuses with the permissions below. App reporting reuses the installation token minted for git operations; no separate token is needed. | `false` |
+| `GIT_SCM_PROVIDER`  | string  | Override automatic SCM provider detection. Accepted values: `auto`, `github`, `gitlab`, `gitea`, `forgejo`, `azuredevops`. Set to `auto` to detect the provider from the repository URL. Required when your self-hosted instance hostname does not reveal the product (e.g. `git.mycompany.com` running GitLab must set `gitlab`).                                | `auto`  |
+| `GIT_SCM_API_URL`   | string  | Optional override for the SCM API base URL used by commit status and native GitHub Checks requests (must be `http://` or `https://`). Use this for self-hosted instances when the API endpoint cannot be inferred from the clone URL (for example when SSH and HTTPS use different hosts/ports: `https://gitea.example.com:8443`).                                |         |
 
 ### Required Token Permissions
 
-The token used for commit status reporting needs permission to **write commit statuses** through the provider API. The same requirements apply whether you use the global [`GIT_ACCESS_TOKEN`](#authentication), a [domain-scoped token](#domain-scoped-authentication) from `GIT_AUTH_DOMAINS`, or a [GitHub App](#github-apps).
+Token-based reporting needs permission to **write commit statuses** through the provider API, whether credentials come from the global [`GIT_ACCESS_TOKEN`](#authentication) or a [domain-scoped token](#domain-scoped-authentication) in `GIT_AUTH_DOMAINS`.
+
+Doco-CD uses the credential that is [scoped](#credential-scope) to the repository host for reporting. If no credential is scoped to that host, doco-cd logs a warning and does not report. Reporting requests do not follow redirects to another host, so the credential cannot go to a different server.
 
 If an access token is also used to clone Git repositories over HTTP(S) (see [Authentication](#authentication)), add the permission below **in addition to** the existing clone permissions required by your provider (see [Required Token Permissions](#required-token-permissions) above).
 
-!!! info "GitHub Apps reuse their installation token"
-    When no `GIT_ACCESS_TOKEN` is configured (globally or per domain) but a GitHub App is, doco-cd reuses the same short-lived installation token used for git clone/fetch to post commit statuses. Grant the App the **Commit statuses: Read and write** repository permission; no additional PAT is required.
+=== "GitHub"
 
-| Provider        | Token type                               | Required permission                                                                                                                                                                                                                 |
-|-----------------|------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| GitHub          | Classic PAT / OAuth token                | `repo:status` is the minimum recommended scope. `repo` also works, but grants broader repository access than necessary.                                                                                                             |
-| GitHub          | Fine-grained PAT / GitHub App            | Repository permission **Commit statuses: Read and write**                                                                                                                                                                           |
-| GitLab          | Personal, project, or group access token | `api` scope                                                                                                                                                                                                                         |
-| Gitea / Forgejo | API access token                         | Must be allowed to write repository API endpoints. On Forgejo scoped tokens, use `write:repository`. Some Gitea versions expose different token controls, so ensure the token can create commit statuses for the target repository. |
-| Azure DevOps    | Personal Access Token (PAT)              | Token must allow Git status writes on the target repo (for example **Code (Read & write)** in the PAT scopes).                                                                                                                      |
+    | Token type                    | Required permission                                                                                                                  |
+    |-------------------------------|--------------------------------------------------------------------------------------------------------------------------------------|
+    | Classic PAT / OAuth token     | `repo:status` is the minimum recommended scope. `repo` also works, but grants broader repository access than necessary.              |
+    | Fine-grained PAT              | Repository permission **Commit statuses: Read and write** (token-only reporting remains on commit statuses)                          |
+    | GitHub App installation token | Repository permission **Checks: Read and write**; keep **Commit statuses: Read and write** for older pending self-update handovers |
 
-!!! info "Why GitLab needs `api` instead of `write_repository`"
-    Doco-CD posts commit statuses through the GitLab REST API. The `write_repository` scope covers Git-over-HTTP push access, but does not grant general REST API write access.
+    !!! info "GitHub Apps reuse their installation token"
+        When the repository's resolved authentication is a [GitHub App](#github-apps) installation, doco-cd reuses its short-lived git clone/fetch token to create and update check runs. Grant the App the **Checks: Read and write** repository permission in addition to its existing clone permissions; no additional PAT is required.
+
+        For an existing App previously using **Commit statuses: Read and write**, enable the additional **Checks: Read and write** permission in the App settings and approve the updated permissions for its installation. Keep **Commit statuses: Read and write** during pending self-update handovers from older versions: journals without a check-run target must still finish their legacy commit statuses, even with newer App configuration.
+
+=== "GitLab"
+
+    | Token type                               | Required permission |
+    |------------------------------------------|---------------------|
+    | Personal, project, or group access token | `api` scope         |
+
+    !!! info "Why GitLab needs `api` instead of `write_repository`"
+        Doco-CD posts commit statuses through the GitLab REST API. The `write_repository` scope covers Git-over-HTTP push access, but does not grant general REST API write access.
+
+=== "Gitea / Forgejo"
+
+    | Token type       | Required permission                                                                                                                                                                                                                 |
+    |------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+    | API access token | Must be allowed to write repository API endpoints. On Forgejo scoped tokens, use `write:repository`. Some Gitea versions expose different token controls, so ensure the token can create commit statuses for the target repository. |
+
+    Doco-CD also reads `/api/v1/version` with the same token to detect support for the native `skipped` state. If the version cannot be read, skipped runs are reported as `success`.
+
+=== "Azure DevOps"
+
+    | Token type                  | Required permission                                                                                           |
+    |-----------------------------|---------------------------------------------------------------------------------------------------------------|
+    | Personal Access Token (PAT) | Token must allow Git status writes on the target repo (for example **Code (Read & write)** in the PAT scopes). |
 
 ### Provider Auto-Detection
 
@@ -202,9 +475,9 @@ When `GIT_SCM_PROVIDER` is not set, doco-cd detects the provider from the reposi
 !!! warning "Self-hosted instances"
     Set `GIT_SCM_PROVIDER` explicitly when running a self-hosted SCM/Git provider instance and the auto-detection cannot determine the correct provider.
 
-    - **GitHub Enterprise Server**: set `GIT_SCM_PROVIDER=github`
-    - **Self-hosted GitLab**: set `GIT_SCM_PROVIDER=gitlab`
-    - **Self-hosted Gitea / Forgejo**: set `GIT_SCM_PROVIDER=gitea` or `GIT_SCM_PROVIDER=forgejo`
+    - **GitHub Enterprise Server**: set `#!ini GIT_SCM_PROVIDER=github`
+    - **Self-hosted GitLab**: set `#!ini GIT_SCM_PROVIDER=gitlab`
+    - **Self-hosted Gitea / Forgejo**: set `#!ini GIT_SCM_PROVIDER=gitea` or `#!ini GIT_SCM_PROVIDER=forgejo`
 
 ### Self-Hosted Instances and API URL
 
@@ -212,7 +485,7 @@ Doco-CD derives the SCM API base URL from the clone URL by converting its scheme
 
 **SSH clone URL with a non-standard SSH port**
 
-When the clone URL is an SSH URL with a custom port (e.g. `ssh://git@gitea.example.com:2222/org/repo.git`), doco-cd strips the port before building the API URL — so the API call targets `https://gitea.example.com/...` correctly. If for any reason this stripping doesn't produce the right host or port (e.g. the HTTPS endpoint is on a non-standard port), set the API base URL explicitly:
+When the clone URL is an SSH URL with a custom port (e.g. `ssh://git@gitea.example.com:2222/org/repo.git`), doco-cd strips the port before building the API URL so the API call targets `https://gitea.example.com/...` correctly. If for any reason this stripping doesn't produce the right host or port (e.g. the HTTPS endpoint is on a non-standard port), set the API base URL explicitly:
 
 ```yaml
 GIT_SCM_API_URL: "https://gitea.example.com:8443"
@@ -226,7 +499,9 @@ Some self-hosted setups route SSH clones through a dedicated hostname or port (e
 GIT_SCM_API_URL: "https://git.example.com"
 ```
 
-`GIT_SCM_API_URL` must be an `http://` or `https://` URL pointing to the root of the SCM instance (no path, no trailing slash). Provider-specific API paths (e.g. `/api/v1`, `/api/v4`) are appended automatically.
+For commit status reporting, configure `GIT_SCM_API_URL` as an `http://` or `https://` URL pointing to the root of the SCM instance (no path, no trailing slash). Provider-specific API paths (e.g. `/api/v1`, `/api/v4`) are appended automatically.
+
+This override also applies to native GitHub Checks requests. For GitHub Enterprise Server, a root URL automatically gains `/api/v3`; an explicit API prefix such as `https://ghe.example.com/api/v3` is used as-is. Set `#!ini GIT_SCM_PROVIDER=github` as described above.
 
 ### Example
 
@@ -235,7 +510,11 @@ services:
   app:
     environment:
       GIT_ACCESS_TOKEN: xxx         # token must be allowed to write commit statuses
+      GIT_AUTH_DOMAINS: |           # hosts that receive GIT_ACCESS_TOKEN
+        - domains: [github.com]
       GIT_COMMIT_STATUS: "true"
       # GIT_SCM_PROVIDER: gitlab   # uncomment for self-hosted GitLab at a custom domain
       # GIT_SCM_API_URL: https://git.example.com  # optional explicit API base URL override
 ```
+
+[sync window]: Advanced/Sync-Windows.md

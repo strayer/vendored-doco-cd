@@ -12,19 +12,22 @@ import (
 	"time"
 
 	"github.com/docker/cli/cli/command"
+	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/api/types/events"
 	"github.com/moby/moby/client"
 
 	"github.com/kimdre/doco-cd/internal/common/id"
+	"github.com/kimdre/doco-cd/internal/common/lifecycle"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 
 	"github.com/kimdre/doco-cd/internal/docker"
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	gitInternal "github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/stages"
+	"github.com/kimdre/doco-cd/internal/syncwindow"
 )
 
 const reconciliationTraceIDAttr = "doco_cd_reconciliation_trace_id"
@@ -37,44 +40,51 @@ const reconciliationSinceSafetySkew = 3 * time.Second
 type contextualEvent struct {
 	event       events.Message
 	contextName string
+	swarmMode   bool
 }
 
 // initContextCLIs populates j.contextCLIs with a Docker CLI entry for the default context
 // and for every unique non-default context referenced in the job's deploy configs.
-func (j *job) initContextCLIs(ctx context.Context, quiet bool) {
-	contextCLIs := map[string]contextCLIEntry{
-		"": {cli: j.info.dockerCli, swarmMode: swarm.GetModeEnabled()},
-	}
+func (j *job) initContextCLIs(ctx context.Context) {
+	contextCLIs := make(map[string]contextCLIEntry)
 
-	for _, dc := range j.info.deployConfigs {
-		ctxName := strings.TrimSpace(dc.Context)
-		if ctxName == "" {
-			continue
+	for _, dc := range j.info.DeployConfigs {
+		if lifecycle.IsCanceled(ctx.Err()) {
+			j.info.Logger.Debug("reconciliation event listener initialization canceled during application shutdown",
+				logger.ErrAttr(ctx.Err()),
+			)
+
+			break
 		}
 
+		ctxName := docker.NormalizeContextName(dc.Context)
 		if _, already := contextCLIs[ctxName]; already {
 			continue
 		}
 
-		cli, closeFn, err := dockerCliForContext(j.info.dockerCli, quiet, ctxName)
-		if err != nil {
-			j.info.jobLog.Error("failed to create Docker CLI for context; skipping event listener for that context",
-				slog.String("context", ctxName),
-				logger.ErrAttr(err),
+		entry := resolveDeployContext(ctx, j.manager.contexts, ctxName)
+		if entry.err != nil {
+			if lifecycle.IsCanceled(entry.err) {
+				j.info.Logger.Debug("reconciliation event listener initialization canceled during application shutdown",
+					slog.String("context", docker.DisplayContextName(ctxName)),
+					logger.ErrAttr(entry.err),
+				)
+
+				break
+			}
+
+			j.info.Logger.Error("failed to create Docker CLI for context; skipping event listener for that context",
+				slog.String("context", docker.DisplayContextName(ctxName)),
+				logger.ErrAttr(entry.err),
 			)
 
 			continue
 		}
 
-		swarmMode, err := swarm.ResolveModeEnabled(ctx, cli.Client())
-		if err != nil {
-			j.info.jobLog.Warn("failed to determine swarm mode for context, assuming non-swarm",
-				slog.String("context", ctxName),
-				logger.ErrAttr(err),
-			)
+		contextCLIs[ctxName] = contextCLIEntry{
+			cli:       entry.cli,
+			swarmMode: entry.swarmMode,
 		}
-
-		contextCLIs[ctxName] = contextCLIEntry{cli: cli, closeFn: closeFn, swarmMode: swarmMode}
 	}
 
 	j.contextCLIs = contextCLIs
@@ -83,57 +93,64 @@ func (j *job) initContextCLIs(ctx context.Context, quiet bool) {
 // cliForContext returns the Docker CLI for the given context name, falling back to the
 // default CLI if the context is not found.
 func (j *job) cliForContext(contextName string) command.Cli {
-	contextName = strings.TrimSpace(contextName)
+	contextName = docker.NormalizeContextName(contextName)
 	if j.contextCLIs != nil {
 		if e, ok := j.contextCLIs[contextName]; ok {
 			return e.cli
 		}
 	}
 
-	return j.info.dockerCli
+	return j.manager.dockerCli
 }
 
-// swarmModeForContext returns the swarm mode for the given context name, falling back to the
-// globally cached value for the default context.
+// swarmModeForContext returns the capability resolved when this job initialized
+// the requested Docker context.
 func (j *job) swarmModeForContext(contextName string) bool {
-	contextName = strings.TrimSpace(contextName)
+	contextName = docker.NormalizeContextName(contextName)
 	if j.contextCLIs != nil {
 		if e, ok := j.contextCLIs[contextName]; ok {
 			return e.swarmMode
 		}
 	}
 
-	return swarm.GetModeEnabled()
+	return false
 }
 
 // deployConfigsForContext returns the subset of the job's deploy configs that target contextName.
 func (j *job) deployConfigsForContext(contextName string) []*deployConfig.Config {
-	return filterConfigsByContext(j.info.deployConfigs, contextName)
+	return filterConfigsByContext(j.info.DeployConfigs, contextName)
+}
+
+func (j *job) deployConfigsForContextMode(contextName string, swarmMode bool) []*deployConfig.Config {
+	return filterConfigsByMode(j.deployConfigsForContext(contextName), j.swarmModeForContext(contextName), swarmMode)
+}
+
+// cleanupConfigsForContextMode returns the deploy configs whose stacks the
+// obsolete-stack cleanup treats as present, with the current ownership policy.
+// Deferred stacks retain their old configs only for recovery, not cleanup.
+func (j *job) cleanupConfigsForContextMode(contextName string, swarmMode bool) []*deployConfig.Config {
+	return filterConfigsByMode(filterConfigsByContext(j.cleanupConfigs, contextName), j.swarmModeForContext(contextName), swarmMode)
+}
+
+// cleanupRequest returns the latest observed cleanup request of the repository.
+// Without an observation, it uses the cleanup configs of the job, not its recovery configs.
+func (j *job) cleanupRequest() DeployRequest {
+	fallback := j.info
+	fallback.DeployConfigs = j.cleanupConfigs
+
+	return j.manager.currentCleanupRequest(fallback)
 }
 
 func (j *job) run(ctx context.Context) {
-	jobLog := j.info.jobLog
+	jobLog := j.info.Logger
 
-	dockerQuiet := false
-	if j.info.appConfig != nil {
-		dockerQuiet = j.info.appConfig.DockerQuietDeploy
-	}
-
-	j.initContextCLIs(ctx, dockerQuiet)
+	j.initContextCLIs(ctx)
 
 	// Wait for all event-listener goroutines to exit before closing their Docker
 	// CLIs, so we never close a client that a listener is still using.
 	var listenerWG sync.WaitGroup
 
-	defer func() {
-		listenerWG.Wait()
-
-		for ctxName, entry := range j.contextCLIs {
-			if ctxName != "" && entry.closeFn != nil {
-				entry.closeFn()
-			}
-		}
-	}()
+	defer listenerWG.Wait()
 
 	// Startup recovery: run for every configured context in parallel.
 	// Run both checks concurrently per context, then wait for all to finish
@@ -142,19 +159,41 @@ func (j *job) run(ctx context.Context) {
 	var startupRecoveryWG sync.WaitGroup
 
 	for ctxName, entry := range j.contextCLIs {
-		startupRecoveryWG.Add(2)
+		for swarmMode, configs := range groupDeployConfigsByMode(j.deployConfigsForContext(ctxName), entry.swarmMode) {
+			if len(configs) == 0 {
+				continue
+			}
 
-		go func(ctxName string, entry contextCLIEntry) {
-			defer startupRecoveryWG.Done()
+			unhealthyConfigs := filterConfigsByMode(
+				j.manager.recoveryGroupByEvent(j.info, configs)["unhealthy"],
+				entry.swarmMode,
+				swarmMode,
+			)
 
-			j.restartUnhealthyContainersOnStartup(ctx, jobLog, ctxName, entry.cli, entry.swarmMode)
-		}(ctxName, entry)
+			startupRecoveryWG.Add(2)
 
-		go func(ctxName string, entry contextCLIEntry) {
-			defer startupRecoveryWG.Done()
+			go func(entry contextCLIEntry, swarmMode bool, unhealthyConfigs []*deployConfig.Config) {
+				defer startupRecoveryWG.Done()
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						logger.LogRecoveredPanic(jobLog, "restart unhealthy containers on startup", recovered)
+					}
+				}()
 
-			j.redeployMissingServicesOnStartup(ctx, jobLog, ctxName, entry.cli, entry.swarmMode)
-		}(ctxName, entry)
+				j.restartUnhealthyContainersOnStartup(ctx, jobLog, entry.cli, swarmMode, unhealthyConfigs)
+			}(entry, swarmMode, unhealthyConfigs)
+
+			go func(ctxName string, entry contextCLIEntry, swarmMode bool, configs []*deployConfig.Config) {
+				defer startupRecoveryWG.Done()
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						logger.LogRecoveredPanic(jobLog, "redeploy missing services on startup", recovered)
+					}
+				}()
+
+				j.redeployMissingServicesOnStartup(ctx, jobLog, ctxName, entry.cli, swarmMode, configs)
+			}(ctxName, entry, swarmMode, configs)
+		}
 	}
 
 	startupRecoveryWG.Wait()
@@ -166,19 +205,26 @@ func (j *job) run(ctx context.Context) {
 	expectedListeners := 0
 
 	for ctxName, entry := range j.contextCLIs {
-		if len(j.deployConfigsForContext(ctxName)) == 0 {
-			continue
+		for swarmMode, configs := range groupDeployConfigsByMode(j.deployConfigsForContext(ctxName), entry.swarmMode) {
+			if len(configs) == 0 {
+				continue
+			}
+
+			expectedListeners++
+
+			listenerWG.Add(1)
+
+			go func(ctxName string, entry contextCLIEntry, swarmMode bool, configs []*deployConfig.Config) {
+				defer listenerWG.Done()
+				defer func() {
+					if recovered := recover(); recovered != nil {
+						logger.LogRecoveredPanic(jobLog, "context event listener", recovered)
+					}
+				}()
+
+				j.runContextEventListener(ctx, jobLog, ctxName, entry, swarmMode, configs, mergedCh, listenerReadyCh)
+			}(ctxName, entry, swarmMode, configs)
 		}
-
-		expectedListeners++
-
-		listenerWG.Add(1)
-
-		go func(ctxName string, entry contextCLIEntry) {
-			defer listenerWG.Done()
-
-			j.runContextEventListener(ctx, jobLog, ctxName, entry, mergedCh, listenerReadyCh)
-		}(ctxName, entry)
 	}
 
 	if expectedListeners == 0 {
@@ -212,24 +258,20 @@ func (j *job) run(ctx context.Context) {
 				return
 			}
 
-			j.handleEvent(ctx, jobLog, ce.event, ce.contextName)
+			j.handleEvent(ctx, jobLog, ce.event, ce.contextName, ce.swarmMode)
 		}
 	}
 }
 
 // runContextEventListener connects to the Docker daemon for entry, listens for relevant events,
 // forwards them (tagged with contextName) to out, and automatically reconnects on disconnection.
-func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, contextName string, entry contextCLIEntry, out chan<- contextualEvent, ready chan<- struct{}) {
-	repositoryLabelValue := gitInternal.GetFullName(j.info.repoData.SourceUrl)
-	if j.info.payload != nil && strings.TrimSpace(j.info.payload.FullName) != "" {
-		repositoryLabelValue = j.info.payload.FullName
+func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, contextName string, entry contextCLIEntry, swarmMode bool, contextDCs []*deployConfig.Config, out chan<- contextualEvent, ready chan<- struct{}) {
+	repositoryLabelValue := gitInternal.GetFullName(j.info.Repository.SourceUrl)
+	if j.info.Payload != nil && strings.TrimSpace(j.info.Payload.FullName) != "" {
+		repositoryLabelValue = j.info.Payload.FullName
 	}
 
-	swarmMode := entry.swarmMode
-
-	// Only listen for events for configs that target this context.
-	contextDCs := j.deployConfigsForContext(contextName)
-	contextGroupByEvent := getDeployConfigGroupByEvent(contextDCs)
+	contextGroupByEvent := j.manager.recoveryGroupByEvent(j.info, contextDCs)
 
 	if len(contextGroupByEvent) == 0 {
 		return
@@ -274,7 +316,7 @@ func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, 
 			ready <- struct{}{}
 		}
 
-		reconnect, newestEventTime := j.forwardEvents(ctx, jobLog, eventResult.Messages, eventResult.Err, contextName, out)
+		reconnect, newestEventTime := j.forwardEvents(ctx, jobLog, eventResult.Messages, eventResult.Err, contextName, swarmMode, out)
 
 		if !newestEventTime.IsZero() {
 			nextCursor := newestEventTime.UTC().Add(-reconciliationSinceSafetySkew)
@@ -310,7 +352,7 @@ func (j *job) runContextEventListener(ctx context.Context, jobLog *slog.Logger, 
 
 // forwardEvents reads events from the Docker streaming API and sends them (tagged with contextName)
 // to out. Returns (reconnect bool, newestEventTime).
-func (j *job) forwardEvents(ctx context.Context, jobLog *slog.Logger, eventCh <-chan events.Message, errCh <-chan error, contextName string, out chan<- contextualEvent) (bool, time.Time) {
+func (j *job) forwardEvents(ctx context.Context, jobLog *slog.Logger, eventCh <-chan events.Message, errCh <-chan error, contextName string, swarmMode bool, out chan<- contextualEvent) (bool, time.Time) {
 	var newestEventTime time.Time
 
 	for {
@@ -348,7 +390,7 @@ func (j *job) forwardEvents(ctx context.Context, jobLog *slog.Logger, eventCh <-
 			}
 
 			select {
-			case out <- contextualEvent{event: event, contextName: contextName}:
+			case out <- contextualEvent{event: event, contextName: contextName, swarmMode: swarmMode}:
 			case <-ctx.Done():
 				return false, newestEventTime
 			case <-j.closeChan:
@@ -380,9 +422,21 @@ func dockerEventTime(event events.Message) time.Time {
 	return time.Time{}
 }
 
-func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events.Message, contextName string) {
+func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events.Message, contextName string, swarmMode bool) {
 	action := normalizeReconciliationEventAction(string(event.Action))
-	dcs := j.deployConfigGroupByEvent[action]
+	if event.Type == events.ContainerEventType && event.Actor.Attributes[api.HookLabel] != "" {
+		jobLog.Debug("skipping reconciliation for lifecycle-hook runner",
+			slog.String("event", action),
+			slog.String("container_name", event.Actor.Attributes["name"]),
+			slog.String("hook", event.Actor.Attributes[api.HookLabel]),
+		)
+
+		return
+	}
+
+	// Restrict candidates to the context the event originated from, since stack
+	// names are only guaranteed to be unique within a single Docker context.
+	dcs := filterConfigsByMode(filterConfigsByContext(j.deployConfigGroupByEvent[action], contextName), j.swarmModeForContext(contextName), swarmMode)
 
 	if len(dcs) == 0 {
 		return
@@ -394,8 +448,25 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 	}
 
 	stackDCs := deployConfigsByName(dcs, stackName)
+
+	stackDCs = j.manager.recoveryConfigs(j.info, stackDCs)
 	if len(stackDCs) == 0 {
 		return
+	}
+
+	contextCLI := j.cliForContext(contextName)
+	eventServiceName := ""
+
+	if swarmMode {
+		var nameErr error
+
+		eventServiceName, nameErr = swarmEventServiceName(ctx, contextCLI, event)
+
+		jobLog = withSwarmServiceIdentity(jobLog, eventServiceName, event.Actor.ID)
+		if nameErr != nil {
+			jobLog.Debug("could not resolve swarm service name for reconciliation event",
+				logger.ErrAttr(nameErr))
+		}
 	}
 
 	// Skip reconciliation if all matching configs have destroy enabled
@@ -418,7 +489,7 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		return
 	}
 
-	if reconciliationHandler.isStackDeploymentInProgress(j.info.metadata.Repository, stackName) {
+	if j.manager.deployments.isInProgress(j.info.Metadata.Repository, contextName, stackName) {
 		jobLog.Debug("suppressing reconciliation event while stack deployment is in progress",
 			slog.String("event", action),
 			slog.String("stack", stackName),
@@ -427,7 +498,11 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		return
 	}
 
-	if reconciliationHandler.isServiceSchedulerStopHeld(event.Actor.Attributes) {
+	// Scheduler stop holds are only registered for Compose-mode jobs, keyed by
+	// project/service. A Swarm service on the same context can carry matching
+	// labels, so restricting the check to Compose events avoids suppressing an
+	// unrelated Swarm event.
+	if !swarmMode && j.manager.schedulerHolds.isHeld(contextName, event.Actor.Attributes) {
 		jobLog.Debug("suppressing reconciliation event for service intentionally held stopped by job scheduler",
 			slog.String("event", action),
 			slog.String("stack", stackName),
@@ -441,7 +516,7 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		jobLog.Debug("suppressing follow-up event from self-initiated container restart",
 			slog.String("event", action),
 			slog.String("container_name", event.Actor.Attributes["name"]),
-			slog.String("restart_cooldown_remaining", remaining.Truncate(time.Second).String()),
+			slog.String("restart_delay_remaining", remaining.Truncate(time.Second).String()),
 			slog.String("stack", stackName),
 		)
 
@@ -458,22 +533,39 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		return
 	}
 
-	stackID := j.info.metadata.Repository + "/" + stackName
+	if shouldIgnoreOneShotCompletionReconciliation(action, event.Actor.Attributes) {
+		jobLog.Debug("skipping reconciliation for successful one-shot service completion",
+			slog.String("event", action),
+			slog.String("stack", stackName),
+			slog.String("container_name", event.Actor.Attributes["name"]),
+		)
+
+		return
+	}
+
+	stackID := j.info.Metadata.Repository + "/" + contextName + "/" + stackName
 	stackLock := lock.GetRepoLock(stackID)
 
-	if !stackLock.TryLock(id.GenID()) {
+	if !stackLock.TryLock(id.New()) {
 		jobLog.Debug("skipping reconciliation, already in progress for this stack", slog.String("stack", stackName))
 		return
 	}
 	defer stackLock.Unlock()
 
 	actorGroupName := "container"
-	if j.swarmModeForContext(contextName) {
+	actorName := event.Actor.Attributes["name"]
+
+	if swarmMode {
 		actorGroupName = "service"
+		actorName = eventServiceName
 	}
 
-	traceID := id.GenID()
+	traceID := id.New()
+
 	event = withReconciliationTraceID(event, traceID)
+	if swarmMode {
+		event.Actor.Attributes["name"] = eventServiceName
+	}
 
 	eventLog := logger.
 		WithoutAttr(jobLog, "job_id").
@@ -482,7 +574,7 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 				slog.String("event", action),
 				slog.Group(actorGroupName,
 					slog.String("id", shortID(event.Actor.ID)),
-					slog.String("name", event.Actor.Attributes["name"]),
+					slog.String("name", actorName),
 				),
 				slog.String("trace_id", traceID),
 			),
@@ -493,10 +585,7 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 		eventLog = eventLog.With(slog.String("context", contextName))
 	}
 
-	contextCLI := j.cliForContext(contextName)
-	contextSwarmMode := j.swarmModeForContext(contextName)
-
-	// For restart-oriented events the container is still present — restart it
+	// For restart-oriented events the container is still present, so restart it
 	// directly instead of going through a full redeploy pipeline.
 	if isRestartReconciliationAction(action) {
 		restartDC := selectRestartDeployConfig(stackDCs, event.Actor.Attributes)
@@ -509,13 +598,13 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 			eventLog.Warn("multiple deploy configs matched restart event, using first match", slog.Int("deploy_config_count", len(stackDCs)))
 		}
 
-		restartResult := j.restartContainer(ctx, eventLog, event, restartDC, contextCLI, contextSwarmMode)
+		restartResult := j.restartContainer(ctx, eventLog, event, restartDC, contextCLI, swarmMode)
 		if restartResult.fallbackToDeploy {
 			if event.Actor.ID != "" {
-				waitForContainerRemovalSettled(ctx, eventLog, contextCLI.Client(), event.Actor.ID, containerRemovalSettleTimeout)
+				j.waitForContainerRemovalSettled(ctx, eventLog, contextCLI.Client(), event.Actor.ID, containerRemovalSettleTimeout)
 			}
 
-			j.deploy(ctx, eventLog, stackDCs, action, event, traceID, contextName)
+			j.deploy(ctx, eventLog, stackDCs, action, event, traceID, contextName, swarmMode)
 		}
 
 		return
@@ -527,57 +616,120 @@ func (j *job) handleEvent(ctx context.Context, jobLog *slog.Logger, event events
 	// started". Wait briefly for the container to either be fully removed or settle
 	// into a stable state before re-deploying.
 	if event.Actor.ID != "" {
-		waitForContainerRemovalSettled(ctx, eventLog, contextCLI.Client(), event.Actor.ID, containerRemovalSettleTimeout)
+		j.waitForContainerRemovalSettled(ctx, eventLog, contextCLI.Client(), event.Actor.ID, containerRemovalSettleTimeout)
 	}
 
-	j.deploy(ctx, eventLog, stackDCs, action, event, traceID, contextName)
+	j.deploy(ctx, eventLog, stackDCs, action, event, traceID, contextName, swarmMode)
 }
 
-func (j *job) deploy(ctx context.Context, jobLog *slog.Logger, dcs []*deployConfig.Config, action string, event events.Message, traceID string, contextName string) {
-	repoLock := lock.GetRepoLock(j.info.metadata.Repository)
-	repoLock.Lock()
-	defer repoLock.Unlock()
-
+// deploy runs reconciliation without a repository-wide lock. Immutable artifacts allow concurrent prepares; per-stack
+// locks serialize deployments of the same stack.
+func (j *job) deploy(ctx context.Context, jobLog *slog.Logger, dcs []*deployConfig.Config, action string, event events.Message, traceID string, contextName string, swarmMode bool) {
 	jobLog.Info("reconciliation started")
 	defer jobLog.Info("reconciliation completed")
 
 	// Use the context-specific CLI and only the deploy configs targeting this context
 	// for cleanup, so we inspect the correct remote daemon for obsolete containers.
 	contextCLI := j.cliForContext(contextName)
-	contextSwarmMode := j.swarmModeForContext(contextName)
-	contextDCs := j.deployConfigsForContext(contextName)
+	cleanupReq := j.cleanupRequest()
+	contextDCs := filterConfigsByMode(filterConfigsByContext(cleanupReq.DeployConfigs, contextName), j.swarmModeForContext(contextName), swarmMode)
 
-	if err := cleanupObsoleteAutoDiscoveredContainers(ctx, jobLog,
-		contextCLI, contextSwarmMode, j.info.repoData.SourceUrl,
-		contextDCs,
-		j.info.metadata); err != nil {
-		jobLog.Error("failed to clean up obsolete auto-discovered containers", logger.ErrAttr(err))
+	// Removing an obsolete stack is a change, not the recovery of a deployed
+	// revision, so sync windows apply to it like to any automatic deployment.
+	removalReq := j.info
+	removalReq.DeployConfigs = nil
+	removalReq.Origin = syncwindow.OriginAutomatic
+	removalGate := j.manager.newSyncWindowGate(removalReq, time.Now())
+
+	pending, cleanupErr := cleanupObsoleteAutoDiscoveredContainersResult(ctx, jobLog,
+		contextCLI, swarmMode, contextName, cleanupReq,
+		contextDCs, j.manager.notifier, j.manager.removalPredicate(cleanupReq, contextName, removalGate))
+	// This event covers one context. It must not clear retries for other contexts.
+	if pending || cleanupErr != nil {
+		j.manager.scheduleCleanupRetry(ctx, cleanupReq, true)
 	}
 
-	// Reconciliation deploys should always force recreate so missing containers are restored
-	// even when there are no Git/compose changes.
-	reconcileDCs := cloneDeployConfigsWithForcedRecreate(dcs)
+	if cleanupErr != nil {
+		jobLog.Error("failed to clean up obsolete auto-discovered containers", logger.ErrAttr(cleanupErr))
+	}
 
 	// Enrich metadata with reconciliation event information for deploy notifications
 	actorKind := "container"
-	if contextSwarmMode {
+	if swarmMode {
 		actorKind = "service"
 	}
 
-	metadata := j.info.metadata
-	metadata.ReconciliationEvent = action
-	metadata.TraceID = strings.TrimSpace(traceID)
-	metadata.AffectedActorKind = actorKind
-	metadata.AffectedActorID = shortID(event.Actor.ID)
-	metadata.AffectedActorName = strings.TrimSpace(event.Actor.Attributes["name"])
+	// Stacks carried over from a previous job are restored from the request
+	// of the revision that is actually deployed, see reconciliationJobInfo.
+	for _, group := range j.groupByRequest(dcs) {
+		metadata := group.request.Metadata
+		metadata.ReconciliationEvent = action
+		metadata.TraceID = strings.TrimSpace(traceID)
+		metadata.AffectedActorKind = actorKind
+		metadata.AffectedActorID = shortID(event.Actor.ID)
+		metadata.AffectedActorName = strings.TrimSpace(event.Actor.Attributes["name"])
 
-	// handleDeploy accepts the base CLI; it handles per-context routing internally.
-	if err := handleDeploy(ctx, jobLog, j.info.appConfig,
-		j.info.dataMountPoint, j.info.dockerCli,
-		j.info.secretProvider, metadata.JobID, j.info.jobTrigger,
-		j.info.repoData, reconcileDCs, j.info.payload, j.info.testName, metadata); err != nil {
-		jobLog.Error("failed to deploy", logger.ErrAttr(err))
+		// handleDeploy accepts the base CLI; it handles per-context routing internally.
+		req := group.request
+		req.Metadata = metadata
+		// Reconciliation deploys should always force recreate so missing containers are restored
+		// even when there are no Git/compose changes.
+		req.DeployConfigs = cloneDeployConfigsWithForcedRecreate(group.configs)
+		req.Origin = syncwindow.OriginReconciliation
+
+		err := j.manager.handleDeploy(ctx, req)
+		if errors.Is(err, stages.ErrSkipDeployment) {
+			// Skips such as sync window deferrals, retry suppression, and pause are logged where they occur.
+			continue
+		}
+
+		if err != nil {
+			jobLog.Error("failed to deploy", logger.ErrAttr(err))
+		}
 	}
+}
+
+// requestGroup is a set of deploy configs deployed with the same request.
+type requestGroup struct {
+	request DeployRequest
+	configs []*deployConfig.Config
+}
+
+// groupByRequest partitions dcs by the request each config was deployed
+// with. The job's own request comes first and is always present, even if
+// dcs is empty.
+func (j *job) groupByRequest(dcs []*deployConfig.Config) []requestGroup {
+	var (
+		own     []*deployConfig.Config
+		order   []*DeployRequest
+		carried = make(map[*DeployRequest][]*deployConfig.Config)
+	)
+
+	for _, dc := range dcs {
+		source, ok := j.carried[dc]
+		if !ok {
+			own = append(own, dc)
+
+			continue
+		}
+
+		if _, seen := carried[source]; !seen {
+			order = append(order, source)
+		}
+
+		carried[source] = append(carried[source], dc)
+	}
+
+	groups := make([]requestGroup, 0, len(order)+1)
+	if len(own) > 0 || len(order) == 0 {
+		groups = append(groups, requestGroup{request: j.info, configs: own})
+	}
+
+	for _, source := range order {
+		groups = append(groups, requestGroup{request: *source, configs: carried[source]})
+	}
+
+	return groups
 }
 
 func withReconciliationTraceID(event events.Message, traceID string) events.Message {

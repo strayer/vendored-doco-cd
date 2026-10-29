@@ -7,12 +7,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/cli/cli/compose/convert"
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
+	"github.com/opencontainers/go-digest"
 
 	"github.com/kimdre/doco-cd/internal/common/types/set"
 
@@ -21,6 +23,10 @@ import (
 )
 
 type ServiceStatus struct {
+	// Swarm service identity, unavailable for Compose containers.
+	ID   string
+	Name string
+
 	// In non-Swarm mode:
 	// Labels may differ between containers within a service, but most of them should be identical for the same service,
 	// except for com.docker.compose.container-number, com.docker.compose.replace, and potentially others.
@@ -33,6 +39,10 @@ type ServiceStatus struct {
 	// Non-swarm mode: number of running containers
 	// Swarm mode: number of service replicas
 	Replicas uint64
+
+	// Non-swarm mode: number of containers in any state.
+	// Swarm mode: not used.
+	Containers uint64
 }
 
 type LatestServiceStatus struct {
@@ -58,6 +68,13 @@ func normalizeRepositoryForLabelMatch(repository string) string {
 		return ""
 	}
 
+	// Strip an OCI digest suffix (repo@sha256:...) first, since GetRepoName reads it as an scp-like Git URL (user@host:path).
+	if idx := strings.LastIndex(repository, "@"); idx > 0 {
+		if _, err := digest.Parse(repository[idx+1:]); err == nil {
+			repository = repository[:idx]
+		}
+	}
+
 	// Normalize scheme/scp-like urls to host/owner/repo when possible.
 	repository = git.GetRepoName(repository)
 
@@ -80,14 +97,43 @@ func normalizeRepositoryForLabelMatch(repository string) string {
 	return strings.TrimSpace(repository)
 }
 
+// NormalizeRepositoryLabel exposes normalizeRepositoryForLabelMatch for
+// callers outside this package that need to map a deployed container or
+// service's cd.doco.source.name label back to the on-disk repository
+// directory name (git.GetRepoName for Git sources, the repository portion
+// of an OCI artifact reference for OCI sources) - the same normalization
+// GetLatestDeployStatus already relies on for label matching. Used by
+// artifact garbage collection (internal/gc) to build its live-revision set.
+func NormalizeRepositoryLabel(repository string) string {
+	return normalizeRepositoryForLabelMatch(repository)
+}
+
+// RepositoryLabelMatches reports whether label, a cd.doco.source.name label value, names one of
+// repositories, matched like GetLatestDeployStatus matches it. A repository can be a repository name or
+// URL, or an OCI artifact reference whose tag or digest is ignored.
+func RepositoryLabelMatches(label string, repositories ...string) bool {
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return false
+	}
+
+	for _, repository := range repositories {
+		if strings.TrimSpace(repository) != "" && buildRepositoryLabelCandidates(repository).Contains(label) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // buildRepositoryLabelCandidates generates a set of candidate repository label values
 // for matching by normalizing the input repository string.
 func buildRepositoryLabelCandidates(repository string) set.Set[string] {
 	if strings.TrimSpace(repository) == "" {
-		return map[string]struct{}{"": {}}
+		return set.New("")
 	}
 
-	candidates := set.Set[string]{}
+	candidates := set.New[string]()
 
 	add := func(v string) {
 		v = strings.TrimSpace(v)
@@ -153,7 +199,7 @@ func getLatestServiceStatus(cacheMap *sync.Map, statusMap map[Service]ServiceSta
 		// Get the candidate with the latest timestamp for the most recent deployment comparison.
 		// Use 'equal' here; ensure latestLabels is not empty if timestamp is empty.
 		// TODO: If timestamps are equal, the result may be random for simultaneous deployments.
-		if timestamp >= latestTimestamp {
+		if deploymentTimestampAtLeast(timestamp, latestTimestamp) {
 			latestTimestamp = timestamp
 			latestLabels = labels
 		}
@@ -171,6 +217,17 @@ func getLatestServiceStatus(cacheMap *sync.Map, statusMap map[Service]ServiceSta
 	return ret
 }
 
+func deploymentTimestampAtLeast(timestamp, previous string) bool {
+	current, currentErr := time.Parse(time.RFC3339, timestamp)
+
+	old, oldErr := time.Parse(time.RFC3339, previous)
+	if currentErr != nil || oldErr != nil {
+		return timestamp >= previous
+	}
+
+	return !current.Before(old)
+}
+
 func getDeployStatus(ctx context.Context, client client.APIClient, swarmMode bool, deployName string) (map[Service]ServiceStatus, error) {
 	result := make(map[Service]ServiceStatus)
 
@@ -183,7 +240,7 @@ func getDeployStatus(ctx context.Context, client client.APIClient, swarmMode boo
 		ns := convert.NewNamespace(deployName)
 
 		for _, service := range services {
-			status := ServiceStatus{Labels: SwarmServiceLabels(service)}
+			status := ServiceStatus{ID: service.ID, Name: service.Spec.Name, Labels: SwarmServiceLabels(service)}
 
 			mode := service.Spec.Mode
 			switch {
@@ -215,25 +272,35 @@ func getDeployStatus(ctx context.Context, client client.APIClient, swarmMode boo
 }
 
 // getServiceStatusFromContainerStatus returns a map of service names to their current status.
+// Compose lifecycle-hook runners are not service replicas and do not carry the doco-cd deployment labels,
+// so they are excluded.
+// Containers without a Compose service label are also excluded. They are not replicas of any service,
+// for example helper containers that other tools start with only the project label.
+// Compose ignores them too, so a deployment cannot remove them and they must not count as drift.
 func getServiceStatusFromContainerStatus(projectName string, containers []container.Summary) map[Service]ServiceStatus {
 	result := make(map[Service]ServiceStatus)
 
 	for _, cont := range containers {
-		if cont.Labels[api.ProjectLabel] != projectName {
+		if cont.Labels[api.ProjectLabel] != projectName || cont.Labels[api.HookLabel] != "" {
 			continue
 		}
 
 		serviceName := cont.Labels[api.ServiceLabel]
+		if strings.TrimSpace(serviceName) == "" {
+			continue
+		}
 
 		status, ok := result[Service(serviceName)]
 		if !ok {
 			// the labels may be different between containers, but they should be the same for the same service,
 			// except com.docker.compose.container-number, com.docker.compose.replace
 			// so just use the labels of the first container we encounter for each service
-			status = ServiceStatus{}
-			status.Labels = cont.Labels
+			status = ServiceStatus{
+				Labels: cont.Labels,
+			}
 		}
 
+		status.Containers++
 		if cont.State == container.StateRunning {
 			status.Replicas++
 		}
@@ -250,8 +317,8 @@ const (
 	ServiceMismatchReasonUnnecessary = "service is unnecessary"
 	ServiceMismatchReasonSwarmMode   = "swarm mode mismatch"
 	ServiceMismatchReasonReplicas    = "replicas mismatch"
+	ServiceMismatchReasonContainers  = "containers mismatch"
 	oneOffServiceNameSeparator       = "-doco-job-"
-	legacyOneShotExecutionMode       = "one_shot"
 )
 
 type ServiceMismatch struct {
@@ -265,9 +332,11 @@ type ServiceMismatchReason struct {
 	Got    any    `json:"got"`
 }
 
-// CheckServiceMismatch checks if the deployed services match the services in the compose file.
-// now only check replicas, swarm mode, missing and unnecessary services.
-func CheckServiceMismatch(swarmModeEnabled bool, deployed map[Service]ServiceStatus, services types.Services) []ServiceMismatch {
+// CheckServiceMismatch checks replicas, Swarm modes, and service presence.
+// In standalone mode, services with autostart disabled may remain stopped,
+// but all of their containers must exist.
+// Invalid autostart labels return an error in standalone mode.
+func CheckServiceMismatch(swarmModeEnabled bool, deployed map[Service]ServiceStatus, services types.Services) ([]ServiceMismatch, error) {
 	var mismatches []ServiceMismatch
 
 	// In non-Swarm mode, services with unset, "on-failure", or "no" restart policy can be considered as "stopped" and won't cause a mismatch.
@@ -334,18 +403,36 @@ func CheckServiceMismatch(swarmModeEnabled bool, deployed map[Service]ServiceSta
 					}
 				}
 			}
-		} else if !allowStoppedForRestartPolicy(svc) {
-			if !ok {
-				if !isScaledToZeroForMode(swarmInternal.DeployModeReplicated, svc) {
+		} else {
+			autostartEnabled, err := serviceAutostartEnabled(svcName, svc)
+			if err != nil {
+				return nil, err
+			}
+
+			enforceReplicas := !allowStoppedForRestartPolicy(svc)
+
+			switch {
+			case !ok:
+				if (!autostartEnabled || enforceReplicas) && !isScaledToZeroForMode(swarmInternal.DeployModeReplicated, svc) {
 					reasons = append(reasons, ServiceMismatchReason{
 						Reason: ServiceMismatchReasonNotDeployed,
 					})
 				}
-			} else if uint64(svc.GetScale()) != status.Replicas { //nolint:gosec
+			case enforceReplicas && (autostartEnabled || status.Replicas > 0) &&
+				uint64(svc.GetScale()) != status.Replicas: //nolint:gosec
 				reasons = append(reasons, ServiceMismatchReason{
 					Reason: ServiceMismatchReasonReplicas,
 					Want:   svc.GetScale(),
 					Got:    status.Replicas,
+				})
+			// A stopped service still needs all of its containers. Extra containers are not
+			// reported because one-off containers can share the service label.
+			case !autostartEnabled && status.Replicas == 0 &&
+				status.Containers < uint64(svc.GetScale()): //nolint:gosec
+				reasons = append(reasons, ServiceMismatchReason{
+					Reason: ServiceMismatchReasonContainers,
+					Want:   svc.GetScale(),
+					Got:    status.Containers,
 				})
 			}
 		}
@@ -383,7 +470,7 @@ func CheckServiceMismatch(swarmModeEnabled bool, deployed map[Service]ServiceSta
 		})
 	}
 
-	return mismatches
+	return mismatches, nil
 }
 
 func isEphemeralOneOffService(name string, status ServiceStatus, declaredServices set.Set[string]) bool {
@@ -400,7 +487,7 @@ func isEphemeralOneOffService(name string, status ServiceStatus, declaredService
 	}
 
 	mode := strings.TrimSpace(labels[DocoCDJobLabels.JobExecutionMode])
-	if mode != string(JobExecutionModeOneOff) && mode != legacyOneShotExecutionMode {
+	if mode != string(JobExecutionModeOneOff) {
 		return false
 	}
 

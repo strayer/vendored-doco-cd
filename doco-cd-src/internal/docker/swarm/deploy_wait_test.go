@@ -1,11 +1,158 @@
 package swarm
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	swarmTypes "github.com/moby/moby/api/types/swarm"
 )
+
+func TestWaitOnServicesWithTimeout(t *testing.T) {
+	t.Parallel()
+
+	const timeout = 10 * time.Millisecond
+
+	err := waitOnServicesWith(t.Context(), []deployedService{{id: "svc-1", name: "stack_api"}}, timeout, func(ctx context.Context, _ deployedService) error {
+		<-ctx.Done()
+
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waitOnServicesWith() error = %v, want context deadline exceeded", err)
+	}
+
+	if !strings.Contains(err.Error(), "timed out after 10ms waiting for swarm services to converge") ||
+		!strings.Contains(err.Error(), "stack_api (id=svc-1)") {
+		t.Fatalf("waitOnServicesWith() error = %q, missing timeout context", err)
+	}
+}
+
+func TestWaitOnServicesWithParentCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	err := waitOnServicesWith(ctx, []deployedService{{id: "svc-1", name: "stack_api"}}, time.Minute, func(ctx context.Context, _ deployedService) error {
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitOnServicesWith() error = %v, want context canceled", err)
+	}
+
+	if strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("waitOnServicesWith() error = %q, parent cancellation reported as timeout", err)
+	}
+}
+
+func TestWaitOnServicesIncludesEveryServiceIdentity(t *testing.T) {
+	t.Parallel()
+
+	firstErr := errors.New("first update failed")
+	secondErr := errors.New("second update failed")
+	services := []deployedService{
+		{id: "service-id-one", name: "stack_api"},
+		{id: "service-id-two", name: "stack_worker"},
+	}
+
+	err := waitOnServices(t.Context(), services, func(_ context.Context, service deployedService) error {
+		if service.id == services[0].id {
+			return firstErr
+		}
+
+		return secondErr
+	})
+	if !errors.Is(err, firstErr) || !errors.Is(err, secondErr) {
+		t.Fatalf("waitOnServices() = %v, want both underlying errors", err)
+	}
+
+	for _, service := range services {
+		if !strings.Contains(err.Error(), ServiceIdentity(service.name, service.id)) {
+			t.Fatalf("waitOnServices() = %v, missing %s", err, service.name)
+		}
+	}
+}
+
+func TestJobTaskFailureFromTasks(t *testing.T) {
+	t.Parallel()
+
+	iteration := uint64(7)
+	otherIteration := uint64(6)
+	tests := []struct {
+		name  string
+		tasks []swarmTypes.Task
+		want  string
+	}{
+		{
+			name: "current iteration failed task includes task details",
+			tasks: []swarmTypes.Task{
+				{
+					ID:           "failed-task",
+					JobIteration: &swarmTypes.Version{Index: iteration},
+					Status: swarmTypes.TaskStatus{
+						State: swarmTypes.TaskStateFailed,
+						Err:   "process exited unexpectedly",
+						ContainerStatus: &swarmTypes.ContainerStatus{
+							ExitCode: 7,
+						},
+					},
+				},
+			},
+			want: "job task failed-task ended in failed (exit code 7): process exited unexpectedly",
+		},
+		{
+			name: "previous iteration failure is ignored",
+			tasks: []swarmTypes.Task{
+				{
+					ID:           "old-failed-task",
+					JobIteration: &swarmTypes.Version{Index: otherIteration},
+					Status:       swarmTypes.TaskStatus{State: swarmTypes.TaskStateFailed},
+				},
+				{
+					ID:           "current-complete-task",
+					JobIteration: &swarmTypes.Version{Index: iteration},
+					Status:       swarmTypes.TaskStatus{State: swarmTypes.TaskStateComplete},
+				},
+			},
+		},
+		{
+			name: "current iteration rejected task uses message",
+			tasks: []swarmTypes.Task{
+				{
+					ID:           "rejected-task",
+					JobIteration: &swarmTypes.Version{Index: iteration},
+					Status: swarmTypes.TaskStatus{
+						State:   swarmTypes.TaskStateRejected,
+						Message: "no suitable node",
+					},
+				},
+			},
+			want: "job task rejected-task ended in rejected: no suitable node",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := jobTaskFailureFromTasks(tt.tasks, iteration)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("jobTaskFailureFromTasks() error = %v, want nil", err)
+				}
+
+				return
+			}
+
+			if err == nil || err.Error() != tt.want {
+				t.Fatalf("jobTaskFailureFromTasks() error = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
 
 func TestShouldWaitForService(t *testing.T) {
 	t.Parallel()
@@ -171,50 +318,35 @@ func TestRollbackUpdateStatusError(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name        string
-		serviceID   string
-		serviceName string
-		status      *swarmTypes.UpdateStatus
-		wantErr     bool
-		wantParts   []string
+		name      string
+		status    *swarmTypes.UpdateStatus
+		wantErr   bool
+		wantParts []string
 	}{
+		{name: "nil status"},
 		{
-			name:        "nil status",
-			serviceID:   "svc-id",
-			serviceName: "stack_api",
-			status:      nil,
-			wantErr:     false,
-		},
-		{
-			name:        "non rollback state",
-			serviceID:   "svc-id",
-			serviceName: "stack_api",
+			name: "non rollback state",
 			status: &swarmTypes.UpdateStatus{
 				State:   swarmTypes.UpdateStateCompleted,
 				Message: "update completed",
 			},
-			wantErr: false,
 		},
 		{
-			name:        "rollback uses service name and message",
-			serviceID:   "svc-id",
-			serviceName: "stack_api",
+			name: "rollback includes state and message",
 			status: &swarmTypes.UpdateStatus{
 				State:   swarmTypes.UpdateStateRollbackCompleted,
 				Message: "rollback completed",
 			},
 			wantErr:   true,
-			wantParts: []string{"stack_api", string(swarmTypes.UpdateStateRollbackCompleted), "rollback completed"},
+			wantParts: []string{string(swarmTypes.UpdateStateRollbackCompleted), "rollback completed"},
 		},
 		{
-			name:        "rollback falls back to service id",
-			serviceID:   "svc-id",
-			serviceName: "   ",
+			name: "rollback without message",
 			status: &swarmTypes.UpdateStatus{
 				State: swarmTypes.UpdateStateRollbackStarted,
 			},
 			wantErr:   true,
-			wantParts: []string{"svc-id", string(swarmTypes.UpdateStateRollbackStarted)},
+			wantParts: []string{string(swarmTypes.UpdateStateRollbackStarted)},
 		},
 	}
 
@@ -222,7 +354,7 @@ func TestRollbackUpdateStatusError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			err := rollbackUpdateStatusError(tt.serviceID, tt.serviceName, tt.status)
+			err := rollbackUpdateStatusError(tt.status)
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("rollbackUpdateStatusError() error = %v, wantErr %v", err, tt.wantErr)
 			}

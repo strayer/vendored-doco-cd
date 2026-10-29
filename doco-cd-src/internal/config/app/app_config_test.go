@@ -8,9 +8,12 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/filesystem"
+	"github.com/kimdre/doco-cd/internal/git"
+	"github.com/kimdre/doco-cd/internal/syncwindow"
 )
 
 func TestGetConfig(t *testing.T) {
@@ -113,6 +116,9 @@ func TestGetConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Isolate the Git credentials from the environment. The global token needs a scope.
+			setGitAuthEnv(t, "", "- domains: [github.com]")
+
 			if tt.dockerSecrets != nil {
 				secretsPath := path.Join(t.TempDir(), "/run/secrets/")
 
@@ -207,17 +213,195 @@ func TestGetConfig(t *testing.T) {
 	}
 }
 
+// setGitAuthEnv sets the global token and GIT_AUTH_DOMAINS and clears other Git credential variables.
+func setGitAuthEnv(t *testing.T, token, authDomains string) {
+	t.Helper()
+
+	t.Setenv("GIT_ACCESS_TOKEN", token)
+	t.Setenv("GIT_ACCESS_TOKEN_FILE", "")
+	t.Setenv("GIT_AUTH_DOMAINS", authDomains)
+	t.Setenv("GIT_AUTH_DOMAINS_FILE", "")
+	t.Setenv("GIT_AUTH_ALLOW_ANY_HOST", "false")
+	t.Setenv("GITHUB_APP_ID", "")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY", "")
+	t.Setenv("GITHUB_APP_PRIVATE_KEY_FILE", "")
+}
+
 func TestGetConfig_GlobalGitHubAppValidation(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "info")
 	t.Setenv("HTTP_PORT", "8080")
 	t.Setenv("WEBHOOK_SECRET", "secret")
-	t.Setenv("GIT_ACCESS_TOKEN", "")
-	t.Setenv("GIT_ACCESS_TOKEN_FILE", "")
+	setGitAuthEnv(t, "", "- domains: [github.com]")
 	t.Setenv("GITHUB_APP_ID", "12345")
 	t.Setenv("GITHUB_APP_PRIVATE_KEY", "test-private-key")
 
 	if _, err := GetConfig(); err != nil {
 		t.Fatalf("expected global GitHub App config to be accepted, got %v", err)
+	}
+}
+
+func TestGetConfig_GlobalGitCredentialScope(t *testing.T) {
+	tests := []struct {
+		name         string
+		token        string
+		app          bool
+		incomplete   bool
+		authDomains  string
+		allowAnyHost bool
+		wantErr      error
+		wantInErr    string
+	}{
+		{name: "token without scope", token: "token", wantErr: ErrUnscopedGitCredential, wantInErr: "GIT_ACCESS_TOKEN"},
+		{
+			name: "token with only credentialed entries", token: "token",
+			authDomains: "- domains: [gitlab.com]\n  git_access_token: gl-token",
+			wantErr:     ErrUnscopedGitCredential,
+		},
+		{name: "app without scope", app: true, wantErr: ErrUnscopedGitCredential, wantInErr: "GITHUB_APP_ID"},
+		{name: "token without scope and allow any host", token: "token", allowAnyHost: true},
+		{name: "app without scope and allow any host", app: true, allowAnyHost: true},
+		{name: "token with domains-only entry", token: "token", authDomains: "- domains: [github.com]"},
+		{
+			name: "token with SSH-only entry", token: "token",
+			authDomains: "- domains: [github.com]\n  ssh_private_key: key",
+		},
+		{name: "incomplete app without scope is ignored", app: true, incomplete: true},
+		{name: "no global credential without scope"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			setGitAuthEnv(t, tt.token, tt.authDomains)
+
+			t.Setenv("GIT_AUTH_ALLOW_ANY_HOST", strconv.FormatBool(tt.allowAnyHost))
+
+			if tt.app {
+				t.Setenv("GITHUB_APP_ID", "12345")
+
+				if !tt.incomplete {
+					t.Setenv("GITHUB_APP_PRIVATE_KEY", "test-private-key")
+				}
+			}
+
+			_, err := GetConfig()
+			if tt.wantErr == nil {
+				if err != nil {
+					t.Fatalf("GetConfig() error = %v, want nil", err)
+				}
+
+				return
+			}
+
+			if !errors.Is(err, tt.wantErr) {
+				t.Fatalf("GetConfig() error = %v, want %v", err, tt.wantErr)
+			}
+
+			if !strings.Contains(err.Error(), tt.wantInErr) || !strings.Contains(err.Error(), "GIT_AUTH_DOMAINS") {
+				t.Fatalf("GetConfig() error = %q, want a migration hint for %s", err, tt.wantInErr)
+			}
+		})
+	}
+}
+
+func TestGetConfig_GitAuthAllowAnyHost(t *testing.T) {
+	t.Cleanup(func() {
+		git.ConfigureAuthResolver(nil, "", "", "", "", git.GitHubAppConfig{})
+	})
+
+	tests := []struct {
+		name        string
+		value       string
+		authDomains string
+		unset       bool
+		want        bool
+		wantErr     error
+	}{
+		{name: "enabled without scope", value: "true", want: true},
+		{name: "enabled with scope", value: "true", authDomains: "- domains: [github.com]", want: true},
+		{name: "disabled by default", authDomains: "- domains: [github.com]", unset: true},
+		{name: "explicitly disabled", value: "false", authDomains: "- domains: [github.com]"},
+		{name: "invalid value", value: "not-a-bool", wantErr: config.ErrParseConfigFailed},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			setGitAuthEnv(t, "global-token", tt.authDomains)
+			t.Setenv("GIT_AUTH_ALLOW_ANY_HOST", tt.value)
+
+			if tt.unset {
+				if err := os.Unsetenv("GIT_AUTH_ALLOW_ANY_HOST"); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			cfg, err := GetConfig()
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) || !strings.Contains(err.Error(), "GitAuthAllowAnyHost") {
+					t.Fatalf("GetConfig() error = %v, want %v for GitAuthAllowAnyHost", err, tt.wantErr)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if cfg.GitAuthAllowAnyHost != tt.want {
+				t.Fatalf("GitAuthAllowAnyHost = %v, want %v", cfg.GitAuthAllowAnyHost, tt.want)
+			}
+
+			cfg.ConfigureGitAuth()
+
+			for _, host := range []string{"github.com", "unlisted.example"} {
+				repoURL := "https://" + host + "/org/repo.git"
+				resolved := git.ResolveAuthConfig(repoURL, "", "")
+
+				token, err := git.ResolveHTTPToken(repoURL, resolved)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				wantToken := ""
+				if host == "github.com" || tt.want {
+					wantToken = "global-token"
+				}
+
+				if token != wantToken {
+					t.Fatalf("token for %s = %q, want %q", host, token, wantToken)
+				}
+			}
+		})
+	}
+}
+
+func TestGetConfig_GitAuthDomainsRejectsInvalidPatterns(t *testing.T) {
+	for _, authDomains := range []string{
+		"- git_access_token: token",
+		"- domains: []\n  git_access_token: token",
+		"- domains: ['*']\n  git_access_token: token",
+		"- domains: ['https://github.com']\n  git_access_token: token",
+		"- domains: ['github.com:443']\n  git_access_token: token",
+		"- domains: ['github.com/org']\n  git_access_token: token",
+		"- domains: ['']\n  git_access_token: token",
+	} {
+		t.Run(authDomains, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			setGitAuthEnv(t, "", authDomains)
+
+			for _, allowAnyHost := range []bool{false, true} {
+				t.Setenv("GIT_AUTH_ALLOW_ANY_HOST", strconv.FormatBool(allowAnyHost))
+
+				if _, err := GetConfig(); err == nil {
+					t.Fatalf("GetConfig() accepted GIT_AUTH_DOMAINS %q with allow-any-host=%v", authDomains, allowAnyHost)
+				}
+			}
+		})
 	}
 }
 
@@ -234,6 +418,259 @@ func TestGetConfig_SchedulerEnabled(t *testing.T) {
 
 	if cfg.SchedulerEnabled {
 		t.Fatal("expected SchedulerEnabled to be false")
+	}
+}
+
+func TestGetConfig_McpEnabled(t *testing.T) {
+	tests := []struct {
+		name        string
+		mcpEnabled  string
+		apiSecret   string
+		wantEnabled bool
+		wantErr     string
+	}{
+		{
+			name: "disabled by default",
+		},
+		{
+			name:        "enabled with API secret",
+			mcpEnabled:  "true",
+			apiSecret:   "x",
+			wantEnabled: true,
+		},
+		{
+			name:       "enabled without API secret",
+			mcpEnabled: "true",
+			wantErr:    "MCP_ENABLED requires API_SECRET",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("HTTP_PORT", "8080")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("MCP_ENABLED", testCase.mcpEnabled)
+			t.Setenv("API_SECRET", testCase.apiSecret)
+			t.Setenv("API_SECRET_FILE", "")
+
+			cfg, err := GetConfig()
+			if testCase.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", testCase.wantErr, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected config to load, got %v", err)
+			}
+
+			if cfg.McpEnabled != testCase.wantEnabled {
+				t.Fatalf("expected McpEnabled=%v, got %v", testCase.wantEnabled, cfg.McpEnabled)
+			}
+		})
+	}
+
+	t.Run("enabled with API secret file", func(t *testing.T) {
+		const apiSecret = "file-secret"
+
+		apiSecretFile := path.Join(t.TempDir(), "api-secret")
+		if err := os.WriteFile(apiSecretFile, []byte(apiSecret), filesystem.PermOwner); err != nil {
+			t.Fatalf("failed to write API secret file: %v", err)
+		}
+
+		t.Setenv("LOG_LEVEL", "info")
+		t.Setenv("HTTP_PORT", "8080")
+		t.Setenv("WEBHOOK_SECRET", "secret")
+		t.Setenv("MCP_ENABLED", "true")
+		t.Setenv("API_SECRET", "")
+		t.Setenv("API_SECRET_FILE", apiSecretFile)
+
+		cfg, err := GetConfig()
+		if err != nil {
+			t.Fatalf("expected config to load, got %v", err)
+		}
+
+		if !cfg.McpEnabled {
+			t.Fatal("expected McpEnabled to be true")
+		}
+
+		if cfg.ApiSecret != apiSecret {
+			t.Fatalf("expected ApiSecret=%q, got %q", apiSecret, cfg.ApiSecret)
+		}
+	})
+}
+
+func TestGetConfig_OpenAPIEnabled(t *testing.T) {
+	for _, testCase := range []struct {
+		name        string
+		value       string
+		wantEnabled bool
+	}{
+		{
+			name: "disabled by default",
+		},
+		{
+			name:        "enabled",
+			value:       "true",
+			wantEnabled: true,
+		},
+		{
+			name:  "explicitly disabled",
+			value: "false",
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("OPENAPI_ENABLED", testCase.value)
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("API_SECRET", "")
+			t.Setenv("API_SECRET_FILE", "")
+			t.Setenv("MCP_ENABLED", "")
+
+			cfg, err := GetConfig()
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+
+			if cfg.OpenAPIEnabled != testCase.wantEnabled {
+				t.Fatalf("OpenAPIEnabled = %v, want %v", cfg.OpenAPIEnabled, testCase.wantEnabled)
+			}
+		})
+	}
+}
+
+func TestGetConfig_VersionCheckEnabled(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		value       string
+		unset       bool
+		wantEnabled bool
+		wantErr     bool
+	}{
+		{name: "enabled by default", unset: true, wantEnabled: true},
+		{name: "empty uses default", wantEnabled: true},
+		{name: "explicitly enabled", value: "true", wantEnabled: true},
+		{name: "explicitly disabled", value: "false"},
+		{name: "invalid boolean", value: "invalid", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VERSION_CHECK_ENABLED", tc.value)
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("APPRISE_NOTIFY_LEVEL", "info")
+
+			if tc.unset {
+				if err := os.Unsetenv("VERSION_CHECK_ENABLED"); err != nil {
+					t.Fatalf("unset VERSION_CHECK_ENABLED: %v", err)
+				}
+			}
+
+			cfg, err := GetConfig()
+			if tc.wantErr {
+				if !errors.Is(err, config.ErrParseConfigFailed) || !strings.Contains(err.Error(), "VersionCheckEnabled") {
+					t.Fatalf("expected a VERSION_CHECK_ENABLED parse error, got %v", err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("load config: %v", err)
+			}
+
+			if cfg.VersionCheckEnabled != tc.wantEnabled {
+				t.Fatalf("VersionCheckEnabled = %v, want %v", cfg.VersionCheckEnabled, tc.wantEnabled)
+			}
+
+			if cfg.AppriseNotifyLevel != "info" {
+				t.Fatalf("AppriseNotifyLevel = %q, want info", cfg.AppriseNotifyLevel)
+			}
+		})
+	}
+}
+
+func TestGetConfig_Pprof(t *testing.T) {
+	tests := []struct {
+		name        string
+		enabled     string
+		port        string
+		metricsPort string
+		wantEnabled bool
+		wantPort    uint16
+		wantErr     string
+	}{
+		{
+			name:     "disabled by default",
+			wantPort: 6060,
+		},
+		{
+			name:        "enabled with custom port",
+			enabled:     "true",
+			port:        "6061",
+			wantEnabled: true,
+			wantPort:    6061,
+		},
+		{
+			name:    "rejects HTTP port conflict",
+			enabled: "true",
+			port:    "8080",
+			wantErr: "PPROF_PORT and HTTP_PORT cannot be the same",
+		},
+		{
+			name:        "rejects metrics port conflict",
+			enabled:     "true",
+			port:        "6061",
+			metricsPort: "6061",
+			wantErr:     "PPROF_PORT and METRICS_PORT cannot be the same",
+		},
+	}
+
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("HTTP_PORT", "8080")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("PPROF_ENABLED", testCase.enabled)
+			t.Setenv("PPROF_PORT", testCase.port)
+			t.Setenv("METRICS_PORT", testCase.metricsPort)
+
+			cfg, err := GetConfig()
+			if testCase.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), testCase.wantErr) {
+					t.Fatalf("expected error containing %q, got %v", testCase.wantErr, err)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("expected config to load, got %v", err)
+			}
+
+			if cfg.PprofEnabled != testCase.wantEnabled {
+				t.Fatalf("PprofEnabled = %t, want %t", cfg.PprofEnabled, testCase.wantEnabled)
+			}
+
+			if cfg.PprofPort != testCase.wantPort {
+				t.Fatalf("PprofPort = %d, want %d", cfg.PprofPort, testCase.wantPort)
+			}
+		})
+	}
+}
+
+func TestGetConfigRejectsNonPositiveMaxPayloadSize(t *testing.T) {
+	for _, value := range []string{"0", "-1"} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("MAX_PAYLOAD_SIZE", value)
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv("API_SECRET", "")
+			t.Setenv("API_SECRET_FILE", "")
+
+			if _, err := GetConfig(); err == nil {
+				t.Fatalf("expected MAX_PAYLOAD_SIZE=%s to be rejected", value)
+			}
+		})
 	}
 }
 
@@ -487,6 +924,33 @@ func TestGetConfig_OciVerifyMaxWorkersRejectsZero(t *testing.T) {
 	}
 }
 
+func TestGetConfig_MaxConcurrentPreDeploymentsDefaultsToEight(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("MAX_CONCURRENT_PREDEPLOYMENTS", "")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if cfg.MaxConcurrentPreDeployments != 8 {
+		t.Fatalf("expected MAX_CONCURRENT_PREDEPLOYMENTS default to be 8, got %d", cfg.MaxConcurrentPreDeployments)
+	}
+}
+
+func TestGetConfig_MaxConcurrentPreDeploymentsRejectsZero(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("MAX_CONCURRENT_PREDEPLOYMENTS", "0")
+
+	if _, err := GetConfig(); err == nil {
+		t.Fatal("expected MAX_CONCURRENT_PREDEPLOYMENTS=0 to be rejected")
+	}
+}
+
 func TestGetConfig_DataMountPathDefaultsToData(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "info")
 	t.Setenv("HTTP_PORT", "8080")
@@ -698,6 +1162,101 @@ func TestGetConfig_SourceURLRewritesRejectsEnvAndFileTogether(t *testing.T) {
 	}
 }
 
+func TestGetConfig_SyncWindowsDefaultEmpty(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("SYNC_WINDOWS", "")
+	t.Setenv("SYNC_WINDOWS_FILE", "")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if cfg.SyncWindows == nil || !cfg.SyncWindows.Empty() {
+		t.Fatalf("expected an empty, non-nil sync window policy, got %+v", cfg.SyncWindows)
+	}
+}
+
+func TestGetConfig_SyncWindows(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("SYNC_WINDOWS_FILE", "")
+	t.Setenv("SYNC_WINDOWS", `
+- name: business-hours
+  kind: allow
+  schedule: "0 8 * * 1-5"
+  duration: 10h
+  timezone: Europe/Berlin
+`)
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	windows := cfg.SyncWindows.Windows()
+	if len(windows) != 1 || windows[0].Name != "business-hours" || windows[0].Duration != 10*time.Hour {
+		t.Fatalf("unexpected sync windows: %+v", windows)
+	}
+}
+
+func TestGetConfig_SyncWindowsFromFile(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("SYNC_WINDOWS", "")
+
+	windowsFile := path.Join(t.TempDir(), "sync-windows.yaml")
+	if err := os.WriteFile(windowsFile, []byte("- kind: deny\n  schedule: \"@daily\"\n  duration: 1h\n"), filesystem.PermOwner); err != nil {
+		t.Fatalf("failed to write sync windows file: %v", err)
+	}
+
+	t.Setenv("SYNC_WINDOWS_FILE", windowsFile)
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	windows := cfg.SyncWindows.Windows()
+	if len(windows) != 1 || windows[0].Name != "deny-1" {
+		t.Fatalf("unexpected sync windows: %+v", windows)
+	}
+}
+
+func TestGetConfig_SyncWindowsRejectsInvalid(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("SYNC_WINDOWS_FILE", "")
+	t.Setenv("SYNC_WINDOWS", `[{kind: allow, schedule: "@every 1h", duration: 1h}]`)
+
+	if _, err := GetConfig(); !errors.Is(err, syncwindow.ErrInvalidConfig) {
+		t.Fatalf("expected ErrInvalidConfig, got %v", err)
+	}
+}
+
+func TestGetConfig_SyncWindowsRejectsEnvAndFileTogether(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("SYNC_WINDOWS", `[{kind: deny, schedule: "@daily", duration: 1h}]`)
+
+	windowsFile := path.Join(t.TempDir(), "sync-windows.yaml")
+	if err := os.WriteFile(windowsFile, []byte("[]\n"), filesystem.PermOwner); err != nil {
+		t.Fatalf("failed to write sync windows file: %v", err)
+	}
+
+	t.Setenv("SYNC_WINDOWS_FILE", windowsFile)
+
+	if _, err := GetConfig(); !errors.Is(err, syncwindow.ErrBothConfigSet) {
+		t.Fatalf("expected ErrBothConfigSet, got %v", err)
+	}
+}
+
 func TestGetConfig_DockerSwarmConfigRetentionDefaultsToZero(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "info")
 	t.Setenv("HTTP_PORT", "8080")
@@ -806,5 +1365,182 @@ func TestGetConfig_PollConfigAbsolutePathNormalizedInPlace(t *testing.T) {
 	want := "file:///local-repos/my-app"
 	if got := cfg.PollConfig[0].SourceUrl; got != want {
 		t.Fatalf("expected normalized SourceUrl %q to be persisted, got %q", want, got)
+	}
+}
+
+func TestGetConfig_PollConfigExplicitZeroDisablesPolling(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("POLL_CONFIG", `
+- source: oci
+  url: ghcr.io/kimdre/doco-cd_tests:test
+  interval: 0
+- source: git
+  url: https://github.com/kimdre/doco-cd_tests.git
+  reference: main
+  interval: 10
+`)
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected poll config to be accepted, got %v", err)
+	}
+
+	if len(cfg.PollConfig) != 2 {
+		t.Fatalf("expected 2 poll configs, got %d", len(cfg.PollConfig))
+	}
+
+	if got := cfg.PollConfig[0].Interval; got != 0 {
+		t.Fatalf("expected explicit zero interval to be preserved, got %s", got)
+	}
+
+	if got := cfg.PollConfig[1].Interval; got != 10*time.Second {
+		t.Fatalf("expected Git interval to be 10s, got %s", got)
+	}
+}
+
+func TestGetConfig_ArtifactGCDefaults(t *testing.T) {
+	t.Setenv("ARTIFACT_GC_RETENTION_TTL", "")
+	t.Setenv("ARTIFACT_GC_RETENTION_RECORDS", "")
+	t.Setenv("ARTIFACT_GC_INTERVAL", "")
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if !cfg.ArtifactGCEnabled {
+		t.Fatal("expected ArtifactGCEnabled to default to true")
+	}
+
+	if cfg.ArtifactGCRetentionRecords != 2 {
+		t.Fatalf("expected ArtifactGCRetentionRecords default to be 2, got %d", cfg.ArtifactGCRetentionRecords)
+	}
+
+	if cfg.ArtifactGCRetentionTTL != time.Minute {
+		t.Fatalf("expected ArtifactGCRetentionTTL default to be 1m, got %s", cfg.ArtifactGCRetentionTTL)
+	}
+
+	if cfg.ArtifactGCInterval != 10*time.Minute {
+		t.Fatalf("expected ArtifactGCInterval default to be 10m, got %s", cfg.ArtifactGCInterval)
+	}
+}
+
+func TestGetConfig_ArtifactGCDisabled(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("ARTIFACT_GC_ENABLED", "false")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if cfg.ArtifactGCEnabled {
+		t.Fatal("expected ArtifactGCEnabled to be false")
+	}
+}
+
+func TestGetConfig_ArtifactGCRetentionRecordsAllowsZero(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("ARTIFACT_GC_RETENTION_RECORDS", "0")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected ARTIFACT_GC_RETENTION_RECORDS=0 to be accepted, got %v", err)
+	}
+
+	if cfg.ArtifactGCRetentionRecords != 0 {
+		t.Fatalf("expected ArtifactGCRetentionRecords=0, got %d", cfg.ArtifactGCRetentionRecords)
+	}
+}
+
+func TestGetConfig_ArtifactGCRetentionRecordsRejectsNegative(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("ARTIFACT_GC_RETENTION_RECORDS", "-1")
+
+	if _, err := GetConfig(); err == nil {
+		t.Fatal("expected ARTIFACT_GC_RETENTION_RECORDS=-1 to be rejected")
+	}
+}
+
+func TestGetConfig_SourceGCDefaults(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if cfg.SourceGCEnabled {
+		t.Fatal("expected SourceGCEnabled to default to false")
+	}
+
+	if cfg.SourceGCRetentionTTL != 168*time.Hour {
+		t.Fatalf("expected SourceGCRetentionTTL default to be 168h, got %s", cfg.SourceGCRetentionTTL)
+	}
+
+	if cfg.SourceGCInterval != time.Hour {
+		t.Fatalf("expected SourceGCInterval default to be 1h, got %s", cfg.SourceGCInterval)
+	}
+}
+
+func TestGetConfig_SourceGCEnabled(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("SOURCE_GC_ENABLED", "true")
+	t.Setenv("SOURCE_GC_RETENTION_TTL", "720h")
+	t.Setenv("SOURCE_GC_INTERVAL", "6h")
+
+	cfg, err := GetConfig()
+	if err != nil {
+		t.Fatalf("expected config to load, got %v", err)
+	}
+
+	if !cfg.SourceGCEnabled || cfg.SourceGCRetentionTTL != 720*time.Hour || cfg.SourceGCInterval != 6*time.Hour {
+		t.Fatalf("expected source GC enabled with TTL 720h and interval 6h, got %t, %s, %s",
+			cfg.SourceGCEnabled, cfg.SourceGCRetentionTTL, cfg.SourceGCInterval)
+	}
+}
+
+func TestGetConfig_SourceGCRejectsShortDurations(t *testing.T) {
+	for _, tt := range []struct{ name, value string }{
+		{name: "SOURCE_GC_RETENTION_TTL", value: "59m"},
+		{name: "SOURCE_GC_INTERVAL", value: "59s"},
+		{name: "SOURCE_GC_INTERVAL", value: "0"},
+	} {
+		t.Run(tt.name+"="+tt.value, func(t *testing.T) {
+			t.Setenv("LOG_LEVEL", "info")
+			t.Setenv("HTTP_PORT", "8080")
+			t.Setenv("WEBHOOK_SECRET", "secret")
+			t.Setenv(tt.name, tt.value)
+
+			if _, err := GetConfig(); err == nil {
+				t.Fatalf("expected %s=%s to be rejected", tt.name, tt.value)
+			}
+		})
+	}
+}
+
+func TestGetConfig_ArtifactGCIntervalRejectsZero(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "info")
+	t.Setenv("HTTP_PORT", "8080")
+	t.Setenv("WEBHOOK_SECRET", "secret")
+	t.Setenv("ARTIFACT_GC_INTERVAL", "0")
+
+	if _, err := GetConfig(); err == nil {
+		t.Fatal("expected ARTIFACT_GC_INTERVAL=0 to be rejected")
 	}
 }

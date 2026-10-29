@@ -33,6 +33,11 @@ func (e TextError) Unwrap() error {
 // Func adapts custom field validation to the tag+parameter shape used in struct tags.
 type Func func(v any, param string) error
 
+// ValueValidator lets scalar configuration types validate themselves without a struct tag.
+type ValueValidator interface {
+	ValidateValue() error
+}
+
 var (
 	engine = playgroundvalidator.New(playgroundvalidator.WithRequiredStructEnabled())
 
@@ -94,7 +99,9 @@ func lookupValidationFunc(tag string) (Func, bool) {
 	return fn, ok
 }
 
-// Validate applies validator rules and this package's custom tag handlers.
+// Validate applies validator rules, custom tag handlers, and scalar value validation.
+// Custom traversal respects the -, nostructlevel, and structonly tags.
+// Opaque structs accept required, omitempty, and registered custom field rules.
 func Validate(v any) error {
 	return validateValue(reflect.ValueOf(v))
 }
@@ -106,9 +113,13 @@ func validateValue(value reflect.Value) error {
 		return nil
 	}
 
+	if err := validateSelf(value, ""); err != nil {
+		return err
+	}
+
 	switch value.Kind() {
 	case reflect.Struct:
-		if err := engine.Struct(value.Interface()); err != nil {
+		if err := validateStandardTags(value); err != nil {
 			return err
 		}
 
@@ -133,6 +144,126 @@ func validateValue(value reflect.Value) error {
 	return nil
 }
 
+func validateStandardTags(value reflect.Value) error {
+	var excluded []string
+	if err := collectOpaqueFields(value, "", &excluded); err != nil {
+		return err
+	}
+
+	if len(excluded) == 0 {
+		return engine.Struct(value.Interface())
+	}
+
+	// The engine copies nested structs before checking traversal controls.
+	return engine.StructExcept(value.Interface(), excluded...)
+}
+
+func collectOpaqueFields(value reflect.Value, path string, excluded *[]string) error {
+	value = dereference(value)
+	if !value.IsValid() {
+		return nil
+	}
+
+	switch value.Kind() {
+	case reflect.Struct:
+		typ := value.Type()
+		for i := range value.NumField() {
+			field := typ.Field(i)
+
+			tag := field.Tag.Get("validate")
+			if field.PkgPath != "" || tag == "-" {
+				continue
+			}
+
+			fieldPath := field.Name
+			if path != "" {
+				fieldPath = path + "." + fieldPath
+			}
+
+			fieldValue := value.Field(i)
+			if omitsEmptyValue(fieldValue, tag) {
+				continue
+			}
+
+			concrete := dereference(fieldValue)
+			if !concrete.IsValid() {
+				continue
+			}
+
+			switch nestedValidationTag(tag) {
+			case "nostructlevel", "structonly":
+				if concrete.Kind() == reflect.Struct {
+					if err := validateOpaqueStructTags(fieldValue, tag, fieldPath); err != nil {
+						return err
+					}
+
+					*excluded = append(*excluded, fieldPath)
+
+					continue
+				}
+			}
+
+			if err := collectOpaqueFields(concrete, fieldPath, excluded); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		for i := range value.Len() {
+			if err := collectOpaqueFields(value.Index(i), fmt.Sprintf("%s[%d]", path, i), excluded); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		iter := value.MapRange()
+		for iter.Next() {
+			itemPath := fmt.Sprintf("%s[%v]", path, iter.Key().Interface())
+			if err := collectOpaqueFields(iter.Value(), itemPath, excluded); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func omitsEmptyValue(value reflect.Value, tag string) bool {
+	for part := range strings.SplitSeq(tag, ",") {
+		switch part {
+		case "omitempty":
+			return value.IsZero()
+		case "nostructlevel", "structonly", "dive":
+			return false
+		}
+	}
+
+	return false
+}
+
+// Opaque structs support presence checks without reading their internal state.
+func validateOpaqueStructTags(value reflect.Value, tag, path string) error {
+	for part := range strings.SplitSeq(tag, ",") {
+		switch part {
+		case "nostructlevel", "structonly":
+			return nil
+		case "omitempty":
+			if value.IsZero() {
+				return nil
+			}
+		case "required":
+			if value.IsZero() {
+				return fmt.Errorf("%s: %w", path, engine.Var(nil, "required"))
+			}
+		default:
+			name, _, _ := strings.Cut(part, "=")
+			if _, custom := lookupValidationFunc(name); !custom {
+				return fmt.Errorf("%s: unsupported validation %q before %s", path, part, nestedValidationTag(tag))
+			}
+		}
+	}
+
+	return nil
+}
+
 // validateCustomTags applies registered custom tag validators to exported struct fields.
 func validateCustomTags(value reflect.Value, path string) error {
 	value = dereference(value)
@@ -148,6 +279,11 @@ func validateCustomTags(value reflect.Value, path string) error {
 			continue
 		}
 
+		tag := fieldType.Tag.Get("validate")
+		if tag == "-" {
+			continue
+		}
+
 		fieldValue := value.Field(i)
 
 		fieldPath := fieldType.Name
@@ -155,8 +291,19 @@ func validateCustomTags(value reflect.Value, path string) error {
 			fieldPath = path + "." + fieldType.Name
 		}
 
-		if err := validateFieldTag(fieldType.Tag.Get("validate"), fieldValue, fieldPath); err != nil {
+		if err := validateFieldTag(tag, fieldValue, fieldPath); err != nil {
 			return err
+		}
+
+		switch nestedValidationTag(tag) {
+		case "nostructlevel":
+			continue
+		case "structonly":
+			if err := validateSelf(dereference(fieldValue), fieldPath); err != nil {
+				return err
+			}
+
+			continue
 		}
 
 		// Struct and pointer fields are already covered by the engine, so only
@@ -169,6 +316,17 @@ func validateCustomTags(value reflect.Value, path string) error {
 	return nil
 }
 
+func nestedValidationTag(tag string) string {
+	for part := range strings.SplitSeq(tag, ",") {
+		switch part {
+		case "nostructlevel", "structonly":
+			return part
+		}
+	}
+
+	return ""
+}
+
 // walkNestedCustomTags descends into nested structs and collections for custom tag validation.
 // standardTags requests engine validation for structs the engine does not reach on its own.
 func walkNestedCustomTags(value reflect.Value, path string, standardTags bool) error {
@@ -177,10 +335,14 @@ func walkNestedCustomTags(value reflect.Value, path string, standardTags bool) e
 		return nil
 	}
 
+	if err := validateSelf(value, path); err != nil {
+		return err
+	}
+
 	switch value.Kind() {
 	case reflect.Struct:
 		if standardTags {
-			if err := engine.Struct(value.Interface()); err != nil {
+			if err := validateStandardTags(value); err != nil {
 				return err
 			}
 		}
@@ -209,6 +371,26 @@ func walkNestedCustomTags(value reflect.Value, path string, standardTags bool) e
 	return nil
 }
 
+// validateSelf applies a scalar's own validation and adds the enclosing field path.
+func validateSelf(value reflect.Value, path string) error {
+	if !value.IsValid() || !value.CanInterface() || !value.Type().Implements(reflect.TypeFor[ValueValidator]()) {
+		return nil
+	}
+
+	// Interface copies addressable values, including any live synchronization state.
+	validator := value.Interface().(ValueValidator)
+
+	if err := validator.ValidateValue(); err != nil {
+		if path == "" {
+			return err
+		}
+
+		return fmt.Errorf("%s: %w", path, err)
+	}
+
+	return nil
+}
+
 // validateFieldTag executes registered custom validators found in a validate tag.
 func validateFieldTag(tag string, value reflect.Value, path string) error {
 	if tag == "" || tag == "-" {
@@ -217,6 +399,9 @@ func validateFieldTag(tag string, value reflect.Value, path string) error {
 
 	for part := range strings.SplitSeq(tag, ",") {
 		name, param, _ := strings.Cut(strings.TrimSpace(part), "=")
+		if name == "nostructlevel" || name == "structonly" {
+			return nil
+		}
 
 		// The lock is not held while calling fn, otherwise a validator that
 		// registers another tag would deadlock and wedge all later validation.

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -12,7 +13,9 @@ import (
 
 	"github.com/avast/retry-go/v5"
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/docker/compose/v5/pkg/api"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/moby/moby/api/types/container"
 
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 
@@ -21,6 +24,289 @@ import (
 	"github.com/kimdre/doco-cd/internal/test"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
+
+func TestGetServiceStatusFromContainerStatus_ExcludesHookContainers(t *testing.T) {
+	t.Parallel()
+
+	const project = "test-project"
+
+	realLabels := Labels{
+		api.ProjectLabel:                    project,
+		api.ServiceLabel:                    "scheduled",
+		DocoCDLabels.Source.Name:            "owner/repo",
+		DocoCDLabels.Deployment.CommitSHA:   "real-commit",
+		DocoCDLabels.Deployment.ComposeHash: "real-compose",
+		DocoCDLabels.Deployment.AutoDiscoveryConfig: MarshalAutoDiscoveryConfig(deploy.AutoDiscoveryConfig{
+			Enabled: true,
+			Delete:  true,
+		}),
+	}
+	source := container.Summary{ID: "source", State: container.StateCreated, Labels: realLabels}
+
+	for _, state := range []container.ContainerState{container.StateCreated, container.StateRunning, container.StateExited} {
+		for _, carriesMetadata := range []bool{false, true} {
+			hookLabels := Labels{
+				api.ProjectLabel: project,
+				api.ServiceLabel: "scheduled",
+				api.HookLabel:    "pre_start",
+			}
+			if carriesMetadata {
+				hookLabels[DocoCDLabels.Source.Name] = "owner/repo"
+				hookLabels[DocoCDLabels.Deployment.CommitSHA] = "hook-commit"
+				hookLabels[DocoCDLabels.Deployment.ComposeHash] = "hook-compose"
+				hookLabels[DocoCDLabels.Deployment.AutoDiscoveryConfig] = "{enabled: false}"
+			}
+
+			hook := container.Summary{ID: "hook", State: state, Labels: hookLabels}
+			orders := []struct {
+				name       string
+				containers []container.Summary
+			}{
+				{name: "hook first", containers: []container.Summary{hook, source}},
+				{name: "source first", containers: []container.Summary{source, hook}},
+				{name: "hook only", containers: []container.Summary{hook}},
+			}
+
+			for _, order := range orders {
+				t.Run(string(state)+"/metadata="+strconv.FormatBool(carriesMetadata)+"/"+order.name, func(t *testing.T) {
+					t.Parallel()
+
+					want := map[Service]ServiceStatus{}
+					if order.name != "hook only" {
+						want["scheduled"] = ServiceStatus{Labels: realLabels, Containers: 1}
+					}
+
+					got := getServiceStatusFromContainerStatus(project, order.containers)
+					if !reflect.DeepEqual(got, want) {
+						t.Fatalf("service status = %#v, want %#v", got, want)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestGetServiceStatusFromContainerStatus_PreservesRealContainers(t *testing.T) {
+	t.Parallel()
+
+	const project = "test-project"
+
+	labels := Labels{api.ProjectLabel: project, api.ServiceLabel: "app"}
+	emptyHookLabels := Labels{api.ProjectLabel: project, api.ServiceLabel: "app", api.HookLabel: ""}
+	hookLabels := Labels{api.ProjectLabel: project, api.ServiceLabel: "app", api.HookLabel: "pre_start"}
+	otherLabels := Labels{api.ProjectLabel: "other-project", api.ServiceLabel: "app"}
+	projectOnlyLabels := Labels{api.ProjectLabel: project, "com.example.helper": "true"}
+	emptyServiceLabels := Labels{api.ProjectLabel: project, api.ServiceLabel: ""}
+	blankServiceLabels := Labels{api.ProjectLabel: project, api.ServiceLabel: "  "}
+
+	tests := []struct {
+		name       string
+		containers []container.Summary
+		want       map[Service]ServiceStatus
+	}{
+		{
+			name: "empty inventory",
+			want: map[Service]ServiceStatus{},
+		},
+		{
+			name:       "nil labels",
+			containers: []container.Summary{{State: container.StateRunning}},
+			want:       map[Service]ServiceStatus{},
+		},
+		{
+			name:       "other project",
+			containers: []container.Summary{{State: container.StateRunning, Labels: otherLabels}},
+			want:       map[Service]ServiceStatus{},
+		},
+		{
+			name:       "project label without service label",
+			containers: []container.Summary{{State: container.StateRunning, Labels: projectOnlyLabels}},
+			want:       map[Service]ServiceStatus{},
+		},
+		{
+			name:       "empty service label",
+			containers: []container.Summary{{State: container.StateRunning, Labels: emptyServiceLabels}},
+			want:       map[Service]ServiceStatus{},
+		},
+		{
+			name:       "blank service label",
+			containers: []container.Summary{{State: container.StateRunning, Labels: blankServiceLabels}},
+			want:       map[Service]ServiceStatus{},
+		},
+		{
+			name: "container without service label next to real service",
+			containers: []container.Summary{
+				{State: container.StateRunning, Labels: projectOnlyLabels},
+				{State: container.StateRunning, Labels: labels},
+			},
+			want: map[Service]ServiceStatus{"app": {Labels: labels, Replicas: 1, Containers: 1}},
+		},
+		{
+			name:       "unmanaged running service",
+			containers: []container.Summary{{State: container.StateRunning, Labels: labels}},
+			want:       map[Service]ServiceStatus{"app": {Labels: labels, Replicas: 1, Containers: 1}},
+		},
+		{
+			name:       "unmanaged created service",
+			containers: []container.Summary{{State: container.StateCreated, Labels: labels}},
+			want:       map[Service]ServiceStatus{"app": {Labels: labels, Containers: 1}},
+		},
+		{
+			name:       "unmanaged stopped service",
+			containers: []container.Summary{{State: container.StateExited, Labels: labels}},
+			want:       map[Service]ServiceStatus{"app": {Labels: labels, Containers: 1}},
+		},
+		{
+			name:       "empty hook label is not a runner",
+			containers: []container.Summary{{State: container.StateRunning, Labels: emptyHookLabels}},
+			want:       map[Service]ServiceStatus{"app": {Labels: emptyHookLabels, Replicas: 1, Containers: 1}},
+		},
+		{
+			name: "running replicas and all real containers count",
+			containers: []container.Summary{
+				{State: container.StateRunning, Labels: hookLabels},
+				{State: container.StateRunning, Labels: labels},
+				{State: container.StateExited, Labels: labels},
+				{State: container.StateCreated, Labels: labels},
+				{State: container.StateRunning, Labels: labels},
+			},
+			want: map[Service]ServiceStatus{"app": {Labels: labels, Replicas: 2, Containers: 4}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := getServiceStatusFromContainerStatus(project, tt.containers)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("service status = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGetLatestServiceStatus_IgnoresHookMetadata(t *testing.T) {
+	t.Parallel()
+
+	const project = "test-project"
+
+	autoDiscovery := MarshalAutoDiscoveryConfig(deploy.AutoDiscoveryConfig{Enabled: true})
+	realLabels := Labels{
+		api.ProjectLabel:                            project,
+		api.ServiceLabel:                            "scheduled",
+		DocoCDLabels.Source.Name:                    "owner/repo",
+		DocoCDLabels.Deployment.CommitSHA:           "real-commit",
+		DocoCDLabels.Deployment.ComposeHash:         "real-compose",
+		DocoCDLabels.Deployment.AutoDiscoveryConfig: autoDiscovery,
+		DocoCDLabels.Deployment.Timestamp:           "2026-10-14T07:00:00Z",
+	}
+	hookLabels := Labels{
+		api.ProjectLabel:                            project,
+		api.ServiceLabel:                            "scheduled",
+		api.HookLabel:                               "pre_start",
+		DocoCDLabels.Source.Name:                    "owner/repo",
+		DocoCDLabels.Deployment.CommitSHA:           "hook-commit",
+		DocoCDLabels.Deployment.ComposeHash:         "hook-compose",
+		DocoCDLabels.Deployment.AutoDiscoveryConfig: "{enabled: false}",
+		DocoCDLabels.Deployment.Timestamp:           "2026-10-14T08:00:00Z",
+	}
+	hook := container.Summary{State: container.StateCreated, Labels: hookLabels}
+	source := container.Summary{State: container.StateCreated, Labels: realLabels}
+
+	for _, tt := range []struct {
+		name       string
+		containers []container.Summary
+		want       LatestServiceStatus
+	}{
+		{
+			name:       "hook first",
+			containers: []container.Summary{hook, source},
+			want: LatestServiceStatus{
+				deploymentCommitSHA:   "real-commit",
+				deploymentComposeHash: "real-compose",
+				DeployedStatus:        map[Service]ServiceStatus{"scheduled": {Labels: realLabels, Containers: 1}},
+			},
+		},
+		{
+			name:       "source first",
+			containers: []container.Summary{source, hook},
+			want: LatestServiceStatus{
+				deploymentCommitSHA:   "real-commit",
+				deploymentComposeHash: "real-compose",
+				DeployedStatus:        map[Service]ServiceStatus{"scheduled": {Labels: realLabels, Containers: 1}},
+			},
+		},
+		{
+			name:       "hook only",
+			containers: []container.Summary{hook},
+			want:       LatestServiceStatus{DeployedStatus: map[Service]ServiceStatus{}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			inventory := getServiceStatusFromContainerStatus(project, tt.containers)
+
+			got := getLatestServiceStatus(&sync.Map{}, inventory, "https://github.com/owner/repo.git", project)
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("deployment status = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Helper containers that other tools start with only the Compose project label must not cause a
+// service mismatch. Otherwise, every poll redeploys the stack while the container exists.
+func TestServiceInventory_IgnoresContainersWithoutServiceLabel(t *testing.T) {
+	t.Parallel()
+
+	const project = "ops"
+
+	appLabels := Labels{api.ProjectLabel: project, api.ServiceLabel: "app"}
+	helperLabels := Labels{api.ProjectLabel: project, "com.example.helper": "true"}
+
+	containers := []container.Summary{
+		{State: container.StateRunning, Labels: helperLabels},
+		{State: container.StateRunning, Labels: appLabels},
+	}
+
+	inventory := getServiceStatusFromContainerStatus(project, containers)
+	status := getLatestServiceStatus(&sync.Map{}, inventory, "https://github.com/owner/repo.git", project)
+
+	want := map[Service]ServiceStatus{"app": {Labels: appLabels, Replicas: 1, Containers: 1}}
+	if !reflect.DeepEqual(status.DeployedStatus, want) {
+		t.Fatalf("deployed status = %#v, want %#v", status.DeployedStatus, want)
+	}
+
+	mismatches, err := CheckServiceMismatch(false, status.DeployedStatus, types.Services{"app": {Name: "app"}})
+	if err != nil {
+		t.Fatalf("CheckServiceMismatch() error = %v", err)
+	}
+
+	if len(mismatches) != 0 {
+		t.Fatalf("CheckServiceMismatch() = %#v, want no mismatches", mismatches)
+	}
+}
+
+func TestDeploymentTimestampAtLeastSubsecond(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		current, previous string
+		want              bool
+	}{
+		{"2026-01-01T12:00:00.000000001Z", "2026-01-01T12:00:00Z", true},
+		{"2026-01-01T12:00:00Z", "2026-01-01T12:00:00.000000001Z", false},
+		{"2026-01-01T12:00:00.1Z", "2026-01-01T12:00:00.11Z", false},
+		{"2026-01-01T12:00:00.1Z", "2026-01-01T12:00:00.1Z", true},
+		{"2026-01-01T12:00:00.1Z", "", true},
+	} {
+		if got := deploymentTimestampAtLeast(tc.current, tc.previous); got != tc.want {
+			t.Fatalf("timestamp %s >= %s = %v, want %v", tc.current, tc.previous, got, tc.want)
+		}
+	}
+}
 
 func Test_getLatestServiceState(t *testing.T) {
 	t.Parallel()
@@ -235,7 +521,7 @@ func Test_getLatestServiceState(t *testing.T) {
 			},
 		},
 		{
-			// svc2 has a different repo label but is still part of the project — it must appear
+			// svc2 has a different repo label but is still part of the project, so it must appear
 			// in DeployedStatus. Only metadata (commit SHA, compose hash) is drawn from svc1.
 			name: "two service with timestamp but repo mixed",
 			serviceStatus: map[Service]ServiceStatus{
@@ -395,7 +681,7 @@ func Test_getLatestServiceState(t *testing.T) {
 					Replicas: 1,
 				},
 				"unlabeled": {
-					// No cd.doco.* labels — simulates a container recreated outside doco-cd.
+					// No cd.doco.* labels simulates a container recreated outside doco-cd.
 					Labels:   Labels{},
 					Replicas: 1,
 				},
@@ -488,11 +774,7 @@ func TestGetLatestServiceState(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if swarm.GetModeEnabled() {
+	if resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("Swarm mode is enabled, skipping test")
 	}
 	// t.Parallel()
@@ -535,7 +817,7 @@ services:
 
 	stackName := test.ConvertTestName(t.Name())
 
-	_, err = LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	_, err = LoadCompose(ctx, nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +831,7 @@ services:
 		}),
 	)
 
-	latest, err := GetLatestDeployStatus(ctx, stack.Client, swarm.GetModeEnabled(), repoName, stackName)
+	latest, err := GetLatestDeployStatus(ctx, stack.Client, resolveTestSwarmMode(ctx, t, stack.Client), repoName, stackName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -580,11 +862,7 @@ func TestGetLatestServiceSwarm(t *testing.T) {
 		t.Fatalf("Failed to create Docker CLI: %v", err)
 	}
 
-	if err := swarm.RefreshModeEnabled(t.Context(), dockerCli.Client()); err != nil {
-		t.Fatalf("Failed to check if Docker daemon is in Swarm mode: %v", err)
-	}
-
-	if !swarm.GetModeEnabled() {
+	if !resolveTestSwarmMode(t.Context(), t, dockerCli.Client()) {
 		t.Skip("Swarm mode is not enabled, skipping test")
 	}
 
@@ -628,12 +906,12 @@ services:
 
 	stackName := test.ConvertTestName(t.Name())
 
-	project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{})
+	project, err := LoadCompose(t.Context(), nil, tmpDir, tmpDir, stackName, []string{filePath}, []string{".env"}, []string{}, map[string]string{}, ComposeLoadOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	projectHash, err := ProjectHash(project)
+	projectHash, err := ProjectHash(project, "")
 	if err != nil {
 		t.Fatalf("failed to get project hash: %v", err)
 	}
@@ -666,10 +944,10 @@ services:
 	).Do(
 		func() error {
 			timestamp := time.Now().UTC().Format(time.RFC3339)
-			addSwarmServiceLabels(swarmStack, project, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString(), projectHash)
-			addSwarmVolumeLabels(swarmStack, deployCfg, &p, tmpDir)
-			addSwarmConfigLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString())
-			addSwarmSecretLabels(swarmStack, deployCfg, &p, tmpDir, "dev", timestamp, p.CommitSHAString())
+			addSwarmServiceLabels(swarmStack, project, deployCfg, &p, "", tmpDir, "dev", timestamp, p.CommitSHAString(), projectHash)
+			addSwarmVolumeLabels(swarmStack, deployCfg, &p)
+			addSwarmConfigLabels(swarmStack, deployCfg, &p, "", tmpDir, "dev", timestamp, p.CommitSHAString())
+			addSwarmSecretLabels(swarmStack, deployCfg, &p, "", tmpDir, "dev", timestamp, p.CommitSHAString())
 
 			return DeploySwarmStack(ctx, dockerCli, swarmStack, opts)
 		},
@@ -682,7 +960,7 @@ services:
 
 	dockerClient := dockerCli.Client()
 
-	latest, err := GetLatestDeployStatus(ctx, dockerClient, swarm.GetModeEnabled(), repoName, stackName)
+	latest, err := GetLatestDeployStatus(ctx, dockerClient, resolveTestSwarmMode(ctx, t, dockerClient), repoName, stackName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1036,7 +1314,7 @@ func TestCheckServiceMismatch(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "swarmMode=true, ignore unnecessary scheduler ephemeral by legacy name fallback",
+			name: "swarmMode=true, ignore unnecessary scheduler ephemeral by execution mode",
 			deployed: map[Service]ServiceStatus{
 				"foo": {Replicas: 1, SwarmMode: swarm.DeployModeReplicated},
 				"foo-doco-job-1730000000000000000": {
@@ -1115,12 +1393,354 @@ func TestCheckServiceMismatch(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := CheckServiceMismatch(tt.swarmModeEnable, tt.deployed, tt.services)
+			got, err := CheckServiceMismatch(tt.swarmModeEnable, tt.deployed, tt.services)
+			if err != nil {
+				t.Fatal(err)
+			}
+
 			slices.SortFunc(got, cmpFunc)
 			slices.SortFunc(tt.want, cmpFunc)
 
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("CheckServiceMismatch() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckServiceMismatch_AutostartDisabled(t *testing.T) {
+	t.Parallel()
+
+	for _, policy := range []struct {
+		restart         string
+		enforceReplicas bool
+	}{
+		{restart: ""},
+		{restart: "no"},
+		{restart: "on-failure"},
+		{restart: "on-failure:3"},
+		{restart: "always", enforceReplicas: true},
+		{restart: "unless-stopped", enforceReplicas: true},
+	} {
+		for _, tt := range []struct {
+			name       string
+			present    bool
+			replicas   uint64
+			containers uint64
+			scale      int
+			reason     string
+		}{
+			{name: "stopped", present: true, containers: 1, scale: 1},
+			{name: "all scaled replicas stopped", present: true, containers: 2, scale: 2},
+			{name: "stopped replica missing", present: true, containers: 1, scale: 2, reason: ServiceMismatchReasonContainers},
+			{name: "stopped extra container", present: true, containers: 2, scale: 1},
+			{name: "running", present: true, replicas: 1, containers: 1, scale: 1},
+			{name: "partially running", present: true, replicas: 1, containers: 1, scale: 2, reason: ServiceMismatchReasonReplicas},
+			{name: "too many running", present: true, replicas: 2, containers: 2, scale: 1, reason: ServiceMismatchReasonReplicas},
+			{name: "missing", scale: 1, reason: ServiceMismatchReasonNotDeployed},
+			{name: "scaled to zero and absent"},
+			{name: "scaled to zero and stopped", present: true, containers: 1},
+			{name: "scaled to zero but running", present: true, replicas: 1, containers: 1, reason: ServiceMismatchReasonReplicas},
+		} {
+			t.Run(policy.restart+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				services := types.Services{"web": {
+					Name: "web", Restart: policy.restart, Scale: new(tt.scale),
+					Labels: types.Labels{DocoCDLabels.Deployment.Autostart: "false"},
+				}}
+
+				deployed := map[Service]ServiceStatus{}
+				if tt.present {
+					deployed["web"] = ServiceStatus{Replicas: tt.replicas, Containers: tt.containers}
+				}
+
+				got, err := CheckServiceMismatch(false, deployed, services)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				var want []ServiceMismatch
+
+				if tt.reason != "" && (tt.reason != ServiceMismatchReasonReplicas || policy.enforceReplicas) {
+					reason := ServiceMismatchReason{Reason: tt.reason}
+
+					switch tt.reason {
+					case ServiceMismatchReasonReplicas:
+						reason.Want, reason.Got = tt.scale, tt.replicas
+					case ServiceMismatchReasonContainers:
+						reason.Want, reason.Got = tt.scale, tt.containers
+					}
+
+					want = []ServiceMismatch{{ServiceName: "web", Reasons: []ServiceMismatchReason{reason}}}
+				}
+
+				if !reflect.DeepEqual(got, want) {
+					t.Fatalf("CheckServiceMismatch() = %#v, want %#v", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestCheckServiceMismatch_ContainerCountNeedsAutostartDisabled(t *testing.T) {
+	t.Parallel()
+
+	for _, restart := range []string{"", "no", "on-failure"} {
+		t.Run(restart, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := CheckServiceMismatch(false,
+				map[Service]ServiceStatus{"web": {Containers: 1}},
+				types.Services{"web": {Name: "web", Restart: restart, Scale: new(2)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if len(got) != 0 {
+				t.Fatalf("autostart-enabled service reported container drift: %v", got)
+			}
+		})
+	}
+}
+
+func TestCheckServiceMismatch_AutostartContainerInventory(t *testing.T) {
+	t.Parallel()
+
+	type inventoryContainer struct {
+		state container.ContainerState
+		hook  string
+	}
+
+	for _, tt := range []struct {
+		name       string
+		containers []inventoryContainer
+		scale      int
+		want       []ServiceMismatchReason
+	}{
+		{name: "created", containers: []inventoryContainer{{state: container.StateCreated}}, scale: 1},
+		{name: "exited", containers: []inventoryContainer{{state: container.StateExited}}, scale: 1},
+		{name: "running", containers: []inventoryContainer{{state: container.StateRunning}}, scale: 1},
+		{
+			name:       "hook only",
+			containers: []inventoryContainer{{state: container.StateCreated, hook: "pre_start"}},
+			scale:      1,
+			want:       []ServiceMismatchReason{{Reason: ServiceMismatchReasonNotDeployed}},
+		},
+		{
+			name:       "all scaled replicas stopped",
+			containers: []inventoryContainer{{state: container.StateCreated}, {state: container.StateExited}},
+			scale:      2,
+		},
+		{
+			name: "stopped replica missing",
+			containers: []inventoryContainer{
+				{state: container.StateExited},
+				{state: container.StateCreated, hook: "pre_start"},
+			},
+			scale: 2,
+			want:  []ServiceMismatchReason{{Reason: ServiceMismatchReasonContainers, Want: 2, Got: uint64(1)}},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			summaries := make([]container.Summary, 0, len(tt.containers))
+			for _, c := range tt.containers {
+				summaries = append(summaries, container.Summary{
+					State: c.state,
+					Labels: Labels{
+						api.ProjectLabel:                  "stack",
+						api.ServiceLabel:                  "web",
+						api.HookLabel:                     c.hook,
+						DocoCDLabels.Deployment.Autostart: "true",
+					},
+				})
+			}
+
+			deployed := getServiceStatusFromContainerStatus("stack", summaries)
+			services := types.Services{"web": {
+				Name: "web", Restart: "unless-stopped", Scale: new(tt.scale),
+				Labels: types.Labels{DocoCDLabels.Deployment.Autostart: "false"},
+			}}
+
+			got, err := CheckServiceMismatch(false, deployed, services)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var want []ServiceMismatch
+			if tt.want != nil {
+				want = []ServiceMismatch{{ServiceName: "web", Reasons: tt.want}}
+			}
+
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("inventory mismatch = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestCheckServiceMismatch_AutostartLabels(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name         string
+		labels       types.Labels
+		customLabels types.Labels
+		wantMismatch bool
+		wantError    bool
+	}{
+		{name: "default enabled", wantMismatch: true},
+		{name: "enabled", labels: types.Labels{DocoCDLabels.Deployment.Autostart: "true"}, wantMismatch: true},
+		{name: "disabled", labels: types.Labels{DocoCDLabels.Deployment.Autostart: "false"}},
+		{name: "custom disabled", customLabels: types.Labels{DocoCDLabels.Deployment.Autostart: "false"}},
+		{
+			name: "custom overrides enabled", labels: types.Labels{DocoCDLabels.Deployment.Autostart: "true"},
+			customLabels: types.Labels{DocoCDLabels.Deployment.Autostart: " FALSE "},
+		},
+		{
+			name: "custom overrides disabled", labels: types.Labels{DocoCDLabels.Deployment.Autostart: "false"},
+			customLabels: types.Labels{DocoCDLabels.Deployment.Autostart: "true"}, wantMismatch: true,
+		},
+		{
+			name: "custom overrides invalid", labels: types.Labels{DocoCDLabels.Deployment.Autostart: "invalid"},
+			customLabels: types.Labels{DocoCDLabels.Deployment.Autostart: "false"},
+		},
+		{name: "invalid", labels: types.Labels{DocoCDLabels.Deployment.Autostart: "invalid"}, wantError: true},
+		{
+			name: "invalid custom", labels: types.Labels{DocoCDLabels.Deployment.Autostart: "false"},
+			customLabels: types.Labels{DocoCDLabels.Deployment.Autostart: "invalid"}, wantError: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			deployed := map[Service]ServiceStatus{"web": {
+				Labels:     Labels{DocoCDLabels.Deployment.Autostart: "false"},
+				Containers: 1,
+			}}
+			services := types.Services{"web": {
+				Name: "web", Restart: "unless-stopped", Labels: tt.labels, CustomLabels: tt.customLabels,
+			}}
+
+			got, err := CheckServiceMismatch(false, deployed, services)
+			if tt.wantError {
+				if err == nil || !strings.Contains(err.Error(), "service web: invalid "+DocoCDLabels.Deployment.Autostart) {
+					t.Fatalf("expected a service-specific autostart error, got %v", err)
+				}
+
+				if got != nil {
+					t.Fatalf("invalid labels returned mismatches: %v", got)
+				}
+
+				return
+			}
+
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			var want []ServiceMismatch
+			if tt.wantMismatch {
+				want = []ServiceMismatch{{ServiceName: "web", Reasons: []ServiceMismatchReason{{
+					Reason: ServiceMismatchReasonReplicas, Want: 1, Got: uint64(0),
+				}}}}
+			}
+
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("CheckServiceMismatch() = %#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestCheckServiceMismatch_AutostartPreservesSwarm(t *testing.T) {
+	t.Parallel()
+
+	for _, label := range []string{"false", "invalid"} {
+		for _, tt := range []struct {
+			name     string
+			mode     swarm.DeployMode
+			deployed map[Service]ServiceStatus
+			reason   string
+		}{
+			{name: "missing", mode: swarm.DeployModeReplicated, reason: ServiceMismatchReasonNotDeployed},
+			{
+				name: "stopped", mode: swarm.DeployModeReplicated,
+				deployed: map[Service]ServiceStatus{"web": {SwarmMode: swarm.DeployModeReplicated}}, reason: ServiceMismatchReasonReplicas,
+			},
+			{
+				name: "job", mode: swarm.DeployModeReplicatedJob,
+				deployed: map[Service]ServiceStatus{"web": {SwarmMode: swarm.DeployModeReplicatedJob}}, reason: ServiceMismatchReasonReplicas,
+			},
+			{
+				name: "mode drift", mode: swarm.DeployModeReplicated,
+				deployed: map[Service]ServiceStatus{"web": {SwarmMode: swarm.DeployModeGlobal}}, reason: ServiceMismatchReasonSwarmMode,
+			},
+			{
+				name: "global", mode: swarm.DeployModeGlobal,
+				deployed: map[Service]ServiceStatus{"web": {SwarmMode: swarm.DeployModeGlobal}},
+			},
+			{
+				name: "global job", mode: swarm.DeployModeGlobalJob,
+				deployed: map[Service]ServiceStatus{"web": {SwarmMode: swarm.DeployModeGlobalJob}},
+			},
+		} {
+			t.Run(label+"/"+tt.name, func(t *testing.T) {
+				t.Parallel()
+
+				services := types.Services{"web": {
+					Name: "web", Deploy: &types.DeployConfig{Mode: string(tt.mode)},
+					Labels: types.Labels{DocoCDLabels.Deployment.Autostart: label},
+				}}
+
+				got, err := CheckServiceMismatch(true, tt.deployed, services)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if tt.reason == "" {
+					if len(got) != 0 {
+						t.Fatalf("unexpected Swarm mismatch: %v", got)
+					}
+				} else if len(got) != 1 || len(got[0].Reasons) != 1 || got[0].Reasons[0].Reason != tt.reason {
+					t.Fatalf("Swarm mismatches = %v, want %q", got, tt.reason)
+				}
+			})
+		}
+	}
+}
+
+func TestRepositoryLabelMatches(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		label        string
+		repositories []string
+		want         bool
+	}{
+		{name: "empty label", label: " ", repositories: []string{"github.com/owner/repo"}, want: false},
+		{name: "no repositories", label: "owner/repo", want: false},
+		{name: "only empty repositories", label: "owner/repo", repositories: []string{"", " "}, want: false},
+		{name: "repository name", label: "github.com/owner/repo", repositories: []string{"github.com/owner/repo"}, want: true},
+		{name: "full name label", label: "owner/repo", repositories: []string{"https://github.com/owner/repo.git"}, want: true},
+		{name: "scp-like git url", label: "owner/repo", repositories: []string{"git@github.com:owner/repo.git"}, want: true},
+		{name: "label with whitespace", label: " owner/repo ", repositories: []string{"https://github.com/owner/repo.git"}, want: true},
+		{name: "second repository", label: "owner/app", repositories: []string{"github.com/owner/config", "https://github.com/owner/app.git"}, want: true},
+		{name: "other repository", label: "owner/other", repositories: []string{"github.com/owner/repo"}, want: false},
+		{name: "oci tag ignored", label: "ghcr.io/org/app", repositories: []string{"ghcr.io/org/app:v2"}, want: true},
+		{name: "oci digest ignored", label: "org/app", repositories: []string{"ghcr.io/org/app@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}, want: true},
+		{name: "other oci repository", label: "ghcr.io/org/other", repositories: []string{"ghcr.io/org/app:v2"}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := RepositoryLabelMatches(tt.label, tt.repositories...); got != tt.want {
+				t.Fatalf("RepositoryLabelMatches(%q, %q) = %v, want %v", tt.label, tt.repositories, got, tt.want)
 			}
 		})
 	}

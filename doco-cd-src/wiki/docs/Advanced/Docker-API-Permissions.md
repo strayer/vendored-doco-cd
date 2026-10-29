@@ -28,14 +28,14 @@ Paths are shown without the `/v1.x` API version prefix that the client prepends 
 
 Every doco-cd installation needs these, regardless of the deployment mode.
 
-| Feature                | Docker API endpoints                                                                     | Access |
-|------------------------|------------------------------------------------------------------------------------------|--------|
-| Client handshake       | `HEAD /_ping`, `GET /version`                                                            | read   |
-| Startup verification   | `GET /info`                                                                              | read   |
-| Swarm mode detection   | `GET /info`                                                                              | read   |
-| Own container lookup (unless [`DATA_HOST_PATH`](../App-Settings.md#general-settings) is set) | `GET /containers/{id}/json` | read   |
-| [Scheduled jobs](Job-Scheduling.md) discovery | `GET /containers/json`, `GET /services` (Swarm), `GET /events`         | read   |
-| [Reconciliation](../Core-Concepts.md) watcher | `GET /events`, `GET /containers/json`, `GET /containers/{id}/json`     | read   |
+| Feature                                                                                      | Docker API endpoints                                               | Access |
+|----------------------------------------------------------------------------------------------|--------------------------------------------------------------------|--------|
+| Client handshake                                                                             | `HEAD /_ping`, `GET /version`                                      | read   |
+| Startup verification                                                                         | `GET /info`                                                        | read   |
+| Swarm mode detection                                                                         | `GET /info`                                                        | read   |
+| Own container lookup (unless [`DATA_HOST_PATH`](../App-Settings.md#storage-settings) is set) | `GET /containers/{id}/json`                                        | read   |
+| [Scheduled jobs](Job-Scheduling.md) discovery                                                | `GET /containers/json`, `GET /services` (Swarm), `GET /events`     | read   |
+| [Reconciliation](../Core-Concepts.md) watcher                                                | `GET /events`, `GET /containers/json`, `GET /containers/{id}/json` | read   |
 
 !!! info "`GET /events` is needed by default"
     Both the scheduler (`SCHEDULER_ENABLED`) and reconciliation (`reconciliation.enabled`) are
@@ -44,8 +44,8 @@ Every doco-cd installation needs these, regardless of the deployment mode.
 
 ### Docker Compose deployments
 
-| Feature              | Docker API endpoints                                                                                                   | Access      |
-|----------------------|------------------------------------------------------------------------------------------------------------------------|-------------|
+| Feature              | Docker API endpoints                                                                                                    | Access      |
+|----------------------|-------------------------------------------------------------------------------------------------------------------------|-------------|
 | Project discovery    | `GET /containers/json`, `GET /containers/{id}/json`, `GET /networks`, `GET /volumes`                                    | read        |
 | Image pull           | `POST /images/create`, `GET /images/json`, `GET /images/{name}/json`                                                    | read/write  |
 | Image drift check    | `GET /distribution/{name}/json`, `GET /images/{name}/json`, `GET /containers/{id}/json`                                 | read        |
@@ -59,15 +59,15 @@ Every doco-cd installation needs these, regardless of the deployment mode.
 
 Used instead of most Compose endpoints when the daemon is a [Swarm manager](Swarm-Mode.md).
 
-| Feature                    | Docker API endpoints                                                                              | Access      |
-|----------------------------|----------------------------------------------------------------------------------------------------|-------------|
-| Stack discovery            | `GET /services`, `GET /services/{id}`, `GET /tasks`                                                | read        |
-| Convergence monitoring     | `GET /services/{id}`, `GET /tasks`, **`GET /nodes`**                                               | read        |
-| Overlay networks           | `GET /networks`, `GET /networks/{id}`, `POST /networks/create`                                     | read/write  |
-| Service deployment         | `POST /services/create`, `POST /services/{id}/update`                                              | read/write  |
-| Configs                    | `GET /configs`, `GET /configs/{id}`, `POST /configs/create`, `POST /configs/{id}/update`           | read/write  |
-| Secrets                    | `GET /secrets`, `GET /secrets/{id}`, `POST /secrets/create`, `POST /secrets/{id}/update`           | read/write  |
-| Config / secret rotation   | `DELETE /configs/{id}`, `DELETE /secrets/{id}`                                                     | destructive |
+| Feature                  | Docker API endpoints                                                                     | Access      |
+|--------------------------|------------------------------------------------------------------------------------------|-------------|
+| Stack discovery          | `GET /services`, `GET /services/{id}`, `GET /tasks`                                      | read        |
+| Convergence monitoring   | `GET /services/{id}`, `GET /tasks`, **`GET /nodes`**                                     | read        |
+| Overlay networks         | `GET /networks`, `GET /networks/{id}`, `POST /networks/create`                           | read/write  |
+| Service deployment       | `POST /services/create`, `POST /services/{id}/update`                                    | read/write  |
+| Configs                  | `GET /configs`, `GET /configs/{id}`, `POST /configs/create`, `POST /configs/{id}/update` | read/write  |
+| Secrets                  | `GET /secrets`, `GET /secrets/{id}`, `POST /secrets/create`, `POST /secrets/{id}/update` | read/write  |
+| Config / secret rotation | `DELETE /configs/{id}`, `DELETE /secrets/{id}`                                           | destructive |
 
 !!! warning "`GET /nodes` is easy to miss"
     Doco-CD waits for services to converge, which reads the list of active Swarm nodes.
@@ -84,23 +84,23 @@ Used instead of most Compose endpoints when the daemon is a [Swarm manager](Swar
 
 These endpoints are only needed when the corresponding setting is enabled.
 
-| Setting                                                              | Default | Additional endpoints                                                                   | Access      |
-|----------------------------------------------------------------------|---------|-----------------------------------------------------------------------------------------|-------------|
-| [`prune_images`](../Deploy-Settings.md) (Compose)                     | `true`  | `DELETE /images/{name}`                                                                 | destructive |
-| [`prune_images`](../Deploy-Settings.md) (Swarm)                       | `true`  | `POST /services/create`, `GET /services`, `POST /services/{id}/update`                  | destructive |
-| [`remove_orphans`](../Deploy-Settings.md)                             | `true`  | `DELETE /containers/{id}`, `DELETE /networks/{id}`, `DELETE /services/{id}` (Swarm)     | destructive |
-| [`destroy.enabled`](../Deploy-Settings.md)                            | `false` | `POST /containers/{id}/stop`, `DELETE /containers/{id}`, `DELETE /networks/{id}`, Swarm: `DELETE /services/{id}`, `DELETE /configs/{id}`, `DELETE /secrets/{id}` | destructive |
-| [`destroy.remove_volumes`](../Deploy-Settings.md)                     | `true`  | `GET /volumes/{name}`, `DELETE /volumes/{name}`                                         | destructive |
-| [`destroy.remove_images`](../Deploy-Settings.md)                      | `true`  | `DELETE /images/{name}`                                                                 | destructive |
-| [`reconciliation.enabled`](../Deploy-Settings.md)                     | `true`  | `GET /events`, `POST /containers/{id}/restart`                                          | read/write  |
-| `SCHEDULER_ENABLED`                                                   | `true`  | See [below](#scheduler_enabled-endpoint-details)                                 | read/write  |
-| [`wait_running_jobs`](../Deploy-Settings.md)                          | `true`  | `GET /tasks` (Swarm), `GET /containers/json` (Compose)                                  | read        |
-| [REST API](../Endpoints/REST-API.md) (`API_SECRET` set)               | off     | See [below](#rest-api-endpoint-details)                                         | destructive |
+| Setting                                                 | Default | Additional endpoints                                                                                                                                             | Access      |
+|---------------------------------------------------------|---------|------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------|
+| [`prune_images`](../Deploy-Settings.md) (Compose)       | `true`  | `DELETE /images/{name}`                                                                                                                                          | destructive |
+| [`prune_images`](../Deploy-Settings.md) (Swarm)         | `true`  | `POST /services/create`, `GET /services`, `POST /services/{id}/update`                                                                                           | destructive |
+| [`remove_orphans`](../Deploy-Settings.md)               | `true`  | `DELETE /containers/{id}`, `DELETE /networks/{id}`, `DELETE /services/{id}` (Swarm)                                                                              | destructive |
+| [`destroy.enabled`](../Deploy-Settings.md)              | `false` | `POST /containers/{id}/stop`, `DELETE /containers/{id}`, `DELETE /networks/{id}`, Swarm: `DELETE /services/{id}`, `DELETE /configs/{id}`, `DELETE /secrets/{id}` | destructive |
+| [`destroy.remove_volumes`](../Deploy-Settings.md)       | `true`  | `GET /volumes/{name}`, `DELETE /volumes/{name}`                                                                                                                  | destructive |
+| [`destroy.remove_images`](../Deploy-Settings.md)        | `true`  | `DELETE /images/{name}`                                                                                                                                          | destructive |
+| [`reconciliation.enabled`](../Deploy-Settings.md)       | `true`  | `GET /events`, `POST /containers/{id}/restart`                                                                                                                   | read/write  |
+| `SCHEDULER_ENABLED`                                     | `true`  | See [below](#scheduler_enabled-endpoint-details)                                                                                                                 | read/write  |
+| [`wait_running_jobs`](../Deploy-Settings.md)            | `true`  | `GET /tasks` (Swarm), `GET /containers/json` (Compose)                                                                                                           | read        |
+| [REST API](../Endpoints/REST-API.md) (`API_SECRET` set) | off     | See [below](#rest-api-endpoint-details)                                                                                                                          | destructive |
 
 #### `SCHEDULER_ENABLED` endpoint details
 
 - Default (`execution_mode: restart`): `POST /containers/{id}/restart`; Swarm: `GET /services/{id}`, `POST /services/{id}/update`
-- `execution_mode: one_off`: `POST /containers/create`, `POST /containers/{id}/wait`, `POST /containers/{id}/start`; Swarm: `POST /services/create`, `DELETE /services/{id}`, `GET /tasks`
+- `execution_mode: one_off`: `GET /containers/json`, `GET /containers/{id}/json`, `POST /containers/create`, `POST /containers/{id}/wait`, `POST /containers/{id}/start`, `DELETE /containers/{id}`; Swarm: `GET /services`, `GET /services/{id}`, `POST /services/create`, `DELETE /services/{id}`, `GET /tasks`
 - `stop_services`: `POST /containers/{id}/stop|start`; Swarm: `POST /services/{id}/update`, `GET /tasks`
 
 #### REST API endpoint details
@@ -134,7 +134,7 @@ which maps Docker API resources to environment variables.
 
 !!! info "Other proxies use different variable names"
     Environment variable names differ between socket proxy implementations.
-    The **Docker API endpoint tables above are the source of truth** — map them to whatever
+    The **Docker API endpoint tables above are the source of truth**. Map them to whatever
     your proxy of choice expects.
 
 ```yaml title="docker-compose.yml"
@@ -197,7 +197,7 @@ volumes:
 1. Needed to wait for Swarm services to converge. Without it every Swarm deployment fails with `403 Forbidden`.
 2. Required for recreating containers, rotating configs/secrets and `remove_orphans`. Set to `0` only if you accept that redeployments will fail.
 3. Point doco-cd at the proxy instead of mounting the socket. See [Docker Settings](../Docker-Settings.md).
-4. The Docker socket is no longer mounted here — only the data volume remains.
+4. The Docker socket is no longer mounted here; only the data volume remains.
 
 ### Minimal standalone (Compose only) configuration
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -14,11 +15,11 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 
 	swarmTypes "github.com/moby/moby/api/types/swarm"
 	dockerClient "github.com/moby/moby/client"
+	"go.yaml.in/yaml/v4"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
@@ -38,6 +39,7 @@ const (
 	swarmResourceNameMaxLen = 64
 	swarmHashSuffixLen      = 8
 	swarmBaseNameMaxLen     = swarmResourceNameMaxLen - (1 + swarmHashSuffixLen) // "_" + hash
+	swarmStopWaitBuffer     = 5 * time.Second
 )
 
 var (
@@ -50,18 +52,255 @@ var (
 	ErrGlobalSwarmServiceNotScalable = errors.New("global-mode swarm service cannot be scaled")
 )
 
+// writeResolvedComposeFile marshals the already-resolved project (with any Git/OCI
+// includes merged in) to a temporary compose file and returns its path along with a
+// cleanup function that removes it.
+func writeResolvedComposeFile(project *types.Project) (string, func(), error) {
+	// MarshalYAML (rather than MarshalJSON) is required here: fields such as
+	// Command/Entrypoint can't use `omitempty` for JSON (compose-go needs to
+	// distinguish an explicitly empty value from an unset one across file
+	// merges), so unset commands would round-trip as a literal JSON `null`,
+	// which the Docker CLI's stack schema rejects. YAML marshaling honors
+	// each field's IsZero()/omitempty and simply omits unset fields instead.
+	content, err := project.MarshalYAML()
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to marshal resolved compose project: %w", err)
+	}
+
+	content, err = normalizeComposeForSwarmSchema(content)
+	if err != nil {
+		return "", nil, err
+	}
+
+	file, err := os.CreateTemp("", "doco-cd-swarm-compose-*.yaml")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create resolved compose file: %w", err)
+	}
+
+	cleanup := func() {
+		_ = os.Remove(file.Name())
+	}
+
+	if _, err = file.Write(content); err != nil {
+		_ = file.Close()
+
+		cleanup()
+
+		return "", nil, fmt.Errorf("failed to write resolved compose file: %w", err)
+	}
+
+	if err = file.Close(); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("failed to close resolved compose file: %w", err)
+	}
+
+	return file.Name(), cleanup, nil
+}
+
+// normalizeComposeForSwarmSchema adapts a compose-go-marshaled project document so
+// it passes the Docker CLI's older, stricter stack-file JSON schema (used only by
+// the Swarm deploy path), without changing its meaning:
+//
+//   - Drops top-level keys the schema doesn't recognize (e.g. "name", which
+//     compose-go always sets on a resolved *types.Project but which has no
+//     equivalent/effect in a Swarm stack deployment).
+//   - Rewrites each service's "env_file" entries back into their plain-string
+//     short form. compose-go always marshals env_file entries as
+//     {path: ..., required: ..., format: ...} objects, but the Docker CLI's
+//     stack schema (unlike its configs/secrets schema) only accepts a string
+//     or a list of strings, so the object form would otherwise fail
+//     validation. The "required" and "format" long-form options have no
+//     equivalent in that legacy schema, so they're dropped; that's an
+//     existing Swarm limitation, not something introduced by resolving
+//     includes.
+func normalizeComposeForSwarmSchema(content []byte) ([]byte, error) {
+	var doc map[string]any
+
+	if err := yaml.Unmarshal(content, &doc); err != nil {
+		return nil, fmt.Errorf("failed to parse resolved compose project: %w", err)
+	}
+
+	// Only "version", "services", "networks", "volumes", "secrets", "configs"
+	// and "x-*" extension fields are valid at the document root in the legacy
+	// stack-file schema.
+	for key := range doc {
+		switch {
+		case key == "version" || key == "services" || key == "networks" ||
+			key == "volumes" || key == "secrets" || key == "configs":
+			continue
+		case strings.HasPrefix(key, "x-"):
+			continue
+		default:
+			delete(doc, key)
+		}
+	}
+
+	if services, ok := doc["services"].(map[string]any); ok {
+		for name, rawService := range services {
+			service, ok := rawService.(map[string]any)
+			if !ok {
+				continue
+			}
+
+			envFiles, ok := service["env_file"].([]any)
+			if !ok {
+				continue
+			}
+
+			for i, rawEntry := range envFiles {
+				entry, ok := rawEntry.(map[string]any)
+				if !ok {
+					continue
+				}
+
+				if path, ok := entry["path"].(string); ok {
+					envFiles[i] = path
+				}
+			}
+
+			service["env_file"] = envFiles
+			services[name] = service
+		}
+
+		doc["services"] = services
+	}
+
+	// The document is fed back into a loader that interpolates again (the
+	// Docker CLI stack loader has no skip-interpolation path here), but its
+	// values are already resolved. Escaping "$" as "$$" makes that second pass
+	// a no-op, instead of silently mangling any resolved value that legitimately
+	// contains "$" - bcrypt hashes, generated passwords, literal "${...}".
+	escapeComposeInterpolation(doc)
+
+	normalized, err := yaml.Marshal(doc)
+	if err != nil {
+		return nil, fmt.Errorf("failed to re-marshal resolved compose project: %w", err)
+	}
+
+	return normalized, nil
+}
+
+// escapeComposeInterpolation rewrites every string scalar in the document so a
+// subsequent interpolation pass reproduces it verbatim.
+func escapeComposeInterpolation(node any) {
+	switch typed := node.(type) {
+	case map[string]any:
+		for key, value := range typed {
+			if str, ok := value.(string); ok {
+				typed[key] = strings.ReplaceAll(str, "$", "$$")
+				continue
+			}
+
+			escapeComposeInterpolation(value)
+		}
+	case map[any]any:
+		for key, value := range typed {
+			if str, ok := value.(string); ok {
+				typed[key] = strings.ReplaceAll(str, "$", "$$")
+				continue
+			}
+
+			escapeComposeInterpolation(value)
+		}
+	case []any:
+		for i, value := range typed {
+			if str, ok := value.(string); ok {
+				typed[i] = strings.ReplaceAll(str, "$", "$$")
+				continue
+			}
+
+			escapeComposeInterpolation(value)
+		}
+	}
+}
+
+// composeFilesUseInclude reports whether any of the given compose files declares
+// a top-level "include" key. It parses each file's raw YAML directly (not the
+// already-resolved project, which no longer has an "include" key once resolved)
+// and ignores read/parse errors so the regular compose loader can surface them.
+func composeFilesUseInclude(files []string) bool {
+	for _, file := range files {
+		data, err := os.ReadFile(file) //nolint:gosec // compose file paths are resolved by doco-cd itself
+		if err != nil {
+			continue
+		}
+
+		var doc map[string]any
+		if err = yaml.Unmarshal(data, &doc); err != nil {
+			continue
+		}
+
+		if _, ok := doc["include"]; ok {
+			return true
+		}
+	}
+
+	return false
+}
+
+// SwarmServiceReplicas returns the desired replica count before a service is
+// scaled down. Global services return ErrGlobalSwarmServiceNotScalable.
+func SwarmServiceReplicas(ctx context.Context, dockerCLI command.Cli, serviceName string) (uint64, error) {
+	result, err := dockerCLI.Client().ServiceInspect(ctx, serviceName, dockerClient.ServiceInspectOptions{
+		InsertDefaults: true,
+	})
+	if err != nil {
+		return 0, fmt.Errorf("inspect service %s: %w", serviceName, err)
+	}
+
+	svc := result.Service
+	if svc.Spec.Mode.Global != nil || svc.Spec.Mode.GlobalJob != nil {
+		return 0, ErrGlobalSwarmServiceNotScalable
+	}
+
+	switch {
+	case svc.Spec.Mode.Replicated != nil && svc.Spec.Mode.Replicated.Replicas != nil:
+		return *svc.Spec.Mode.Replicated.Replicas, nil
+	case svc.Spec.Mode.ReplicatedJob != nil && svc.Spec.Mode.ReplicatedJob.TotalCompletions != nil:
+		return *svc.Spec.Mode.ReplicatedJob.TotalCompletions, nil
+	default:
+		return 1, nil
+	}
+}
+
 // LoadSwarmStack loads a Docker Swarm stack using the provided project and deploy configuration.
 func LoadSwarmStack(dockerCli command.Cli, project *types.Project,
 	deployConfig *deploy.Config, externalWorkingDir string,
 ) (*composetypes.Config, *options.Deploy, error) {
+	// The Docker CLI's own stack loader used below doesn't understand the
+	// Compose Specification's "include" directive, so a file that still
+	// contains a literal "include:" key would be rejected by that loader's
+	// schema. Only when includes are actually used do we substitute the
+	// already-resolved project (with includes merged in) for the original
+	// files; the common, include-free case keeps using project.ComposeFiles
+	// directly and is unaffected by the resolved-project round trip.
+	composefiles := project.ComposeFiles
+
+	var cleanup func()
+
+	if composeFilesUseInclude(project.ComposeFiles) {
+		resolvedComposeFile, resolvedCleanup, err := writeResolvedComposeFile(project)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to write resolved compose file: %w", err)
+		}
+
+		composefiles = []string{resolvedComposeFile}
+		cleanup = resolvedCleanup
+	}
+
+	if cleanup != nil {
+		defer cleanup()
+	}
+
 	opts := options.Deploy{
-		Composefiles:     project.ComposeFiles,
+		Composefiles:     composefiles,
 		Namespace:        deployConfig.Name,
 		ResolveImage:     swarmInternal.ResolveImageAlways,
 		SendRegistryAuth: true,
 		Prune:            deployConfig.RemoveOrphans,
 		Detach:           false,
 		Environment:      project.Environment,
+		Timeout:          deployConfig.Timeout.Duration(),
 	}
 
 	cfg, err := swarmInternal.LoadComposefile(dockerCli, opts, deployConfig.Internal.Environment, externalWorkingDir)
@@ -87,9 +326,15 @@ func DeploySwarmStack(ctx context.Context, dockerCli command.Cli, cfg *composety
 
 // RemoveSwarmStack removes a Docker Swarm stack using the provided deploy configuration.
 func RemoveSwarmStack(ctx context.Context, dockerCli command.Cli, namespace string) error {
+	return RemoveSwarmStackWithLogger(ctx, dockerCli, namespace, nil)
+}
+
+// RemoveSwarmStackWithLogger records per-service removal details with the caller's logger.
+func RemoveSwarmStackWithLogger(ctx context.Context, dockerCli command.Cli, namespace string, log *slog.Logger) error {
 	opts := options.Remove{
 		Namespaces: []string{namespace},
 		Detach:     false,
+		Logger:     log,
 	}
 
 	return swarmInternal.RunRemove(ctx, dockerCli, opts)
@@ -106,11 +351,14 @@ func RemoveSwarmStack(ctx context.Context, dockerCli command.Cli, namespace stri
 // triggers for the same repository), must never be added: swarm would recreate all
 // tasks of every service on each deployment, see
 // https://github.com/kimdre/doco-cd/issues/1153.
-func stableSwarmMetadataLabels(deployConfig *deploy.Config, payload *webhook.ParsedPayload, repoDir string) map[string]string {
+//
+// The working directory is not stable either: every revision is deployed from its own
+// immutable artifact directory, so it changes with every new commit, see
+// https://github.com/kimdre/doco-cd/issues/1909.
+func stableSwarmMetadataLabels(deployConfig *deploy.Config, payload *webhook.ParsedPayload) map[string]string {
 	return map[string]string{
 		DocoCDLabels.Metadata.Manager:        app.Name,
 		DocoCDLabels.Deployment.Name:         deployConfig.Name,
-		DocoCDLabels.Deployment.WorkingDir:   repoDir,
 		DocoCDLabels.Deployment.ConfigTarget: deployConfig.Internal.ConfigTarget,
 		DocoCDLabels.Deployment.TargetRef:    ExtractOciArtifactTag(deployConfig.Reference),
 		DocoCDLabels.Source.Type:             SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
@@ -134,20 +382,23 @@ func stableSwarmMetadataLabels(deployConfig *deploy.Config, payload *webhook.Par
 // applyCertRotationLabelsToService, so only services actually using a rotated certificate carry
 // them. project resolves those references and may be nil, in which case no cert labels are added.
 func addSwarmServiceLabels(stack *composetypes.Config, project *types.Project, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
-	repoDir, appVersion, timestamp, latestCommit, projectHash string,
+	sourceURL, repoDir, appVersion, timestamp, latestCommit, projectHash string,
 ) {
-	stableLabels := stableSwarmMetadataLabels(deployConfig, payload, repoDir)
+	stableLabels := stableSwarmMetadataLabels(deployConfig, payload)
 
 	sharedServiceSpecLabels := map[string]string{
 		DocoCDLabels.Metadata.Version:               appVersion,
 		DocoCDLabels.Deployment.Timestamp:           timestamp,
+		DocoCDLabels.Deployment.WorkingDir:          repoDir,
 		DocoCDLabels.Deployment.ComposeHash:         projectHash,
 		DocoCDLabels.Deployment.Trigger:             payload.TriggerString(),
 		DocoCDLabels.Deployment.CommitSHA:           latestCommit,
 		DocoCDLabels.Deployment.ConfigHash:          deployConfig.Internal.Hash,
 		DocoCDLabels.Deployment.AutoDiscovery:       strconv.FormatBool(deployConfig.AutoDiscovery.Enabled),
 		DocoCDLabels.Deployment.AutoDiscoveryConfig: MarshalAutoDiscoveryConfig(deployConfig.AutoDiscovery),
-		DocoCDLabels.Source.URL:                     payload.WebURL,
+		DocoCDLabels.Source.URL:                     resolveSourceURLLabel(sourceURL, payload),
+		DocoCDLabels.Source.ConfigRevision:          deployConfig.Internal.ConfigSourceRevision,
+		DocoCDLabels.Source.ConfigWorkingDir:        deployConfig.Internal.ConfigSourceWorkingDir,
 	}
 
 	maps.Copy(sharedServiceSpecLabels, stableLabels)
@@ -181,10 +432,8 @@ func addSwarmServiceLabels(stack *composetypes.Config, project *types.Project, d
 // subset of the deployment metadata may be set here. Volumes are looked up by their
 // stack namespace label and doco-cd labels are ignored when comparing volume configs,
 // so deployment metadata such as the timestamp is intentionally left out.
-func addSwarmVolumeLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
-	repoDir string,
-) {
-	customLabels := stableSwarmMetadataLabels(deployConfig, payload, repoDir)
+func addSwarmVolumeLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload) {
+	customLabels := stableSwarmMetadataLabels(deployConfig, payload)
 
 	for i, v := range stack.Volumes {
 		if v.Labels == nil {
@@ -199,7 +448,7 @@ func addSwarmVolumeLabels(stack *composetypes.Config, deployConfig *deploy.Confi
 
 // addSwarmConfigLabels adds custom labels to the configs in a Docker Swarm stack.
 func addSwarmConfigLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
-	repoDir, appVersion, timestamp, latestCommit string,
+	sourceURL, repoDir, appVersion, timestamp, latestCommit string,
 ) {
 	customLabels := map[string]string{
 		DocoCDLabels.Metadata.Manager:      app.Name,
@@ -212,7 +461,7 @@ func addSwarmConfigLabels(stack *composetypes.Config, deployConfig *deploy.Confi
 		DocoCDLabels.Deployment.TargetRef:  ExtractOciArtifactTag(deployConfig.Reference),
 		DocoCDLabels.Source.Type:           SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
 		DocoCDLabels.Source.Name:           payload.FullName,
-		DocoCDLabels.Source.URL:            payload.WebURL,
+		DocoCDLabels.Source.URL:            resolveSourceURLLabel(sourceURL, payload),
 	}
 
 	for i, c := range stack.Configs {
@@ -227,7 +476,7 @@ func addSwarmConfigLabels(stack *composetypes.Config, deployConfig *deploy.Confi
 }
 
 func addSwarmSecretLabels(stack *composetypes.Config, deployConfig *deploy.Config, payload *webhook.ParsedPayload,
-	repoDir, appVersion, timestamp, latestCommit string,
+	sourceURL, repoDir, appVersion, timestamp, latestCommit string,
 ) {
 	customLabels := map[string]string{
 		DocoCDLabels.Metadata.Manager:      app.Name,
@@ -240,7 +489,7 @@ func addSwarmSecretLabels(stack *composetypes.Config, deployConfig *deploy.Confi
 		DocoCDLabels.Deployment.TargetRef:  ExtractOciArtifactTag(deployConfig.Reference),
 		DocoCDLabels.Source.Type:           SourceTypeLabelValue(string(payload.Source), string(deployConfig.Source)),
 		DocoCDLabels.Source.Name:           payload.FullName,
-		DocoCDLabels.Source.URL:            payload.WebURL,
+		DocoCDLabels.Source.URL:            resolveSourceURLLabel(sourceURL, payload),
 	}
 
 	for i, s := range stack.Secrets {
@@ -499,30 +748,6 @@ func PruneStackSecrets(ctx context.Context, client dockerClient.APIClient, names
 	return nil
 }
 
-// WaitForSwarmService waits until a swarm service exists (and optionally has published ports).
-func WaitForSwarmService(ctx context.Context, t *testing.T, cli dockerClient.APIClient, serviceName string, timeout time.Duration) (swarmTypes.Service, error) {
-	t.Helper()
-
-	deadline := time.Now().Add(timeout)
-
-	var lastErr error
-
-	for time.Now().Before(deadline) {
-		result, err := cli.ServiceInspect(ctx, serviceName, dockerClient.ServiceInspectOptions{
-			InsertDefaults: true,
-		})
-		if err == nil {
-			return result.Service, nil
-		}
-
-		lastErr = err
-
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	return swarmTypes.Service{}, fmt.Errorf("timed out waiting for service %s after %s: %w", serviceName, timeout.String(), lastErr)
-}
-
 // RestartService restarts long-running Swarm services by bumping ForceUpdate.
 // For job-mode services (replicated-job/global-job), it returns ErrJobServiceRestartNotSupported.
 func RestartService(ctx context.Context, cli dockerClient.APIClient, serviceName string) error {
@@ -552,7 +777,7 @@ func RestartService(ctx context.Context, cli dockerClient.APIClient, serviceName
 		Spec:    spec,
 	})
 	if err != nil {
-		return fmt.Errorf("update service %s: %w", serviceName, err)
+		return fmt.Errorf("update service %s: %w", swarmInternal.ServiceIdentity(svc.Spec.Name, svc.ID), err)
 	}
 
 	return nil
@@ -644,7 +869,7 @@ func RerunJobService(ctx context.Context, cli dockerClient.APIClient, serviceNam
 		Spec:    spec,
 	})
 	if err != nil {
-		return fmt.Errorf("update (rerun) job service %s: %w", serviceName, err)
+		return fmt.Errorf("update (rerun) job service %s: %w", swarmInternal.ServiceIdentity(svc.Spec.Name, svc.ID), err)
 	}
 
 	return nil
@@ -664,6 +889,14 @@ var ErrSwarmServiceAlreadyStopped = errors.New("swarm service is already scaled 
 // waiting the scheduled job would start while the target's containers are
 // still shutting down and flushing to disk.
 //
+// timeoutOverride, when non-nil, is used explicitly as the wait deadline
+// (this is how cd.doco.job.stop_services.timeout is applied). When nil, the
+// service's own configured Spec.TaskTemplate.ContainerSpec.StopGracePeriod is
+// honored (plus a small buffer for scheduling overhead), falling back to
+// DefaultStopServicesTimeout if the service has no grace period configured.
+// This prevents a service declaring a long grace period from having its
+// shutdown wait time out prematurely.
+//
 // Global-mode services cannot be scaled to 0; the function returns
 // (0, ErrGlobalSwarmServiceNotScalable) so the caller can skip them gracefully.
 // A replicated service that is already at 0 replicas returns
@@ -672,10 +905,8 @@ var ErrSwarmServiceAlreadyStopped = errors.New("swarm service is already scaled 
 // The serviceName must be the full swarm-scoped name (e.g. "mystack_myservice").
 // In the cd.doco.job.stop_services label, cross-stack services are expressed as
 // "stack/service" and resolved to "stack_service" before calling this function.
-func StopSwarmService(ctx context.Context, dockerCLI command.Cli, serviceName string, timeout time.Duration) (originalReplicas uint64, err error) {
-	result, err := dockerCLI.Client().ServiceInspect(ctx, serviceName, dockerClient.ServiceInspectOptions{
-		InsertDefaults: true,
-	})
+func StopSwarmService(ctx context.Context, dockerCLI command.Cli, serviceName string, timeoutOverride *time.Duration) (originalReplicas uint64, err error) {
+	result, err := dockerCLI.Client().ServiceInspect(ctx, serviceName, dockerClient.ServiceInspectOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("inspect service %s: %w", serviceName, err)
 	}
@@ -705,14 +936,31 @@ func StopSwarmService(ctx context.Context, dockerCLI command.Cli, serviceName st
 
 	// Scale to 0.
 	if err := swarmInternal.ScaleService(ctx, dockerCLI, serviceName, 0, false, false); err != nil {
-		return 0, fmt.Errorf("scale service %s to 0: %w", serviceName, err)
+		return 0, fmt.Errorf("scale to 0: %w", err)
 	}
 
-	if err := waitForSwarmServiceTasksStopped(ctx, dockerCLI, svc.ID, serviceName, timeout); err != nil {
+	waitTimeout := resolveSwarmStopWaitTimeout(timeoutOverride, svc.Spec.TaskTemplate.ContainerSpec)
+
+	if err := waitForSwarmServiceTasksStopped(ctx, dockerCLI, svc.ID, serviceName, waitTimeout); err != nil {
 		return replicas, err
 	}
 
 	return replicas, nil
+}
+
+// resolveSwarmStopWaitTimeout determines the wait deadline used by waitForSwarmServiceTasksStopped:
+// an explicit override always wins; failing that, the service's own configured StopGracePeriod plus a small observation
+// buffer is used, falling back to DefaultStopServicesTimeout when unset.
+func resolveSwarmStopWaitTimeout(timeoutOverride *time.Duration, containerSpec *swarmTypes.ContainerSpec) time.Duration {
+	if timeoutOverride != nil {
+		return *timeoutOverride
+	}
+
+	if containerSpec != nil && containerSpec.StopGracePeriod != nil {
+		return *containerSpec.StopGracePeriod + swarmStopWaitBuffer
+	}
+
+	return DefaultStopServicesTimeout
 }
 
 // waitForSwarmServiceTasksStopped blocks until the given service has no tasks
@@ -723,7 +971,7 @@ func StopSwarmService(ctx context.Context, dockerCLI command.Cli, serviceName st
 // and therefore returns before the tasks have actually shut down.
 func waitForSwarmServiceTasksStopped(ctx context.Context, dockerCLI command.Cli, serviceID, serviceName string, timeout time.Duration) error {
 	if timeout <= 0 {
-		timeout = 30 * time.Second
+		timeout = DefaultStopServicesTimeout
 	}
 
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -738,10 +986,10 @@ func waitForSwarmServiceTasksStopped(ctx context.Context, dockerCLI command.Cli,
 		})
 		if err != nil {
 			if waitCtx.Err() != nil && ctx.Err() == nil {
-				return fmt.Errorf("timed out after %s waiting for task(s) of service %s to stop", timeout, serviceName)
+				return fmt.Errorf("timed out after %s waiting for task(s) of service %s to stop", timeout, swarmInternal.ServiceIdentity(serviceName, serviceID))
 			}
 
-			return fmt.Errorf("list tasks of service %s: %w", serviceName, err)
+			return fmt.Errorf("list tasks of service %s: %w", swarmInternal.ServiceIdentity(serviceName, serviceID), err)
 		}
 
 		live := 0
@@ -765,7 +1013,7 @@ func waitForSwarmServiceTasksStopped(ctx context.Context, dockerCLI command.Cli,
 
 		select {
 		case <-waitCtx.Done():
-			return fmt.Errorf("timed out after %s waiting for %d task(s) of service %s to stop", timeout, live, serviceName)
+			return fmt.Errorf("timed out after %s waiting for %d task(s) of service %s to stop", timeout, live, swarmInternal.ServiceIdentity(serviceName, serviceID))
 		case <-ticker.C:
 		}
 	}
@@ -786,7 +1034,7 @@ func StartSwarmService(ctx context.Context, dockerCLI command.Cli, serviceName s
 	}
 
 	if err := swarmInternal.ScaleService(ctx, dockerCLI, serviceName, replicas, false, false); err != nil {
-		return fmt.Errorf("scale service %s back to %d: %w", serviceName, replicas, err)
+		return fmt.Errorf("scale back to %d: %w", replicas, err)
 	}
 
 	return nil

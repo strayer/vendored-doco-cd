@@ -4,7 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
+	"time"
 
+	"github.com/avast/retry-go/v5"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/cli/compose/convert"
 	composetypes "github.com/docker/cli/cli/compose/types"
@@ -79,7 +83,7 @@ func checkDaemonIsSwarmManager(ctx context.Context, dockerClient client.APIClien
 }
 
 // pruneServices removes services that are no longer referenced in the source.
-func pruneServices(ctx context.Context, dockerCCLI command.Cli, namespace convert.Namespace, services set.Set[string]) {
+func pruneServices(ctx context.Context, dockerCCLI command.Cli, namespace convert.Namespace, services set.Set[string], log *slog.Logger) {
 	apiClient := dockerCCLI.Client()
 
 	oldServices, err := GetStackServices(ctx, apiClient, namespace.Name())
@@ -95,32 +99,64 @@ func pruneServices(ctx context.Context, dockerCCLI command.Cli, namespace conver
 		}
 	}
 
-	removeServices(ctx, dockerCCLI, pruneSvcSlice)
+	removeServices(ctx, dockerCCLI, pruneSvcSlice, log)
 }
 
 func ScaleService(ctx context.Context, dockerCLI command.Cli, serviceName string, replicas uint64, wait, force bool) error {
 	apiClient := dockerCLI.Client()
 
-	result, err := apiClient.ServiceInspect(ctx, serviceName, client.ServiceInspectOptions{})
-	if err != nil {
-		return err
-	}
+	var serviceID string
 
-	service := result.Service
+	fullName := serviceName
 
-	if force {
-		service.Spec.TaskTemplate.ForceUpdate++
-	}
+	err := retry.New(
+		retry.Attempts(5),
+		retry.Delay(250*time.Millisecond),
+		retry.DelayType(retry.BackOffDelay),
+		retry.RetryIf(func(err error) bool {
+			return strings.Contains(err.Error(), "update out of sequence")
+		}),
+	).Do(func() error {
+		result, err := apiClient.ServiceInspect(ctx, serviceName, client.ServiceInspectOptions{})
+		if err != nil {
+			return err
+		}
 
-	// Handle replicated-job services
-	if service.Spec.Mode.ReplicatedJob != nil {
-		// Jobs may not have an update config (daemon rejects ServiceUpdate otherwise).
-		service.Spec.UpdateConfig = nil
-		service.Spec.RollbackConfig = nil
+		service := result.Service
 
-		// Treat `replicas` as "how many completions to run" and allow that many concurrently.
-		service.Spec.Mode.ReplicatedJob.TotalCompletions = &replicas
-		service.Spec.Mode.ReplicatedJob.MaxConcurrent = &replicas
+		serviceID = service.ID
+		if service.Spec.Name != "" {
+			fullName = service.Spec.Name
+		}
+
+		if force {
+			service.Spec.TaskTemplate.ForceUpdate++
+		}
+
+		// Handle replicated-job services
+		if service.Spec.Mode.ReplicatedJob != nil {
+			// Jobs may not have an update config (daemon rejects ServiceUpdate otherwise).
+			service.Spec.UpdateConfig = nil
+			service.Spec.RollbackConfig = nil
+
+			// Treat `replicas` as "how many completions to run" and allow that many concurrently.
+			service.Spec.Mode.ReplicatedJob.TotalCompletions = &replicas
+			service.Spec.Mode.ReplicatedJob.MaxConcurrent = &replicas
+
+			_, err = apiClient.ServiceUpdate(ctx, service.ID, client.ServiceUpdateOptions{
+				Version: service.Version,
+				Spec:    service.Spec,
+			})
+
+			return err
+		}
+
+		// Handle classic replicated services
+		if service.Spec.Mode.Replicated == nil {
+			return fmt.Errorf("%w: %s", ErrNotReplicatedService, serviceName)
+		}
+
+		service.Spec.Mode.Replicated.Replicas = &replicas
 
 		_, err = apiClient.ServiceUpdate(ctx, service.ID, client.ServiceUpdateOptions{
 			Version: service.Version,
@@ -128,26 +164,14 @@ func ScaleService(ctx context.Context, dockerCLI command.Cli, serviceName string
 		})
 
 		return err
-	}
-
-	// Handle classic replicated services
-	if service.Spec.Mode.Replicated == nil {
-		return fmt.Errorf("%w: %s", ErrNotReplicatedService, serviceName)
-	}
-
-	service.Spec.Mode.Replicated.Replicas = &replicas
-
-	_, err = apiClient.ServiceUpdate(ctx, service.ID, client.ServiceUpdateOptions{
-		Version: service.Version,
-		Spec:    service.Spec,
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("update service %s: %w", ServiceIdentity(fullName, serviceID), err)
 	}
 
 	if wait {
-		if err := waitOnService(ctx, dockerCLI, serviceName); err != nil {
-			return err
+		if err := waitOnService(ctx, dockerCLI, serviceID); err != nil {
+			return fmt.Errorf("service %s: %w", ServiceIdentity(fullName, serviceID), err)
 		}
 	}
 

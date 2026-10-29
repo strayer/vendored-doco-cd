@@ -1,0 +1,19 @@
+# yaml-language-server: $schema=https://doco.cd/latest/schemas/deploy.schema.json
+# The shop-dev host polls this repo with `target: shop-dev` and reads only this file.
+# It lists the stacks the host runs and pins every version they use.
+name: app
+working_dir: shop-dev/app
+environment:
+  SHOP_COMPOSE_SHA: "b3e21007ad8c2ac1223537d7d5f7c1e2ef51be77" # app repo's deploy/
+  SHOP_BE_TAG: "dd5c00230acc348c4b0524730a848ff592189b16"
+  REGISTRY: "ghcr.io/example"
+  DOMAIN: "dev.shop.example.com"
+remove_orphans: true
+reconciliation:
+  events: [unhealthy] # not `die` — one-shot/post_start exits would loop it
+---
+name: db
+working_dir: shop-dev/db
+environment:
+  DB_COMPOSE_SHA: "9cfc981a28aa46d4510a520768960140039c4ef0" # this repo's shared/db
+  POSTGRES_TAG: "17.2-alpine"

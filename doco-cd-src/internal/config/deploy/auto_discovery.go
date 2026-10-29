@@ -2,39 +2,214 @@ package deploy
 
 import (
 	"bytes"
+	"container/list"
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"maps"
+	"io/fs"
+	"log/slog"
 	"os"
+	"path"
 	"path/filepath"
 	"reflect"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"go.yaml.in/yaml/v4"
 
+	"github.com/kimdre/doco-cd/internal/common/types/clone"
+	"github.com/kimdre/doco-cd/internal/common/types/set"
+	"github.com/kimdre/doco-cd/internal/encryption"
 	"github.com/kimdre/doco-cd/internal/filesystem"
-	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
+	gitInternal "github.com/kimdre/doco-cd/internal/git"
 )
 
 // AutoDiscoveryConfig holds auto-discovery settings for a deployment.
 type AutoDiscoveryConfig struct {
-	Enabled       bool `yaml:"enabled" json:"enabled" default:"false"`               // Enabled enables autodiscovery of services to deploy in the working directory
 	ScanDepth     int  `yaml:"depth" json:"depth" default:"0"`                       // ScanDepth is the maximum depth of subdirectories to scan for docker-compose files
+	Enabled       bool `yaml:"enabled" json:"enabled" default:"false"`               // Enabled enables autodiscovery of services to deploy in the working directory
 	Delete        bool `yaml:"delete" json:"delete" default:"false"`                 // Delete removes obsolete auto-discovered deployments that are no longer present in the repository
 	RemoveVolumes bool `yaml:"remove_volumes" json:"remove_volumes" default:"false"` // RemoveVolumes removes the volumes of an auto-discovered deployment when it is deleted
 	RemoveImages  bool `yaml:"remove_images" json:"remove_images" default:"true"`    // RemoveImages removes the images of an auto-discovered deployment when it is deleted
 }
 
-var autoDiscoveryCache = struct {
-	mu      sync.RWMutex
-	entries map[string][]*Config
-}{
-	entries: map[string][]*Config{},
+// discoveryCache is an LRU cache for auto-discovery results.
+type discoveryCache struct {
+	mu      sync.Mutex
+	entries map[discoveryCacheKey]*list.Element
+	recent  list.List
+	bytes   int
+}
+
+// autoDiscoveryCache is a global cache for auto-discovery results,
+// keyed by repository, tree, settings, and remaining depth.
+var autoDiscoveryCache = discoveryCache{
+	entries: make(map[discoveryCacheKey]*list.Element),
+}
+
+// Maximum number of entries in the auto-discovery proof cache.
+// Each entry is a Git subtree hash, repository hash, settings hash, and path.
+const maxAutoDiscoveryProofEntries = 4096
+
+// discoveryProofKey is a unique key for a Git subtree proof,
+// including the path because scan boundaries can differ for identical trees
+// at different locations.
+type discoveryProofKey struct {
+	tree       plumbing.Hash
+	repository [sha256.Size]byte
+	settings   [sha256.Size]byte
+	directory  string
+}
+
+// discoveryProofCache is an LRU cache for Git subtree proofs,
+// allowing reuse of verified subtrees across different artifacts.
+type discoveryProofCache struct {
+	mu      sync.Mutex
+	entries map[discoveryProofKey]*list.Element
+	recent  list.List
+}
+
+// autoDiscoveryProof is a global cache for Git subtree proofs,
+// allowing reuse of verified subtrees across different artifacts.
+var autoDiscoveryProof = discoveryProofCache{
+	entries: make(map[discoveryProofKey]*list.Element),
+}
+
+// discoveryScanMode represents the mode of auto-discovery scanning.
+type discoveryScanMode string
+
+const (
+	// discoveryScanModeTree uses verified Git-tree subtrees throughout the scan.
+	discoveryScanModeTree discoveryScanMode = "tree"
+	// discoveryScanModeFull scans from disk because no Git tree is available.
+	discoveryScanModeFull discoveryScanMode = "full"
+	// discoveryScanModeMixed uses the Git tree where verified and disk for fallbacks.
+	discoveryScanModeMixed discoveryScanMode = "mixed"
+)
+
+// get checks if a proof for the given key exists in the cache.
+func (c *discoveryProofCache) get(key discoveryProofKey) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	element, ok := c.entries[key]
+	if !ok {
+		return false
+	}
+
+	c.recent.MoveToBack(element)
+
+	return true
+}
+
+// put adds a proof for the given key to the cache, evicting the oldest entry if necessary.
+func (c *discoveryProofCache) put(key discoveryProofKey) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.entries == nil {
+		c.entries = make(map[discoveryProofKey]*list.Element)
+	}
+
+	if element, ok := c.entries[key]; ok {
+		c.recent.MoveToBack(element)
+		return
+	}
+
+	if len(c.entries) >= maxAutoDiscoveryProofEntries {
+		oldest := c.recent.Front()
+		delete(c.entries, oldest.Value.(discoveryProofKey))
+		c.recent.Remove(oldest)
+	}
+
+	c.entries[key] = c.recent.PushBack(key)
+}
+
+// Maximum number of entries in the auto-discovery cache.
+// Each entry is a repository, tree, settings, and remaining depth.
+const (
+	maxAutoDiscoveryCacheEntries    = 4096
+	maxAutoDiscoveryCacheBytes      = 8 << 20
+	maxAutoDiscoveryCacheEntryBytes = 256 << 10
+)
+
+type discoveryCacheKey struct {
+	repository, tree, settings string
+	remainingDepth             int
+}
+
+type discoveryCacheEntry struct {
+	key     discoveryCacheKey
+	matches []discoveryMatch
+	size    int
+}
+
+// Paths in the cache are relative to the cached subtree, not to a revision's artifact.
+// Overrides contain parsed user fields only; the base Config (including Internal) is
+// cloned and applied afresh for every discovery.
+type discoveryMatch struct {
+	dir      string
+	override *Config
+	// overrideKeys are the YAML keys the nested config sets, see mergeConfigKeys.
+	overrideKeys *yamlKeys
+	overrideSize int
+}
+
+// get retrieves the matches for the given key from the cache, returning false if not found.
+func (c *discoveryCache) get(key discoveryCacheKey) ([]discoveryMatch, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	element, ok := c.entries[key]
+	if !ok {
+		return nil, false
+	}
+
+	c.recent.MoveToBack(element)
+
+	return element.Value.(*discoveryCacheEntry).matches, true
+}
+
+// put adds the matches for the given key to the cache, evicting the oldest entries if necessary.
+func (c *discoveryCache) put(key discoveryCacheKey, matches []discoveryMatch) {
+	size := 128 + len(key.repository) + len(key.tree) + len(key.settings)
+	for _, match := range matches {
+		size += 96 + len(match.dir) + match.overrideSize
+		if size > maxAutoDiscoveryCacheEntryBytes {
+			return
+		}
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.entries == nil {
+		c.entries = make(map[discoveryCacheKey]*list.Element)
+	}
+
+	if element, exists := c.entries[key]; exists {
+		c.recent.MoveToBack(element)
+		return
+	}
+
+	// Evict oldest entries until the cache is within limits.
+	for len(c.entries) >= maxAutoDiscoveryCacheEntries || c.bytes+size > maxAutoDiscoveryCacheBytes {
+		oldest := c.recent.Front()
+		entry := oldest.Value.(*discoveryCacheEntry)
+		c.bytes -= entry.size
+		delete(c.entries, entry.key)
+		c.recent.Remove(oldest)
+	}
+
+	entry := &discoveryCacheEntry{key: key, matches: matches, size: size}
+	c.entries[key] = c.recent.PushBack(entry)
+	c.bytes += size
 }
 
 func (c *AutoDiscoveryConfig) UnmarshalYAML(node *yaml.Node) error {
@@ -88,9 +263,9 @@ func (c *AutoDiscoveryConfig) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// expandInlineAutoDiscoverConfigs replaces inline deployments that have auto-discovery
-// enabled with the discovered deployments rooted at repoRoot.
-func expandInlineAutoDiscoverConfigs(repoRoot string, deployments []*Config) ([]*Config, error) {
+// expandInlineAutoDiscoverConfigs replaces enabled inline auto-discovery entries with the deployments they
+// discover in source.
+func expandInlineAutoDiscoverConfigs(ctx context.Context, source *discoverySource, deployments []*Config) ([]*Config, error) {
 	expanded := make([]*Config, 0, len(deployments))
 
 	for _, deployment := range deployments {
@@ -99,9 +274,9 @@ func expandInlineAutoDiscoverConfigs(repoRoot string, deployments []*Config) ([]
 			continue
 		}
 
-		discoveredConfigs, err := autoDiscoverDeployments(repoRoot, deployment)
+		discoveredConfigs, err := source.discover(ctx, deployment)
 		if err != nil {
-			return nil, fmt.Errorf("failed to auto-discover deployment configurations: %w", err)
+			return nil, err
 		}
 
 		expanded = append(expanded, discoveredConfigs...)
@@ -110,162 +285,576 @@ func expandInlineAutoDiscoverConfigs(repoRoot string, deployments []*Config) ([]
 	return expanded, nil
 }
 
-// autoDiscoverDeployments scans for subdirectories containing docker-compose files
-// and generates Config entries for each.
-// repoRoot is the absolute path to the repository root.
-// baseConfig.WorkingDirectory is treated as repo-root-relative.
-func autoDiscoverDeployments(repoRoot string, baseConfig *Config) ([]*Config, error) {
-	repositoryLabel := filepath.Base(filepath.Clean(repoRoot))
-
-	cacheKey, cacheable := autoDiscoveryCacheKey(repoRoot, baseConfig)
-	if cacheable {
-		autoDiscoveryCache.mu.RLock()
-		cached, ok := autoDiscoveryCache.entries[cacheKey]
-		autoDiscoveryCache.mu.RUnlock()
-
-		if ok {
-			recordAutoDiscoveryCacheLookup(repositoryLabel, "hit")
-			return cloneConfigSlice(cached), nil
-		}
-
-		recordAutoDiscoveryCacheLookup(repositoryLabel, "miss")
+// publishedGitDiscoveryFS retains both views of a published artifact.
+// A verified subtree can use the Git tree and its cache, while materialized
+// submodules and other unverified branches are discovered from disk.
+// The caller releases the mirror read lock after scanning the returned FS.
+func publishedGitDiscoveryFS(repoRoot, labelRoot, mirrorRoot string, revision plumbing.Hash, base *Config) (fs.FS, func()) {
+	disk := os.DirFS(repoRoot)
+	if revision.IsZero() || !isPublishedPrimaryGitArtifact(repoRoot, mirrorRoot, revision) {
+		return disk, nil
 	}
 
-	var configs []*Config
+	root := path.Clean(base.WorkingDirectory)
+	if !fs.ValidPath(root) || !regularDiscoveryRoot(repoRoot, root) {
+		return disk, nil
+	}
 
-	searchPath := filepath.Join(repoRoot, baseConfig.WorkingDirectory)
+	unlock := gitInternal.AcquireSharedMirrorLock(mirrorRoot)
 
-	err := filepath.WalkDir(searchPath, func(p string, d os.DirEntry, err error) error {
-		if err != nil {
-			return err
+	repo, err := git.PlainOpen(mirrorRoot)
+	if err != nil {
+		unlock()
+		slog.Debug("could not open discovery mirror; using published artifact", "reason", err)
+
+		return disk, nil
+	}
+
+	tree, err := gitInternal.NewTreeFSAtCommit(repo, revision)
+	if err != nil {
+		unlock()
+		slog.Debug("could not open discovery tree; using published artifact", "reason", err)
+
+		return disk, nil
+	}
+
+	return &publishedDiscoveryFS{
+		FS:       disk,
+		tree:     tree,
+		verifier: newDiscoveryVerifier(tree, disk, labelRoot, base),
+	}, unlock
+}
+
+// A working directory reached through a symlink cannot be identified by its
+// Git tree hash even if the target happens to have the same contents today.
+func regularDiscoveryRoot(repoRoot, root string) bool {
+	if root == "." {
+		return true
+	}
+
+	current := repoRoot
+	for part := range strings.SplitSeq(root, "/") {
+		current = filepath.Join(current, part)
+
+		info, err := os.Lstat(current)
+		if err != nil || !info.IsDir() {
+			return false
+		}
+	}
+
+	return true
+}
+
+// publishedDiscoveryFS retains both views of a published artifact.
+// A verified subtree can use the Git tree and its cache, while materialized
+// submodules and other unverified branches are discovered from disk.
+type publishedDiscoveryFS struct {
+	fs.FS
+	tree     gitTreeDiscoveryFS
+	verifier *discoveryVerifier
+}
+
+// autoDiscoverDeployments scans fsys for compose files and creates a Config for each matching subdirectory.
+// Only an object-backed TreeFS with a matching revision can reuse Git subtree metadata;
+// disk artifacts, submodules and OCI sources cannot be identified by Git tree hashes.
+func autoDiscoverDeployments(fsys fs.FS, repoRoot, revisionKey string, baseConfig *Config) ([]*Config, error) {
+	start := time.Now()
+	repositoryLabel := filepath.Base(filepath.Clean(repoRoot))
+	scanner := discoveryScanner{
+		fsys:       fsys,
+		repository: repoRoot,
+		label:      repositoryLabel,
+		base:       baseConfig,
+		origin:     autoDiscoveryOrigin(baseConfig, revisionKey),
+		compose:    set.New(baseConfig.ComposeFiles...),
+	}
+
+	// A plain TreeFS has no materialized inputs. A published artifact has both
+	// views, and verifies each subtree before allowing Git-backed cache use.
+	if tree, ok := fsys.(gitTreeDiscoveryFS); ok && revisionKey != "" && tree.Commit().String() == revisionKey {
+		scanner.tree = tree
+	} else if published, ok := fsys.(*publishedDiscoveryFS); ok &&
+		revisionKey != "" && published.tree.Commit().String() == revisionKey {
+		scanner.tree, scanner.verifier = published.tree, published.verifier
+	}
+
+	if scanner.tree != nil {
+		names := append([]string(nil), baseConfig.ComposeFiles...)
+		sort.Strings(names)
+		settings, _ := json.Marshal(struct {
+			ComposeFiles []string
+			ConfigFiles  []string
+		}{names, DefaultDeploymentConfigFileNames})
+		scanner.settings = string(settings)
+	}
+
+	if scanner.tree == nil {
+		recordAutoDiscoveryCacheLookup(repositoryLabel, "bypass")
+	}
+
+	defer func() {
+		mode := discoveryScanModeTree
+		if scanner.tree == nil {
+			mode = discoveryScanModeFull
+		} else if scanner.diskBranches > 0 {
+			mode = discoveryScanModeMixed
+
+			recordAutoDiscoveryCacheLookup(repositoryLabel, "bypass")
 		}
 
-		// Calculate the depth of the current path relative to the search path
-		rel, err := filepath.Rel(searchPath, p)
-		if err != nil {
-			return err
-		}
+		slog.Debug("auto-discovery scan",
+			slog.Group("scan",
+				"mode", string(mode),
+				"duration", fmt.Sprintf("%.3fms", time.Since(start).Seconds()*1000),
+				"directories_read", scanner.directoryReads,
+			),
+			slog.Group("cache",
+				"hits", scanner.cacheHits,
+				"misses", scanner.cacheMisses,
+			),
+			slog.Group("verification",
+				"duration", fmt.Sprintf("%.3fms", scanner.proofDuration().Seconds()*1000),
+			),
+			slog.Group("fallback",
+				"directories_from_disk", scanner.diskBranches,
+				"reasons", scanner.fallbackReasons(),
+			))
+	}()
 
-		depth := 0
-		if rel != "." {
-			depth = len(strings.Split(rel, string(os.PathSeparator)))
-		}
+	searchPath := path.Clean(baseConfig.WorkingDirectory)
 
-		// Skip directories that exceed the maximum depth if ScanDepth is set greater than 0
-		if d.IsDir() && depth > baseConfig.AutoDiscovery.ScanDepth && baseConfig.AutoDiscovery.ScanDepth > 0 {
-			return filepath.SkipDir
-		}
-
-		if d.IsDir() {
-			if filesystem.IsIgnoredDir(d.Name()) && p != searchPath {
-				return filepath.SkipDir
-			}
-		}
-
-		if !d.IsDir() {
-			return nil
-		}
-
-		// Read directory entries once and build a filename set for O(1) compose-file membership checks,
-		// avoiding one os.Stat syscall per candidate compose filename.
-		dirEntries, err := os.ReadDir(p)
-		if err != nil {
-			return err
-		}
-
-		if !dirContainsAnyComposeFile(dirEntries, baseConfig.ComposeFiles) {
-			return nil
-		}
-
-		c := &Config{}
-		deepCopy(baseConfig, c)
-
-		stackDirName := filepath.Base(p)    // Get the stack name from the directory name where the compose file is located
-		repoName := filepath.Base(repoRoot) // Get the repository name from the repo root path
-
-		if baseConfig.Name != "" && stackDirName == repoName {
-			c.Name = baseConfig.Name
-		} else {
-			c.Name = stackDirName
-		}
-
-		c.WorkingDirectory, err = filepath.Rel(repoRoot, p)
-		if err != nil {
-			return err
-		}
-
-		// Check for a nested .doco-cd config file alongside the compose file and
-		// merge any overridable fields from it on top of the base config copy.
-		// Reuse the already-read dirEntries instead of issuing additional Stat calls.
-		for _, cfgName := range DefaultDeploymentConfigFileNames {
-			if !dirHasFile(dirEntries, cfgName) {
-				continue
-			}
-
-			localCfgPath := filepath.Join(p, cfgName)
-
-			localConfigs, parseErr := GetConfigFromYAML(localCfgPath, false)
-			if parseErr != nil {
-				return fmt.Errorf("failed to parse nested .doco-cd config at %s: %w", localCfgPath, parseErr)
-			}
-
-			if len(localConfigs) > 1 {
-				return fmt.Errorf("%w: %s contains %d documents", ErrMultipleYAMLDocuments, localCfgPath, len(localConfigs))
-			}
-
-			mergeConfig(c, localConfigs[0])
-
-			break // use first found config file name (.yaml preferred over .yml)
-		}
-
-		if err = c.Validate(); err != nil {
-			return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
-		}
-
-		configs = append(configs, c)
-
-		return nil
-	})
+	info, err := fs.Stat(fsys, searchPath)
 	if err != nil {
 		return nil, err
 	}
 
-	if cacheable {
-		autoDiscoveryCache.mu.Lock()
-		autoDiscoveryCache.entries[cacheKey] = cloneConfigSlice(configs)
-		autoDiscoveryCache.mu.Unlock()
+	if !info.IsDir() {
+		return nil, nil
 	}
 
-	return configs, nil
+	if _, err := scanner.scan(searchPath, 0); err != nil {
+		return nil, err
+	}
+
+	return scanner.configs, nil
 }
 
-func autoDiscoveryCacheKey(repoRoot string, baseConfig *Config) (string, bool) {
-	repo, err := git.PlainOpen(repoRoot)
-	if err != nil {
-		return "", false
-	}
-
-	head, err := repo.Head()
-	if err != nil {
-		return "", false
-	}
-
-	composeFiles := append([]string(nil), baseConfig.ComposeFiles...)
-	sort.Strings(composeFiles)
-
-	return strings.Join([]string{
-		repoRoot,
-		head.Hash().String(),
-		baseConfig.WorkingDirectory,
-		strings.Join(composeFiles, "\x00"),
-		strconv.Itoa(baseConfig.AutoDiscovery.ScanDepth),
-		strconv.FormatBool(baseConfig.AutoDiscovery.Delete),
-		strconv.FormatBool(baseConfig.AutoDiscovery.RemoveVolumes),
-		strconv.FormatBool(baseConfig.AutoDiscovery.RemoveImages),
-		baseConfig.Name,
-	}, "|"), true
+type gitTreeDiscoveryFS interface {
+	fs.FS
+	Commit() plumbing.Hash
+	SubtreeHash(string) (plumbing.Hash, error)
 }
 
+// Ensure gitInternal.TreeFS implements gitTreeDiscoveryFS.
+var _ gitTreeDiscoveryFS = (*gitInternal.TreeFS)(nil)
+
+// discoveryVerifier verifies that a Git tree matches the disk contents for a given subtree.
+type discoveryVerifier struct {
+	tree       gitTreeDiscoveryFS
+	disk       fs.FS
+	root       string
+	depth      int
+	repository [sha256.Size]byte
+	settings   [sha256.Size]byte
+	proven     map[string]bool
+	absent     set.Set[string]
+	duration   time.Duration
+	reasons    map[string]int
+}
+
+// newDiscoveryVerifier creates a new discoveryVerifier for the given Git tree, disk FS, repository label, and base Config.
+func newDiscoveryVerifier(tree gitTreeDiscoveryFS, disk fs.FS, repository string, base *Config) *discoveryVerifier {
+	root := path.Clean(base.WorkingDirectory)
+	settings, _ := json.Marshal(struct {
+		ConfigFiles []string
+		Root        string
+		Depth       int
+	}{DefaultDeploymentConfigFileNames, root, base.AutoDiscovery.ScanDepth})
+
+	return &discoveryVerifier{
+		tree:       tree,
+		disk:       disk,
+		root:       root,
+		depth:      base.AutoDiscovery.ScanDepth,
+		repository: sha256.Sum256([]byte(repository)),
+		settings:   sha256.Sum256(settings),
+		proven:     make(map[string]bool),
+		absent:     set.New[string](),
+		reasons:    make(map[string]int),
+	}
+}
+
+// reject records a reason for rejecting a subtree and returns false.
+func (v *discoveryVerifier) reject(reason string) bool {
+	v.reasons[reason]++
+
+	return false
+}
+
+// verify checks if the subtree at path p is valid by comparing the Git tree and disk contents.
+// It measures the duration of the verification process and updates the total duration.
+func (v *discoveryVerifier) verify(p string) bool {
+	started := time.Now()
+	defer func() { v.duration += time.Since(started) }()
+
+	return v.prove(p)
+}
+
+// prove checks if the subtree at path p has already been proven valid.
+// If not, it calls proveSubtree to perform the verification and caches the result.
+func (v *discoveryVerifier) prove(p string) bool {
+	if valid, ok := v.proven[p]; ok {
+		return valid
+	}
+
+	// Contents of a materialized submodule have no Git tree either. Record the
+	// fallback once at its root instead of once per nested directory.
+	if p != "." && v.absent.Contains(path.Dir(p)) {
+		v.absent.Add(p)
+		v.proven[p] = false
+
+		return false
+	}
+
+	valid := v.proveSubtree(p)
+	v.proven[p] = valid
+
+	return valid
+}
+
+// plainGitDiscoveryTree compares directory inventories and nested config bytes
+// against a GitStore-published artifact. Gitlinks become directories, symlinks
+// redirect reads, and SOPS can replace nested configs: affected branches
+// cannot use TreeFS. Positive proofs transfer to later artifacts with the
+// same Git subtree at the same path and scan boundary; failed branches fall
+// back to disk.
+// Reuse relies on GitStore's contract that published artifacts are not modified
+// after verification; Git hashes cannot detect external writes to those paths.
+func plainGitDiscoveryTree(tree gitTreeDiscoveryFS, disk fs.FS, repository string, base *Config) bool {
+	root := path.Clean(base.WorkingDirectory)
+	if !fs.ValidPath(root) {
+		return false
+	}
+
+	return newDiscoveryVerifier(tree, disk, repository, base).verify(".")
+}
+
+// proveSubtree compares the Git and disk inventories within the scan boundary.
+// Only complete positive proofs can be reused across published revisions.
+func (v *discoveryVerifier) proveSubtree(p string) bool {
+	hash, err := v.tree.SubtreeHash(p)
+	if err != nil {
+		v.absent.Add(p)
+
+		return v.reject("unavailable_tree")
+	}
+
+	key := discoveryProofKey{tree: hash, repository: v.repository, settings: v.settings, directory: p}
+	if autoDiscoveryProof.get(key) {
+		return true
+	}
+
+	entries, err := fs.ReadDir(v.tree, p)
+	if err != nil {
+		return v.reject("read_error")
+	}
+
+	diskEntries, err := fs.ReadDir(v.disk, p)
+	if err != nil {
+		return v.reject("read_error")
+	}
+
+	if len(entries) != len(diskEntries) {
+		return v.reject("inventory_mismatch")
+	}
+
+	for i, entry := range entries {
+		// TreeFS marks gitlinks irregular. ExportTree turns even an unfetched
+		// gitlink into a directory, so skipping it would lose disk inventory.
+		if entry.Type()&fs.ModeIrregular != 0 {
+			return v.reject("gitlink")
+		}
+
+		if entry.Type()&fs.ModeSymlink != 0 || diskEntries[i].Type()&fs.ModeSymlink != 0 {
+			return v.reject("symlink")
+		}
+
+		if entry.Name() != diskEntries[i].Name() || entry.IsDir() != diskEntries[i].IsDir() ||
+			(entry.Type()&fs.ModeType != 0 && !entry.IsDir()) ||
+			(diskEntries[i].Type()&fs.ModeType != 0 && !diskEntries[i].IsDir()) {
+			return v.reject("unsupported_or_mismatched_entry")
+		}
+
+		child := path.Join(p, entry.Name())
+		if entry.IsDir() {
+			if !discoveryProofVisits(child, entry.Name(), v.root, v.depth) {
+				continue
+			}
+
+			if !v.prove(child) {
+				return false
+			}
+
+			continue
+		}
+
+		for _, name := range DefaultDeploymentConfigFileNames {
+			if entry.Name() != name {
+				continue
+			}
+
+			contents, readErr := fs.ReadFile(v.tree, child)
+			if readErr != nil {
+				return v.reject("read_error")
+			}
+
+			diskContents, readErr := fs.ReadFile(v.disk, child)
+			if readErr != nil {
+				return v.reject("read_error")
+			}
+
+			if !bytes.Equal(contents, diskContents) {
+				return v.reject("config_mismatch")
+			}
+
+			if _, encrypted := encryption.DetectFormat(contents, child); encrypted {
+				return v.reject("encrypted_config")
+			}
+		}
+	}
+
+	autoDiscoveryProof.put(key)
+
+	return true
+}
+
+// discoveryProofVisits determines whether a child directory should be visited during proof verification.
+// It returns true if the child is within the root directory and within the specified depth limit.
+func discoveryProofVisits(child, name, root string, depth int) bool {
+	if root != "." {
+		if child == root || strings.HasPrefix(root, child+"/") {
+			return true
+		}
+
+		if !strings.HasPrefix(child, root+"/") {
+			return false
+		}
+	}
+
+	if filesystem.IsIgnoredDir(name) {
+		return false
+	}
+
+	if depth == 0 {
+		return true
+	}
+
+	rel := child
+	if root != "." {
+		rel = strings.TrimPrefix(child, root+"/")
+	}
+
+	return strings.Count(rel, "/")+1 <= depth
+}
+
+// discoveryScanner scans a filesystem for docker-compose files
+// and creates Configs for each matching subdirectory.
+type discoveryScanner struct {
+	fsys       fs.FS
+	tree       gitTreeDiscoveryFS
+	verifier   *discoveryVerifier
+	repository string
+	label      string
+	settings   string
+	base       *Config
+	origin     *AutoDiscoveryOrigin
+	compose    set.Set[string]
+	configs    []*Config
+
+	directoryReads, cacheHits, cacheMisses, diskBranches int
+}
+
+// proofDuration returns the total duration spent verifying Git subtree proofs during the scan.
+func (s *discoveryScanner) proofDuration() time.Duration {
+	if s.verifier == nil {
+		return 0
+	}
+
+	return s.verifier.duration
+}
+
+// fallbackReasons returns a map of reasons for fallback during the scan.
+func (s *discoveryScanner) fallbackReasons() map[string]int {
+	if s.verifier == nil {
+		return nil
+	}
+
+	return s.verifier.reasons
+}
+
+// appendConfig clones the base Config, applies any overrides from the discovery match,
+// and appends it to the scanner's configs slice. It returns an error if the resulting
+// Config is invalid.
+func (s *discoveryScanner) appendConfig(p string, match discoveryMatch) error {
+	c := clone.New(s.base)
+
+	stackDirName := path.Base(p)
+	if p == "." {
+		stackDirName = s.label
+	}
+
+	if s.base.Name != "" && stackDirName == s.label {
+		c.Name = s.base.Name
+	} else {
+		c.Name = stackDirName
+	}
+
+	c.WorkingDirectory = p
+	if match.override != nil {
+		mergeConfigKeys(c, clone.New(match.override), match.overrideKeys)
+	}
+
+	if err := c.Validate(); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidConfig, err)
+	}
+
+	c.Internal.AutoDiscoveryOrigin = s.origin
+	s.configs = append(s.configs, c)
+
+	return nil
+}
+
+// scan visits directories in fs.WalkDir's lexicographic, parent-first order.
+// Each visited directory is read only once, for both matches and child traversal.
+func (s *discoveryScanner) scan(p string, depth int) ([]discoveryMatch, error) {
+	var key discoveryCacheKey
+
+	useTree := s.tree != nil && (s.verifier == nil || s.verifier.verify(p))
+
+	readFS := s.fsys
+	if useTree {
+		readFS = s.tree
+
+		hash, err := s.tree.SubtreeHash(p)
+		if err != nil {
+			return nil, err
+		}
+
+		remaining := -1
+		if s.base.AutoDiscovery.ScanDepth > 0 {
+			remaining = s.base.AutoDiscovery.ScanDepth - depth
+		}
+
+		key = discoveryCacheKey{s.repository, hash.String(), s.settings, remaining}
+		if matches, ok := autoDiscoveryCache.get(key); ok {
+			s.cacheHits++
+			recordAutoDiscoveryCacheLookup(s.label, "hit")
+
+			for _, match := range matches {
+				if err := s.appendConfig(path.Join(p, match.dir), match); err != nil {
+					return nil, err
+				}
+			}
+
+			return matches, nil
+		}
+
+		s.cacheMisses++
+		recordAutoDiscoveryCacheLookup(s.label, "miss")
+	} else if s.verifier != nil {
+		s.diskBranches++
+	}
+
+	entries, err := fs.ReadDir(readFS, p)
+	if err != nil {
+		return nil, err
+	}
+
+	s.directoryReads++
+
+	var matches []discoveryMatch
+
+	if dirContainsAnyComposeFile(entries, s.compose) {
+		match := discoveryMatch{dir: "."}
+
+		// A local .yaml takes precedence over .yml, and only a directory with
+		// a matching compose file reads or validates its nested config.
+		for _, cfgName := range DefaultDeploymentConfigFileNames {
+			if !dirHasFile(entries, cfgName) {
+				continue
+			}
+
+			localCfgPath := path.Join(p, cfgName)
+
+			b, readErr := fs.ReadFile(readFS, localCfgPath)
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read nested .doco-cd config at %s: %w", localCfgPath, readErr)
+			}
+
+			localConfigs, parseErr := getConfigFromYAMLBytes(b, localCfgPath, false)
+			if parseErr != nil {
+				return nil, fmt.Errorf("failed to parse nested .doco-cd config at %s: %w", localCfgPath, parseErr)
+			}
+
+			if len(localConfigs) > 1 {
+				return nil, fmt.Errorf("%w: %s contains %d documents", ErrMultipleYAMLDocuments, localCfgPath, len(localConfigs))
+			}
+
+			keys, keysErr := yamlKeysOf(b)
+			if keysErr != nil {
+				return nil, fmt.Errorf("failed to parse nested .doco-cd config at %s: %w", localCfgPath, keysErr)
+			}
+
+			match.override = localConfigs[0]
+			match.override.Internal.File = ""
+			match.overrideKeys = keys
+
+			// Bound cached contents by the size of the parsed value, not only
+			// the source bytes (YAML aliases can expand during decoding).
+			if useTree {
+				encoded, marshalErr := json.Marshal(match.override)
+				if marshalErr != nil {
+					match.overrideSize = maxAutoDiscoveryCacheEntryBytes + 1
+				} else {
+					match.overrideSize = len(encoded)*4 + keys.size()
+				}
+			}
+
+			break
+		}
+
+		if err := s.appendConfig(p, match); err != nil {
+			return nil, err
+		}
+
+		matches = append(matches, match)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() || filesystem.IsIgnoredDir(entry.Name()) ||
+			(s.base.AutoDiscovery.ScanDepth > 0 && depth >= s.base.AutoDiscovery.ScanDepth) {
+			continue
+		}
+
+		child, err := s.scan(path.Join(p, entry.Name()), depth+1)
+		if err != nil {
+			return nil, err
+		}
+
+		for _, match := range child {
+			match.dir = path.Join(entry.Name(), match.dir)
+			matches = append(matches, match)
+		}
+	}
+
+	if useTree {
+		autoDiscoveryCache.put(key, matches)
+	}
+
+	return matches, nil
+}
+
+// cloneConfigSlice creates a deep copy of a slice of Config pointers.
 func cloneConfigSlice(configs []*Config) []*Config {
 	if configs == nil {
 		return nil
@@ -279,32 +868,21 @@ func cloneConfigSlice(configs []*Config) []*Config {
 			continue
 		}
 
-		copyCfg := &Config{}
-		deepCopy(cfg, copyCfg)
-		cloned = append(cloned, copyCfg)
+		cloned = append(cloned, clone.New(cfg))
 	}
 
 	return cloned
 }
 
-// dirContainsAnyComposeFile returns true when at least one of the given compose
-// filenames is present as a regular file in the pre-read directory entries.
-// Using the already-read entries avoids one os.Stat syscall per candidate name.
-func dirContainsAnyComposeFile(entries []os.DirEntry, composeFiles []string) bool {
-	if len(entries) == 0 || len(composeFiles) == 0 {
+// dirContainsAnyComposeFile returns true when a compose filename is present as a
+// regular file in the pre-read directory entries.
+func dirContainsAnyComposeFile(entries []os.DirEntry, composeFileNames set.Set[string]) bool {
+	if len(entries) == 0 || len(composeFileNames) == 0 {
 		return false
 	}
 
-	fileNames := make(map[string]struct{}, len(entries))
-
 	for _, entry := range entries {
-		if !entry.IsDir() {
-			fileNames[entry.Name()] = struct{}{}
-		}
-	}
-
-	for _, composeFile := range composeFiles {
-		if _, ok := fileNames[composeFile]; ok {
+		if !entry.IsDir() && composeFileNames.Contains(entry.Name()) {
 			return true
 		}
 	}
@@ -325,32 +903,43 @@ func dirHasFile(entries []os.DirEntry, name string) bool {
 }
 
 // mergeConfig merges Config fields from override into base, but only for fields
-// tagged with `doco:"allowOverride"`. Protected fields (reference, repository_url,
-// auto_discovery, git_depth) are never overridden.
+// tagged with `doco:"allowOverride"`. Protected fields remain unchanged.
 // Merge semantics:
 //   - Maps: merged key-by-key (override wins on key collision)
 //   - Slices: replaced entirely if the override slice is non-empty
 //   - Nested structs: all sub-fields are merged (parent tag opts them in)
 //   - Scalars: replaced if the override holds a non-zero value.
 func mergeConfig(base, override *Config) {
-	mergeStructByTag(reflect.ValueOf(base).Elem(), reflect.ValueOf(override).Elem())
+	mergeConfigKeys(base, override, nil)
+}
+
+// mergeConfigKeys merges override into base like mergeConfig. keys are the YAML keys the override sets:
+// a scalar the override sets replaces the base value even if it is zero, such as `remove_volumes: false`,
+// and a scalar it does not set is kept. A nil keys falls back to mergeConfig's non-zero rule.
+func mergeConfigKeys(base, override *Config, keys *yamlKeys) {
+	mergeStructByTag(reflect.ValueOf(base).Elem(), reflect.ValueOf(override).Elem(), keys)
 }
 
 // mergeStructByTag iterates a struct's fields and merges only those tagged doco:"allowOverride".
-func mergeStructByTag(base, override reflect.Value) {
+func mergeStructByTag(base, override reflect.Value, keys *yamlKeys) {
 	t := base.Type()
 	for i := 0; i < t.NumField(); i++ {
 		if t.Field(i).Tag.Get("doco") != "allowOverride" {
 			continue
 		}
 
-		mergeField(base.Field(i), override.Field(i))
+		fieldKeys, set := keys.field(t.Field(i))
+		if !set {
+			continue
+		}
+
+		mergeField(base.Field(i), override.Field(i), fieldKeys)
 	}
 }
 
 // mergeField applies a single field merge from override into base.
 // For structs the merge recurses into all sub-fields (no tag check – parent has opted in).
-func mergeField(base, override reflect.Value) {
+func mergeField(base, override reflect.Value, keys *yamlKeys) {
 	switch base.Kind() {
 	case reflect.Map:
 		if override.IsNil() || override.Len() == 0 {
@@ -374,60 +963,25 @@ func mergeField(base, override reflect.Value) {
 
 	case reflect.Struct:
 		// Recurse into all sub-fields; the parent tag already opted them in.
-		mergeAllStructFields(base, override)
+		mergeAllStructFields(base, override, keys.forStruct())
 
 	default:
-		// Scalar: apply only when the override holds a non-zero value.
-		if !override.IsZero() {
+		// Scalar: apply when the override sets it, or holds a non-zero value if that is unknown.
+		if keys != nil || !override.IsZero() {
 			base.Set(override)
 		}
 	}
 }
 
 // mergeAllStructFields merges every field of override into base without tag checks.
-func mergeAllStructFields(base, override reflect.Value) {
+func mergeAllStructFields(base, override reflect.Value, keys *yamlKeys) {
+	t := base.Type()
 	for i := 0; i < base.NumField(); i++ {
-		mergeField(base.Field(i), override.Field(i))
-	}
-}
+		fieldKeys, set := keys.field(t.Field(i))
+		if !set {
+			continue
+		}
 
-// deepCopy creates a deep copy of a Config struct.
-func deepCopy(src, dst *Config) {
-	*dst = *src
-
-	// Deep copy maps and slices
-	if src.ComposeFiles != nil {
-		dst.ComposeFiles = make([]string, len(src.ComposeFiles))
-		copy(dst.ComposeFiles, src.ComposeFiles)
-	}
-
-	if src.EnvFiles != nil {
-		dst.EnvFiles = make([]string, len(src.EnvFiles))
-		copy(dst.EnvFiles, src.EnvFiles)
-	}
-
-	if src.BuildOpts.Args != nil {
-		dst.BuildOpts.Args = make(map[string]string)
-		maps.Copy(dst.BuildOpts.Args, src.BuildOpts.Args)
-	}
-
-	if src.Environment != nil {
-		dst.Environment = make(map[string]string)
-		maps.Copy(dst.Environment, src.Environment)
-	}
-
-	if src.Profiles != nil {
-		dst.Profiles = make([]string, len(src.Profiles))
-		copy(dst.Profiles, src.Profiles)
-	}
-
-	if src.ExternalSecrets != nil {
-		dst.ExternalSecrets = make(map[string]secrettypes.ExternalSecretRef)
-		maps.Copy(dst.ExternalSecrets, src.ExternalSecrets)
-	}
-
-	if src.Internal.Environment != nil {
-		dst.Internal.Environment = make(map[string]string)
-		maps.Copy(dst.Internal.Environment, src.Internal.Environment)
+		mergeField(base.Field(i), override.Field(i), fieldKeys)
 	}
 }

@@ -2,14 +2,33 @@ package docker
 
 import (
 	"context"
+	"errors"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/compose/v5/pkg/api"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/lifecycle"
 	"github.com/kimdre/doco-cd/internal/common/types/set"
 )
+
+func TestWaitForStartedServicesTimeoutIsTypedFailure(t *testing.T) {
+	t.Parallel()
+
+	lister := func(context.Context) ([]api.ContainerSummary, error) {
+		return nil, nil
+	}
+
+	err := waitForStartedServicesWith(t.Context(), lister, []string{"api"},
+		set.New[string](), set.New[string](), time.Nanosecond)
+	if !errors.Is(err, lifecycle.ErrTimedOut) || lifecycle.IsCancellation(err) {
+		t.Fatalf("readiness timeout must be a typed failure, not lifecycle cancellation: %v", err)
+	}
+}
 
 func TestGetStartServicesForDeploy(t *testing.T) {
 	t.Parallel()
@@ -54,7 +73,7 @@ func TestGetStartServicesForDeploy(t *testing.T) {
 		},
 	}
 
-	services, err := getStartServicesForDeploy(project)
+	services, err := getStartServicesForDeploy(project, set.New[string](), set.New[string]())
 	if err != nil {
 		t.Fatalf("getStartServicesForDeploy() failed: %v", err)
 	}
@@ -79,12 +98,196 @@ func TestGetStartServicesForDeploy_InvalidLabels(t *testing.T) {
 		},
 	}
 
-	if _, err := getStartServicesForDeploy(project); err == nil {
+	if _, err := getStartServicesForDeploy(project, set.New[string](), set.New[string]()); err == nil {
 		t.Fatalf("expected error for invalid schedule labels")
 	}
 }
 
-func TestGetStartServicesForDeploy_ExcludesCompletedDependencyServices(t *testing.T) {
+func TestGetAutostartDisabledServices(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Services: types.Services{
+			"default": {Name: "default"},
+			"enabled": {
+				Name: "enabled",
+				Labels: map[string]string{
+					DocoCDLabels.Deployment.Autostart: "true",
+				},
+			},
+			"disabled": {
+				Name: "disabled",
+				Labels: map[string]string{
+					DocoCDLabels.Deployment.Autostart: "false",
+				},
+			},
+			"custom-disabled": {
+				Name: "custom-disabled",
+				CustomLabels: map[string]string{
+					DocoCDLabels.Deployment.Autostart: " FALSE ",
+				},
+			},
+		},
+	}
+
+	disabled, err := getAutostartDisabledServices(project)
+	if err != nil {
+		t.Fatalf("getAutostartDisabledServices() failed: %v", err)
+	}
+
+	if !disabled.Contains("disabled") || !disabled.Contains("custom-disabled") {
+		t.Fatalf("expected disabled services, got %v", disabled.ToSlice())
+	}
+
+	if disabled.Contains("default") || disabled.Contains("enabled") {
+		t.Fatalf("unexpected disabled services: %v", disabled.ToSlice())
+	}
+}
+
+func TestGetAutostartDisabledServices_InvalidValue(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Services: types.Services{
+			"bad": {
+				Name: "bad",
+				Labels: map[string]string{
+					DocoCDLabels.Deployment.Autostart: "sometimes",
+				},
+			},
+		},
+	}
+
+	if _, err := getAutostartDisabledServices(project); err == nil {
+		t.Fatalf("expected invalid autostart label to fail")
+	}
+}
+
+func TestServiceAutostartEnabled(t *testing.T) {
+	t.Parallel()
+
+	for raw, want := range map[string]bool{
+		"false": false, "False": false, "FALSE": false, "f": false, "F": false, "0": false, " FALSE ": false,
+		"true": true, "True": true, "TRUE": true, "t": true, "T": true, "1": true, " TRUE ": true,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+
+			enabled, err := serviceAutostartEnabled("web", types.ServiceConfig{
+				Labels: types.Labels{DocoCDLabels.Deployment.Autostart: raw},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if enabled != want {
+				t.Fatalf("autostart %q enabled = %t, want %t", raw, enabled, want)
+			}
+		})
+	}
+}
+
+func TestGetStartServicesForDeploy_PreservesAutostartState(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Services: types.Services{
+			"api":     {Name: "api"},
+			"running": {Name: "running"},
+			"stopped": {Name: "stopped"},
+		},
+	}
+
+	services, err := getStartServicesForDeploy(
+		project,
+		set.New[string]("running", "stopped"),
+		set.New[string]("running"),
+	)
+	if err != nil {
+		t.Fatalf("getStartServicesForDeploy() failed: %v", err)
+	}
+
+	got := set.New[string](services...)
+	if !got.Contains("api") || !got.Contains("running") {
+		t.Fatalf("expected normal and previously running services to start, got %v", services)
+	}
+
+	if got.Contains("stopped") {
+		t.Fatalf("previously stopped service must not start, got %v", services)
+	}
+}
+
+func TestGetRunningServices(t *testing.T) {
+	t.Parallel()
+
+	services := getRunningServices([]api.ContainerSummary{
+		{
+			State:  "running",
+			Labels: map[string]string{api.ServiceLabel: "api"},
+		},
+		{
+			State:  "exited",
+			Labels: map[string]string{api.ServiceLabel: "stopped"},
+		},
+		{
+			State:  "running",
+			Labels: map[string]string{},
+		},
+	})
+
+	if !services.Contains("api") || services.Contains("stopped") || services.Contains("") {
+		t.Fatalf("unexpected running services: %v", services.ToSlice())
+	}
+}
+
+// startProjectServicesTestClient lists canned containers and records direct starts.
+type startProjectServicesTestClient struct {
+	client.APIClient
+	containers []container.Summary
+	started    []string
+}
+
+func (c *startProjectServicesTestClient) ContainerList(context.Context, client.ContainerListOptions) (client.ContainerListResult, error) {
+	return client.ContainerListResult{Items: c.containers}, nil
+}
+
+func (c *startProjectServicesTestClient) ContainerStart(_ context.Context, id string, _ client.ContainerStartOptions) (client.ContainerStartResult, error) {
+	c.started = append(c.started, id)
+
+	return client.ContainerStartResult{}, nil
+}
+
+func TestStartProjectServices_SkipsHookContainers(t *testing.T) {
+	t.Parallel()
+
+	labels := func(service, hook string) map[string]string {
+		l := map[string]string{api.ProjectLabel: "stack", api.ServiceLabel: service}
+		if hook != "" {
+			l[api.HookLabel] = hook
+		}
+
+		return l
+	}
+
+	apiClient := &startProjectServicesTestClient{containers: []container.Summary{
+		{ID: "db-pre_start-created", State: container.StateCreated, Labels: labels("db", "pre_start")},
+		{ID: "db-1", State: container.StateExited, Labels: labels("db", "")},
+		{ID: "db-pre_start-failed", State: container.StateExited, Labels: labels("db", "pre_start")},
+		{ID: "db-2", State: container.StateCreated, Labels: labels("db", "")},
+		{ID: "other-1", State: container.StateExited, Labels: labels("other", "")},
+	}}
+
+	err := StartProjectServices(t.Context(), contextRegistryTestCli{apiClient: apiClient}, "stack", []string{"db"}, nil)
+	if err != nil {
+		t.Fatalf("start project services: %v", err)
+	}
+
+	if want := []string{"db-1", "db-2"}; !slices.Equal(apiClient.started, want) {
+		t.Fatalf("started containers = %v, want only real service replicas %v", apiClient.started, want)
+	}
+}
+
+func TestGetStartServicesForDeploy_IncludesCompletedDependencyServices(t *testing.T) {
 	t.Parallel()
 
 	project := &types.Project{
@@ -109,19 +312,135 @@ func TestGetStartServicesForDeploy_ExcludesCompletedDependencyServices(t *testin
 		},
 	}
 
-	services, err := getStartServicesForDeploy(project)
+	services, err := getStartServicesForDeploy(project, set.New[string](), set.New[string]())
 	if err != nil {
 		t.Fatalf("getStartServicesForDeploy() failed: %v", err)
 	}
 
 	startSet := set.New[string](services...)
 
-	if startSet.Contains("init") {
-		t.Fatalf("did not expect completed dependency service in start targets: %v", services)
+	if !startSet.Contains("init") || !startSet.Contains("api") || !startSet.Contains("db") {
+		t.Fatalf("expected one-shot, dependent, and normal services to be started: %v", services)
+	}
+}
+
+func TestGetOneShotServices(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Services: types.Services{
+			"init": {
+				Name: "init",
+			},
+			"post-init": {
+				Name: "post-init",
+				Labels: map[string]string{
+					DocoCDLabels.Deployment.OneShot: "true",
+				},
+			},
+			"explicitly-long-running": {
+				Name: "explicitly-long-running",
+				Labels: map[string]string{
+					DocoCDLabels.Deployment.OneShot: "false",
+				},
+			},
+			"default-restart-policy": {
+				Name: "default-restart-policy",
+			},
+			"no-restart-policy": {
+				Name:    "no-restart-policy",
+				Restart: "no",
+			},
+			"api": {
+				Name: "api",
+				DependsOn: types.DependsOnConfig{
+					"init": {
+						Condition: types.ServiceConditionCompletedSuccessfully,
+					},
+				},
+			},
+		},
 	}
 
-	if !startSet.Contains("api") || !startSet.Contains("db") {
-		t.Fatalf("expected dependent and normal services to be started: %v", services)
+	services, err := getOneShotServices(project)
+	if err != nil {
+		t.Fatalf("getOneShotServices() failed: %v", err)
+	}
+
+	if !services.Contains("init") || !services.Contains("post-init") {
+		t.Fatalf("expected dependency and labeled one-shot services, got %v", services.ToSlice())
+	}
+
+	if services.Contains("explicitly-long-running") || services.Contains("default-restart-policy") ||
+		services.Contains("no-restart-policy") || services.Contains("api") {
+		t.Fatalf("unexpected one-shot services: %v", services.ToSlice())
+	}
+}
+
+func TestGetOneShotServices_InvalidLabel(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Services: types.Services{
+			"invalid": {
+				Name: "invalid",
+				Labels: map[string]string{
+					DocoCDLabels.Deployment.OneShot: "sometimes",
+				},
+			},
+		},
+	}
+
+	if _, err := getOneShotServices(project); err == nil {
+		t.Fatalf("expected invalid one-shot label to fail")
+	}
+}
+
+func TestGetOneShotServices_RejectsContinuousRestartPolicy(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Services: types.Services{
+			"invalid": {
+				Name:    "invalid",
+				Restart: "unless-stopped",
+				Labels: map[string]string{
+					DocoCDLabels.Deployment.OneShot: "true",
+				},
+			},
+		},
+	}
+
+	if _, err := getOneShotServices(project); err == nil {
+		t.Fatalf("expected incompatible one-shot restart policy to fail")
+	}
+}
+
+func TestAddOneShotServiceLabels(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Services: types.Services{
+			"init": {
+				Name:         "init",
+				CustomLabels: types.Labels{"existing": "value"},
+			},
+			"api": {
+				Name: "api",
+			},
+		},
+	}
+
+	addOneShotServiceLabels(project, set.New[string]("init"))
+
+	initService := project.Services["init"]
+	if initService.CustomLabels[DocoCDLabels.Deployment.OneShot] != "true" ||
+		initService.CustomLabels["existing"] != "value" {
+		t.Fatalf("unexpected init service labels: %v", initService.CustomLabels)
+	}
+
+	if _, exists := project.Services["api"].CustomLabels[DocoCDLabels.Deployment.OneShot]; exists {
+		t.Fatalf("ordinary service must not receive the one-shot label")
 	}
 }
 
@@ -196,7 +515,7 @@ func TestProjectForStart_ExcludesJobServices(t *testing.T) {
 		t.Fatalf("getJobServices() failed: %v", err)
 	}
 
-	startProject, err := projectForStart(project, jobServices)
+	startProject, err := projectForStart(project, jobServices, set.New[string]())
 	if err != nil {
 		t.Fatalf("projectForStart() failed: %v", err)
 	}
@@ -244,7 +563,7 @@ func TestProjectForStart_DependencyOnJobServiceStripped(t *testing.T) {
 		t.Fatalf("getJobServices() failed: %v", err)
 	}
 
-	startProject, err := projectForStart(project, jobServices)
+	startProject, err := projectForStart(project, jobServices, set.New[string]())
 	if err != nil {
 		t.Fatalf("projectForStart() failed: %v", err)
 	}
@@ -279,13 +598,49 @@ func TestProjectForStart_OnlyJobServices(t *testing.T) {
 		t.Fatalf("getJobServices() failed: %v", err)
 	}
 
-	startProject, err := projectForStart(project, jobServices)
+	startProject, err := projectForStart(project, jobServices, set.New[string]())
 	if err != nil {
 		t.Fatalf("projectForStart() failed: %v", err)
 	}
 
 	if len(startProject.Services) != 0 {
 		t.Fatalf("expected no services to start when only job services exist, got: %v", startProject.ServiceNames())
+	}
+}
+
+func TestProjectForStart_ExcludesStoppedAutostartServices(t *testing.T) {
+	t.Parallel()
+
+	project := &types.Project{
+		Name: "stack",
+		Services: types.Services{
+			"api": {
+				Name: "api",
+				DependsOn: types.DependsOnConfig{
+					"on-demand": {Condition: "service_started"},
+				},
+			},
+			"on-demand": {
+				Name: "on-demand",
+			},
+		},
+	}
+
+	startProject, err := projectForStart(
+		project,
+		set.New[string](),
+		set.New[string]("on-demand"),
+	)
+	if err != nil {
+		t.Fatalf("projectForStart() failed: %v", err)
+	}
+
+	if _, ok := startProject.Services["on-demand"]; ok {
+		t.Fatalf("stopped autostart service must be excluded from start project")
+	}
+
+	if _, ok := startProject.Services["api"].DependsOn["on-demand"]; ok {
+		t.Fatalf("dependency on stopped autostart service must be stripped")
 	}
 }
 
@@ -307,7 +662,7 @@ func TestAssessStartedServiceStates_IgnoresExitedJobContainer(t *testing.T) {
 		},
 	}
 
-	ready, waiting, err := assessStartedServiceStates(containers, set.New[string]("api"))
+	ready, waiting, err := assessStartedServiceStates(containers, set.New[string]("api"), set.New[string]())
 	if err != nil {
 		t.Fatalf("assessStartedServiceStates() returned unexpected error: %v", err)
 	}
@@ -329,7 +684,7 @@ func TestAssessStartedServiceStates_FailsWhenNonJobExited(t *testing.T) {
 		},
 	}
 
-	_, _, err := assessStartedServiceStates(containers, set.New[string]("api"))
+	_, _, err := assessStartedServiceStates(containers, set.New[string]("api"), set.New[string]())
 	if err == nil {
 		t.Fatalf("expected error when target service has an exited container")
 	}
@@ -347,9 +702,125 @@ func TestAssessStartedServiceStates_FailsWhenRestarting(t *testing.T) {
 		},
 	}
 
-	_, _, err := assessStartedServiceStates(containers, set.New[string]("api"))
+	_, _, err := assessStartedServiceStates(containers, set.New[string]("api"), set.New[string]())
 	if err == nil {
 		t.Fatalf("expected error when target service has a restarting container")
+	}
+}
+
+func TestAssessStartedServiceStates_AcceptsCompletedOneShot(t *testing.T) {
+	t.Parallel()
+
+	containers := []api.ContainerSummary{
+		runningContainer("api"),
+		{
+			State:    "exited",
+			ExitCode: 0,
+			Labels: map[string]string{
+				api.ServiceLabel: "post-init",
+			},
+		},
+	}
+
+	ready, waiting, err := assessStartedServiceStates(
+		containers,
+		set.New[string]("api", "post-init"),
+		set.New[string]("post-init"),
+	)
+	if err != nil {
+		t.Fatalf("assessStartedServiceStates() returned unexpected error: %v", err)
+	}
+
+	if !ready || len(waiting) != 0 {
+		t.Fatalf("expected services to be ready, waiting: %v", waiting)
+	}
+}
+
+func TestAssessStartedServiceStates_WaitsForRunningOneShot(t *testing.T) {
+	t.Parallel()
+
+	ready, waiting, err := assessStartedServiceStates(
+		[]api.ContainerSummary{runningContainer("post-init")},
+		set.New[string]("post-init"),
+		set.New[string]("post-init"),
+	)
+	if err != nil {
+		t.Fatalf("assessStartedServiceStates() returned unexpected error: %v", err)
+	}
+
+	if ready || len(waiting) != 1 || waiting[0] != "post-init" {
+		t.Fatalf("expected to wait for running one-shot service, got ready=%t waiting=%v", ready, waiting)
+	}
+}
+
+func TestAssessStartedServiceStates_FailsWhenOneShotExitsNonZero(t *testing.T) {
+	t.Parallel()
+
+	_, _, err := assessStartedServiceStates(
+		[]api.ContainerSummary{{
+			State:    "exited",
+			ExitCode: 12,
+			Labels: map[string]string{
+				api.ServiceLabel: "post-init",
+			},
+		}},
+		set.New[string]("post-init"),
+		set.New[string]("post-init"),
+	)
+	if err == nil {
+		t.Fatalf("expected nonzero one-shot exit to fail")
+	}
+}
+
+func TestAssessStartedServiceStates_RequiresAllOneShotContainersToComplete(t *testing.T) {
+	t.Parallel()
+
+	for _, containers := range [][]api.ContainerSummary{
+		{
+			{State: "exited", ExitCode: 0, Labels: map[string]string{api.ServiceLabel: "post-init"}},
+			runningContainer("post-init"),
+		},
+		{
+			runningContainer("post-init"),
+			{State: "exited", ExitCode: 0, Labels: map[string]string{api.ServiceLabel: "post-init"}},
+		},
+	} {
+		ready, waiting, err := assessStartedServiceStates(
+			containers,
+			set.New[string]("post-init"),
+			set.New[string]("post-init"),
+		)
+		if err != nil {
+			t.Fatalf("assessStartedServiceStates() returned unexpected error: %v", err)
+		}
+
+		if ready || len(waiting) != 1 || waiting[0] != "post-init" {
+			t.Fatalf("expected to wait for every one-shot container, got ready=%t waiting=%v", ready, waiting)
+		}
+	}
+}
+
+func TestAssessStartedServiceStates_FailsOneShotRegardlessOfContainerOrder(t *testing.T) {
+	t.Parallel()
+
+	for _, containers := range [][]api.ContainerSummary{
+		{
+			{State: "exited", ExitCode: 0, Labels: map[string]string{api.ServiceLabel: "post-init"}},
+			{State: "exited", ExitCode: 1, Labels: map[string]string{api.ServiceLabel: "post-init"}},
+		},
+		{
+			{State: "exited", ExitCode: 1, Labels: map[string]string{api.ServiceLabel: "post-init"}},
+			{State: "exited", ExitCode: 0, Labels: map[string]string{api.ServiceLabel: "post-init"}},
+		},
+	} {
+		_, _, err := assessStartedServiceStates(
+			containers,
+			set.New[string]("post-init"),
+			set.New[string]("post-init"),
+		)
+		if err == nil {
+			t.Fatalf("expected any nonzero one-shot exit to fail")
+		}
 	}
 }
 
@@ -390,7 +861,9 @@ func TestWaitForStartedServices_FailsOnCrashLoop(t *testing.T) {
 		{{State: "restarting", Labels: map[string]string{api.ServiceLabel: "api"}}},
 	}, &calls)
 
-	err := waitForStartedServicesWith(t.Context(), lister, []string{"api"}, set.New[string](), 30*time.Second)
+	err := waitForStartedServicesWith(
+		t.Context(), lister, []string{"api"}, set.New[string](), set.New[string](), 30*time.Second,
+	)
 	if err == nil {
 		t.Fatalf("expected crashlooping service to fail the start wait")
 	}
@@ -410,7 +883,9 @@ func TestWaitForStartedServices_RequiresStableReadiness(t *testing.T) {
 		{runningContainer("api")},
 	}, &calls)
 
-	err := waitForStartedServicesWith(t.Context(), lister, []string{"api"}, set.New[string](), 30*time.Second)
+	err := waitForStartedServicesWith(
+		t.Context(), lister, []string{"api"}, set.New[string](), set.New[string](), 30*time.Second,
+	)
 	if err != nil {
 		t.Fatalf("waitForStartedServicesWith() returned unexpected error: %v", err)
 	}
@@ -428,12 +903,101 @@ func TestWaitForStartedServices_SucceedsAfterStableSamples(t *testing.T) {
 		{runningContainer("api")},
 	}, &calls)
 
-	err := waitForStartedServicesWith(t.Context(), lister, []string{"api"}, set.New[string](), 30*time.Second)
+	err := waitForStartedServicesWith(
+		t.Context(), lister, []string{"api"}, set.New[string](), set.New[string](), 30*time.Second,
+	)
 	if err != nil {
 		t.Fatalf("waitForStartedServicesWith() returned unexpected error: %v", err)
 	}
 
 	if calls != startReadyStableSamples {
 		t.Fatalf("expected exactly %d samples before success, got %d", startReadyStableSamples, calls)
+	}
+}
+
+func TestWaitForStartedServices_AcceptsOneShotCompletedBeforeFirstPoll(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	lister := scriptedLister(t, [][]api.ContainerSummary{{
+		runningContainer("api"),
+		{
+			State:    "exited",
+			ExitCode: 0,
+			Labels: map[string]string{
+				api.ServiceLabel: "post-init",
+			},
+		},
+	}}, &calls)
+
+	err := waitForStartedServicesWith(
+		t.Context(),
+		lister,
+		[]string{"api", "post-init"},
+		set.New[string](),
+		set.New[string]("post-init"),
+		30*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("waitForStartedServicesWith() returned unexpected error: %v", err)
+	}
+
+	if calls != startReadyStableSamples {
+		t.Fatalf("expected exactly %d samples before success, got %d", startReadyStableSamples, calls)
+	}
+}
+
+func TestWaitForStartedServices_AllowsOneShotRestartRetry(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	lister := scriptedLister(t, [][]api.ContainerSummary{
+		{{State: "exited", ExitCode: 1, Labels: map[string]string{api.ServiceLabel: "post-init"}}},
+		{{State: "restarting", Labels: map[string]string{api.ServiceLabel: "post-init"}}},
+		{{State: "running", Labels: map[string]string{api.ServiceLabel: "post-init"}}},
+		{{State: "exited", ExitCode: 0, Labels: map[string]string{api.ServiceLabel: "post-init"}}},
+	}, &calls)
+
+	err := waitForStartedServicesWith(
+		t.Context(),
+		lister,
+		[]string{"post-init"},
+		set.New[string](),
+		set.New[string]("post-init"),
+		30*time.Second,
+	)
+	if err != nil {
+		t.Fatalf("waitForStartedServicesWith() returned unexpected error: %v", err)
+	}
+}
+
+func TestWaitForStartedServices_FailsStableOneShotError(t *testing.T) {
+	t.Parallel()
+
+	calls := 0
+	lister := scriptedLister(t, [][]api.ContainerSummary{{
+		{
+			State:    "exited",
+			ExitCode: 1,
+			Labels: map[string]string{
+				api.ServiceLabel: "post-init",
+			},
+		},
+	}}, &calls)
+
+	err := waitForStartedServicesWith(
+		t.Context(),
+		lister,
+		[]string{"post-init"},
+		set.New[string](),
+		set.New[string]("post-init"),
+		30*time.Second,
+	)
+	if err == nil {
+		t.Fatalf("expected stable one-shot failure to fail")
+	}
+
+	if calls != oneShotFailureStableSamples {
+		t.Fatalf("expected failure after %d samples, got %d", oneShotFailureStableSamples, calls)
 	}
 }

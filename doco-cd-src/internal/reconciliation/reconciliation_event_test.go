@@ -1,20 +1,107 @@
 package reconciliation
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"reflect"
 	"slices"
 	"testing"
 	"time"
 
+	"github.com/docker/cli/cli/command"
 	"github.com/moby/moby/api/types/events"
+	swarmTypes "github.com/moby/moby/api/types/swarm"
+	"github.com/moby/moby/client"
 
+	"github.com/kimdre/doco-cd/internal/common/types/duration"
+
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	deployConfig "github.com/kimdre/doco-cd/internal/config/deploy"
 
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/docker/swarm"
 	"github.com/kimdre/doco-cd/internal/notification"
 )
+
+type swarmEventNameClient struct {
+	client.APIClient
+	name string
+	err  error
+}
+
+func (c swarmEventNameClient) ServiceInspect(context.Context, string, client.ServiceInspectOptions) (client.ServiceInspectResult, error) {
+	return client.ServiceInspectResult{Service: swarmTypes.Service{Spec: swarmTypes.ServiceSpec{Name: c.name}}}, c.err
+}
+
+type swarmEventNameCLI struct {
+	command.Cli
+	client client.APIClient
+}
+
+func (c swarmEventNameCLI) Client() client.APIClient { return c.client }
+
+func TestSwarmEventServiceName(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		attributes map[string]string
+		inspect    swarmEventNameClient
+		want       string
+		wantErr    bool
+	}{
+		{name: "name attribute", attributes: map[string]string{"name": "stack_api"}, want: "stack_api"},
+		{name: "swarm service attribute", attributes: map[string]string{"com.docker.swarm.service.name": "stack_api"}, want: "stack_api"},
+		{name: "service attribute", attributes: map[string]string{"service": "stack_api"}, want: "stack_api"},
+		{name: "inspect fallback", inspect: swarmEventNameClient{name: "stack_api"}, want: "stack_api"},
+		{name: "deleted service", inspect: swarmEventNameClient{err: errors.New("not found")}, want: "unavailable", wantErr: true},
+		{name: "empty inspected name", want: "unavailable"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			event := events.Message{Actor: events.Actor{ID: "full-service-id", Attributes: tc.attributes}}
+
+			name, err := swarmEventServiceName(t.Context(), swarmEventNameCLI{client: tc.inspect}, event)
+			if name != tc.want || (err != nil) != tc.wantErr {
+				t.Fatalf("swarmEventServiceName() = %q, %v; want %q, error=%v", name, err, tc.want, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestSwarmEventServiceLogIdentity(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		want string
+	}{
+		{name: "stack_api", want: "stack_api"},
+		{name: "", want: "unavailable"},
+	} {
+		t.Run(tc.want, func(t *testing.T) {
+			t.Parallel()
+
+			var output bytes.Buffer
+
+			log := slog.New(slog.NewJSONHandler(&output, nil))
+			withSwarmServiceIdentity(log, tc.name, "full-service-id").Info("reconciliation started")
+
+			var record map[string]any
+			if err := json.Unmarshal(output.Bytes(), &record); err != nil {
+				t.Fatalf("decode log: %v", err)
+			}
+
+			if record["service"] != tc.want || record["service_id"] != "full-service-id" {
+				t.Fatalf("reconciliation service identity = %v/%v", record["service"], record["service_id"])
+			}
+		})
+	}
+}
 
 func TestGetDeployConfigGroupByEvent(t *testing.T) {
 	t.Parallel()
@@ -285,6 +372,64 @@ func TestShouldIgnoreRestartReconciliationForScheduledJob(t *testing.T) {
 	}
 }
 
+func TestShouldIgnoreOneShotCompletionReconciliation(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		action   string
+		labels   map[string]string
+		expected bool
+	}{
+		{
+			name:   "successful one-shot exit",
+			action: "die",
+			labels: map[string]string{
+				docker.DocoCDLabels.Deployment.OneShot: "true",
+				"exitCode":                             "0",
+			},
+			expected: true,
+		},
+		{
+			name:   "failed one-shot exit",
+			action: "die",
+			labels: map[string]string{
+				docker.DocoCDLabels.Deployment.OneShot: "true",
+				"exitCode":                             "1",
+			},
+			expected: false,
+		},
+		{
+			name:   "ordinary successful exit",
+			action: "die",
+			labels: map[string]string{
+				"exitCode": "0",
+			},
+			expected: false,
+		},
+		{
+			name:   "unrelated one-shot event",
+			action: "unhealthy",
+			labels: map[string]string{
+				docker.DocoCDLabels.Deployment.OneShot: "true",
+				"exitCode":                             "0",
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			actual := shouldIgnoreOneShotCompletionReconciliation(tt.action, tt.labels)
+			if actual != tt.expected {
+				t.Fatalf("shouldIgnoreOneShotCompletionReconciliation() = %v, want %v", actual, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsRestartFollowupAction(t *testing.T) {
 	t.Parallel()
 
@@ -378,6 +523,8 @@ func TestCloneDeployConfigsWithForcedRecreate(t *testing.T) {
 
 	dc1 := deployConfig.New("stack-a", "main")
 	dc1.ForceRecreate = false
+	dc1.Internal.Environment = map[string]string{"VALUE": "before"}
+	dc1.Reconciliation.Events = []string{"die"}
 	dc2 := deployConfig.New("stack-b", "main")
 	dc2.ForceRecreate = false
 
@@ -400,36 +547,49 @@ func TestCloneDeployConfigsWithForcedRecreate(t *testing.T) {
 	if dc1.ForceRecreate || dc2.ForceRecreate {
 		t.Fatal("expected source deploy configs to remain unmodified")
 	}
+
+	cloned[0].Internal.Environment["VALUE"] = "after"
+
+	cloned[0].Reconciliation.Events[0] = "stop"
+	if dc1.Internal.Environment["VALUE"] != "before" || dc1.Reconciliation.Events[0] != "die" {
+		t.Fatal("reconciliation mutated the retained deployed snapshot")
+	}
 }
 
 func TestStackDeploymentInProgressTracking(t *testing.T) {
 	t.Parallel()
 
-	r := newReconciliation()
+	r := newTestManager(t)
 	repo := "github.com/example/repo"
 	stack := "stack-a"
+	context := ""
 
-	if r.isStackDeploymentInProgress(repo, stack) {
+	if r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to be initially not in progress")
 	}
 
-	r.startStackDeployment(repo, stack)
+	r.deployments.start(repo, context, stack)
 
-	if !r.isStackDeploymentInProgress(repo, stack) {
+	if !r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to be marked in progress")
 	}
 
-	// Reference counting should keep stack marked as in-progress until all marks are cleared.
-	r.startStackDeployment(repo, stack)
-	r.finishStackDeployment(repo, stack)
+	// A same-named stack in a different context must be tracked independently.
+	if r.deployments.isInProgress(repo, "other-context", stack) {
+		t.Fatal("expected same-named stack in a different context to be unaffected")
+	}
 
-	if !r.isStackDeploymentInProgress(repo, stack) {
+	// Reference counting should keep stack marked as in-progress until all marks are cleared.
+	r.deployments.start(repo, context, stack)
+	r.deployments.finish(repo, context, stack)
+
+	if !r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to remain in progress after one of two marks is cleared")
 	}
 
-	r.finishStackDeployment(repo, stack)
+	r.deployments.finish(repo, context, stack)
 
-	if r.isStackDeploymentInProgress(repo, stack) {
+	if r.deployments.isInProgress(repo, context, stack) {
 		t.Fatal("expected stack deployment to be cleared after all marks are removed")
 	}
 }
@@ -441,7 +601,7 @@ func TestRestartOptionsFromDeployConfig(t *testing.T) {
 		t.Parallel()
 
 		dc := deployConfig.New("stack-a", "main")
-		dc.Reconciliation.RestartTimeout = 30
+		dc.Reconciliation.RestartTimeout = duration.Duration(30 * time.Second)
 		dc.Reconciliation.RestartSignal = "SIGQUIT"
 
 		opts := restartOptionsFromDeployConfig(dc)
@@ -736,6 +896,31 @@ func TestDeployConfigsByName(t *testing.T) {
 	}
 }
 
+// TestFilterConfigsByContext_SameNameDifferentContexts ensures that stacks sharing a name across
+// different Docker contexts are only matched within their own context, since duplicate stack names
+// are now permitted as long as they target different Docker contexts.
+func TestFilterConfigsByContext_SameNameDifferentContexts(t *testing.T) {
+	t.Parallel()
+
+	dcDefault := deployConfig.New("telegraf", "main")
+	dcDocker01 := deployConfig.New("telegraf", "main")
+	dcDocker01.Context = "docker01"
+	dcDocker02 := deployConfig.New("telegraf", "main")
+	dcDocker02.Context = "docker02"
+
+	all := []*deployConfig.Config{dcDefault, dcDocker01, dcDocker02}
+
+	got := filterConfigsByContext(all, "docker01")
+	if len(got) != 1 || got[0] != dcDocker01 {
+		t.Fatalf("expected only the docker01 config, got %#v", got)
+	}
+
+	got = filterConfigsByContext(all, "")
+	if len(got) != 1 || got[0] != dcDefault {
+		t.Fatalf("expected only the default context config, got %#v", got)
+	}
+}
+
 func TestUniqueRedeployDCsFromGroupByEvent(t *testing.T) {
 	t.Parallel()
 
@@ -743,34 +928,48 @@ func TestUniqueRedeployDCsFromGroupByEvent(t *testing.T) {
 	dcDestroy := deployConfig.New("stack-destroy", "main")
 	dcBoth := deployConfig.New("stack-both", "main")       // registered under two redeploy events
 	dcRestart := deployConfig.New("stack-restart", "main") // only restart events → must be excluded
+	dcDifferentContext := deployConfig.New("stack-die", "main")
+	dcDifferentContext.Context = "remote"
 
 	grouped := map[string][]*deployConfig.Config{
-		"die":       {dcDie, dcBoth},
-		"destroy":   {dcDestroy, dcBoth}, // dcBoth appears again — must be deduplicated
-		"unhealthy": {dcRestart},         // restart-oriented — must be excluded
-		"stop":      {dcRestart},         // restart-oriented — must be excluded
+		"die":       {dcDie, dcBoth, dcDifferentContext},
+		"destroy":   {dcDestroy, dcBoth}, // dcBoth appears again and must be deduplicated
+		"unhealthy": {dcRestart},         // restart-oriented and must be excluded
+		"stop":      {dcRestart},         // restart-oriented and must be excluded
 	}
 
 	got := uniqueRedeployDCsFromGroupByEvent(grouped)
 
 	// Build a name set for order-independent assertion.
-	names := make(map[string]struct{}, len(got))
+	names := set.New[string]()
 	for _, dc := range got {
-		names[dc.Name] = struct{}{}
+		names.Add(dc.Name)
 	}
 
-	if len(got) != 3 {
-		t.Fatalf("expected 3 unique redeploy configs, got %d: %v", len(got), names)
+	if len(got) != 4 {
+		t.Fatalf("expected 4 unique redeploy configs, got %d: %v", len(got), names)
 	}
 
 	for _, wantName := range []string{"stack-die", "stack-destroy", "stack-both"} {
-		if _, ok := names[wantName]; !ok {
+		if !names.Contains(wantName) {
 			t.Errorf("expected %q to be included, got %v", wantName, names)
 		}
 	}
 
-	if _, ok := names["stack-restart"]; ok {
+	if names.Contains("stack-restart") {
 		t.Error("expected stack-restart to be excluded (only restart-oriented events)")
+	}
+
+	var stackDieContexts []string
+
+	for _, dc := range got {
+		if dc.Name == "stack-die" {
+			stackDieContexts = append(stackDieContexts, dc.Context)
+		}
+	}
+
+	if !slices.Contains(stackDieContexts, "") || !slices.Contains(stackDieContexts, "remote") {
+		t.Fatalf("expected stack-die in default and remote contexts, got %v", stackDieContexts)
 	}
 }
 

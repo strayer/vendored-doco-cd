@@ -2,6 +2,7 @@ package swarm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -19,6 +20,7 @@ import (
 const (
 	rollbackStatusObservationTimeout  = 20 * time.Second
 	rollbackStatusObservationInterval = 250 * time.Millisecond
+	jobTaskPollInterval               = 200 * time.Millisecond
 )
 
 // Service represents a service.
@@ -68,10 +70,10 @@ func waitOnService(ctx context.Context, dockerCli command.Cli, serviceID string)
 			return progressErr
 		}
 
-		return fmt.Errorf("failed to inspect service %s update status: %w", serviceID, err)
+		return fmt.Errorf("failed to inspect service update status: %w", err)
 	}
 
-	rollbackErr := rollbackUpdateStatusError(serviceID, serviceResult.Service.Spec.Name, serviceResult.Service.UpdateStatus)
+	rollbackErr := rollbackUpdateStatusError(serviceResult.Service.UpdateStatus)
 	if rollbackErr != nil {
 		return rollbackErr
 	}
@@ -81,7 +83,6 @@ func waitOnService(ctx context.Context, dockerCli command.Cli, serviceID string)
 			ctx,
 			dockerCli.Client(),
 			serviceID,
-			serviceResult.Service.Spec.Name,
 			rollbackStatusObservationTimeout,
 		)
 		if delayedRollbackErr != nil {
@@ -92,15 +93,204 @@ func waitOnService(ctx context.Context, dockerCli command.Cli, serviceID string)
 	return progressErr
 }
 
+// WaitOnJobService waits for one Swarm job execution to complete. Unlike
+// ServiceProgress alone, it also reports terminal task failures, which do not
+// converge and would otherwise leave callers blocked indefinitely.
+//
+// When previousJobIteration is provided, the service must first advance beyond
+// that iteration before its progress is observed. This prevents a reused job
+// service from reporting an earlier successful execution as the current run.
+func WaitOnJobService(
+	ctx context.Context,
+	dockerCli command.Cli,
+	serviceID string,
+	previousJobIteration *uint64,
+) error {
+	_, err := waitForJobIteration(ctx, dockerCli.Client(), serviceID, previousJobIteration)
+	if err != nil {
+		return err
+	}
+
+	waitCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	progressResult := make(chan error, 1)
+	failureResult := make(chan error, 1)
+
+	go func() {
+		progressResult <- waitOnService(waitCtx, dockerCli, serviceID)
+	}()
+
+	go func() {
+		failureResult <- waitForJobTaskFailure(waitCtx, dockerCli.Client(), serviceID)
+	}()
+
+	select {
+	case err = <-progressResult:
+		cancel()
+
+		failureErr := <-failureResult
+		if err != nil {
+			if failureErr != nil && !errors.Is(failureErr, context.Canceled) {
+				return failureErr
+			}
+
+			return err
+		}
+
+		currentIteration, failureErr := currentJobIteration(ctx, dockerCli.Client(), serviceID)
+		if failureErr != nil {
+			return failureErr
+		}
+
+		if failureErr = jobTaskFailure(ctx, dockerCli.Client(), serviceID, currentIteration); failureErr != nil {
+			return failureErr
+		}
+
+		return nil
+	case err = <-failureResult:
+		cancel()
+
+		progressErr := <-progressResult
+
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+
+		return progressErr
+	}
+}
+
+func waitForJobIteration(
+	ctx context.Context,
+	apiClient client.APIClient,
+	serviceID string,
+	previousJobIteration *uint64,
+) (uint64, error) {
+	ticker := time.NewTicker(jobTaskPollInterval)
+	defer ticker.Stop()
+
+	for {
+		result, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
+		if err != nil {
+			return 0, fmt.Errorf("inspect job service %s: %w", serviceID, err)
+		}
+
+		if result.Service.Spec.Mode.ReplicatedJob == nil && result.Service.Spec.Mode.GlobalJob == nil {
+			return 0, fmt.Errorf("service %s is not a Swarm job service", serviceID)
+		}
+
+		if result.Service.JobStatus != nil {
+			iteration := result.Service.JobStatus.JobIteration.Index
+			if previousJobIteration == nil || iteration > *previousJobIteration {
+				return iteration, nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// waitForJobTaskFailure polls a job service's tasks for terminal failures. A shared job
+// service (e.g. a cluster-wide image-prune job that any concurrent stack deployment can
+// trigger) may be re-triggered by another caller while this waits, advancing the service to
+// a newer iteration. That does not mean our own trigger failed - someone else's run simply
+// superseded it - so failures are tracked against whichever iteration is current rather than
+// erroring out when the iteration moves forward.
+func waitForJobTaskFailure(ctx context.Context, apiClient client.APIClient, serviceID string) error {
+	ticker := time.NewTicker(jobTaskPollInterval)
+	defer ticker.Stop()
+
+	for {
+		iteration, err := currentJobIteration(ctx, apiClient, serviceID)
+		if err != nil {
+			return err
+		}
+
+		if err = jobTaskFailure(ctx, apiClient, serviceID, iteration); err != nil {
+			return err
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// currentJobIteration returns the job service's current iteration index.
+func currentJobIteration(ctx context.Context, apiClient client.APIClient, serviceID string) (uint64, error) {
+	result, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
+	if err != nil {
+		return 0, fmt.Errorf("inspect job service %s: %w", serviceID, err)
+	}
+
+	if result.Service.JobStatus == nil {
+		return 0, fmt.Errorf("job service %s no longer reports an active job iteration", serviceID)
+	}
+
+	return result.Service.JobStatus.JobIteration.Index, nil
+}
+
+func jobTaskFailure(ctx context.Context, apiClient client.APIClient, serviceID string, iteration uint64) error {
+	tasks, err := apiClient.TaskList(ctx, client.TaskListOptions{
+		Filters: make(client.Filters).Add("service", serviceID),
+	})
+	if err != nil {
+		return fmt.Errorf("list tasks for job service %s: %w", serviceID, err)
+	}
+
+	return jobTaskFailureFromTasks(tasks.Items, iteration)
+}
+
+func jobTaskFailureFromTasks(tasks []swarm.Task, iteration uint64) error {
+	for _, task := range tasks {
+		if task.JobIteration == nil || task.JobIteration.Index != iteration {
+			continue
+		}
+
+		switch task.Status.State {
+		case swarm.TaskStateFailed, swarm.TaskStateRejected, swarm.TaskStateOrphaned,
+			swarm.TaskStateShutdown, swarm.TaskStateRemove:
+			return newJobTaskFailure(task)
+		}
+	}
+
+	return nil
+}
+
+func newJobTaskFailure(task swarm.Task) error {
+	details := strings.TrimSpace(task.Status.Err)
+	if details == "" {
+		details = strings.TrimSpace(task.Status.Message)
+	}
+
+	exitCode := ""
+	if task.Status.ContainerStatus != nil {
+		exitCode = fmt.Sprintf(" (exit code %d)", task.Status.ContainerStatus.ExitCode)
+	}
+
+	if details == "" {
+		return fmt.Errorf("job task %s ended in %s%s", task.ID, task.Status.State, exitCode)
+	}
+
+	return fmt.Errorf("job task %s ended in %s%s: %s", task.ID, task.Status.State, exitCode, details)
+}
+
 // waitForRollbackUpdateStatus keeps observing a service update for a short time
 // to catch rollback states that may appear after the first progress error.
-func waitForRollbackUpdateStatus(ctx context.Context, apiClient client.APIClient, serviceID, serviceName string, timeout time.Duration) error {
+func waitForRollbackUpdateStatus(ctx context.Context, apiClient client.APIClient, serviceID string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
 		serviceResult, err := apiClient.ServiceInspect(ctx, serviceID, client.ServiceInspectOptions{})
 		if err == nil {
-			rollbackErr := rollbackUpdateStatusError(serviceID, serviceName, serviceResult.Service.UpdateStatus)
+			rollbackErr := rollbackUpdateStatusError(serviceResult.Service.UpdateStatus)
 			if rollbackErr != nil {
 				return rollbackErr
 			}
@@ -121,22 +311,18 @@ func waitForRollbackUpdateStatus(ctx context.Context, apiClient client.APIClient
 }
 
 // rollbackUpdateStatusError returns an error when a service update finished in a rollback state.
-func rollbackUpdateStatusError(serviceID, serviceName string, status *swarm.UpdateStatus) error {
+// Callers add the service name and ID so the identity appears exactly once.
+func rollbackUpdateStatusError(status *swarm.UpdateStatus) error {
 	if status == nil || !isRollbackUpdateState(status.State) {
 		return nil
 	}
 
-	target := strings.TrimSpace(serviceName)
-	if target == "" {
-		target = serviceID
-	}
-
 	message := strings.TrimSpace(status.Message)
 	if message == "" {
-		return fmt.Errorf("service %s entered rollback state %q", target, status.State)
+		return fmt.Errorf("entered rollback state %q", status.State)
 	}
 
-	return fmt.Errorf("service %s entered rollback state %q: %s", target, status.State, message)
+	return fmt.Errorf("entered rollback state %q: %s", status.State, message)
 }
 
 // isRollbackUpdateState reports whether the update state indicates a rollback lifecycle.

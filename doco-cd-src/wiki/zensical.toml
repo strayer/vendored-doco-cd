@@ -23,6 +23,7 @@ nav = [
   { Home = "index.md" },
   { "Getting Started" = [
     { "Getting Started" = "Getting-Started.md" },
+    { "Migrating from Docker Compose" = "Migrating-from-Docker-Compose.md" },
     { "Setup Access Token" = "Setup-Access-Token.md" },
     { "Setup SSH Key" = "Setup-SSH-Key.md" },
     { "Setup Webhook" = "Setup-Webhook.md" },
@@ -42,6 +43,7 @@ nav = [
     { "External Secrets" = [
       "External-Secrets/index.md",
       { "AWS Secrets Manager" = "External-Secrets/AWS-Secrets-Manager.md" },
+      { "Azure Key Vault" = "External-Secrets/Azure-Key-Vault.md" },
       { "Bitwarden Secrets Manager" = "External-Secrets/Bitwarden-Secrets-Manager.md" },
       { "Bitwarden Vault / Vaultwarden" = "External-Secrets/Bitwarden-Vault-Vaultwarden.md" },
       { "1Password" = "External-Secrets/1Password.md" },
@@ -61,14 +63,19 @@ nav = [
     { "Pre- / Post-Deployment Scripts" = "Advanced/Pre-Post-Deployment-Scripts.md" },
     { "Renovate Bot" = "Advanced/Renovate.md" },
     { "Self-Updating" = "Advanced/Self-Updating.md" },
+    { "Source URL Rewrites" = "Advanced/Source-URL-Rewrites.md" },
     { "Swarm Mode" = "Advanced/Swarm-Mode.md" },
+    { "Sync Windows" = "Advanced/Sync-Windows.md" },
     { "Tips & Tricks" = "Advanced/Tips-and-Tricks.md" },
   ] },
   { Reference = [
     { "Core Concepts" = "Core-Concepts.md" },
+    { "Artifact Storage" = "Reference/Artifact-Storage.md" },
     { Endpoints = [
       { "Healthcheck" = "Endpoints/Healthcheck.md" },
+      { "MCP Server" = "Endpoints/MCP-Server.md" },
       { "Prometheus Metrics / Monitoring" = "Endpoints/Metrics.md" },
+      { "Go Runtime Profiling" = "Endpoints/Profiling.md" },
       { "REST API" = "Endpoints/REST-API.md" },
       { "Webhook Listener" = "Endpoints/Webhook-Listener.md" },
     ] },
@@ -203,7 +210,10 @@ custom_checkbox = true
 auto_append = ["wiki/includes/abbreviations.md"]
 check_paths = true
 
-# zensical
+# Markdown extension hooks
+[project.markdown_extensions."hooks.deploy_schema"]
+[project.markdown_extensions."hooks.metrics_table"]
+
 [project.markdown_extensions.zensical.extensions.preview]
 configurations = [
   { targets.include = [
@@ -212,3 +222,14 @@ configurations = [
 ]
 
 [project.plugins.markdown-exec]
+[project.plugins.minify]
+minify_html = true
+minify_js = true
+js_files = [
+  "javascripts/*.js"
+]
+minify_css = true
+css_files = [
+  "stylesheets/*.css"
+]
+cache_safe = true

@@ -1,0 +1,19 @@
+# Examples
+
+Full working setups for common doco-cd scenarios. Each example replicates every repo it needs:
+
+- `app-repo/` or `deployments-repo/`: what you commit to Git.
+- `server/`: what you put on the Docker host (doco-cd itself).
+
+| Example | Pattern | Pick it when |
+|---|---|---|
+| [single-repo-single-env](single-repo-single-env/) | App repo carries its own compose + `.doco-cd.yml`. One doco-cd instance polls it. | You have one app and one Docker host. Start here. |
+| [single-repo-two-envs](single-repo-two-envs/) | Same repo, two deploy configs. Each doco-cd instance selects its own via poll `target:`. Adds notifications. | You have staging and prod of the same app. |
+| [self-updating](self-updating/) | doco-cd deploys the stack that contains itself. One instance, bootstrapped once, updated by a push. | You want the controller under GitOps too, like the stacks it deploys. |
+| [deployments-repo](deployments-repo/) | One central repo deploys many apps to many hosts. Version pins per host, compose files pulled from app repos, secrets encrypted with SOPS. | You have a fleet of apps/hosts and want one place that states what runs where. |
+
+Notes that apply to all examples:
+
+- All examples use polling. Doco-CD itself needs no inbound port, but deployed app stacks may publish ports for user traffic. To adapt an example for webhooks, set `WEBHOOK_SECRET`, enable a reachable HTTP listener, and configure the Git provider to send requests through an HTTPS reverse proxy; see [Setup Webhook](../wiki/docs/Setup-Webhook.md).
+- Examples use the `latest` image tag to stay copy-pasteable. In real use pin the doco-cd image by tag + digest.
+- The `server/` compose is the one thing the other examples do not GitOps: it is copied to the host by hand. To put it under GitOps too, see [self-updating](self-updating/) and [Self-Updating](https://doco.cd/latest/Advanced/Self-Updating/).

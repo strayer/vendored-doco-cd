@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -12,40 +14,522 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/docker/compose/v5/pkg/api"
 	"github.com/docker/compose/v5/pkg/compose"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
+	swarmTypes "github.com/moby/moby/api/types/swarm"
 	"github.com/moby/moby/client"
 
+	restserver "github.com/kimdre/doco-cd/internal/api"
+	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
+	"github.com/kimdre/doco-cd/internal/controlplane"
 
 	"github.com/kimdre/doco-cd/internal/git"
 
 	"github.com/kimdre/doco-cd/internal/test"
 
-	"github.com/kimdre/doco-cd/internal/docker/swarm"
-
+	"github.com/kimdre/doco-cd/internal/common/types/set"
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/encryption"
+	"github.com/kimdre/doco-cd/internal/lock"
 	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/reconciliation"
+	"github.com/kimdre/doco-cd/internal/source"
+	"github.com/kimdre/doco-cd/internal/stages"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
+
+func TestPostSkippedWebhookUsesNativeGitHubConclusion(t *testing.T) {
+	git.ConfigureAuthResolver([]git.ScopedAuthConfig{{Domains: []string{"github.com"}}}, "", "", "", "", git.GitHubAppConfig{ID: "42", PrivateKey: "test-key"})
+
+	restore := git.SwapGitHubAppTokenProviderForTest(func(string, git.GitHubAppConfig) (string, error) {
+		return "installation-token", nil
+	})
+
+	t.Cleanup(func() {
+		restore()
+		configureTestGitAuth()
+	})
+
+	var received struct {
+		Name       string `json:"name"`
+		Status     string `json:"status"`
+		Conclusion string `json:"conclusion"`
+		Output     struct {
+			Title   string `json:"title"`
+			Summary string `json:"summary"`
+		} `json:"output"`
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			_, _ = w.Write([]byte(`{"total_count":0,"check_runs":[]}`))
+			return
+		}
+
+		if r.Method != http.MethodPost || r.URL.Path != "/repos/owner/repo/check-runs" {
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode check: %v", err)
+		}
+
+		_, _ = w.Write([]byte(`{"id":123}`))
+	}))
+	defer server.Close()
+
+	postSkippedWebhookCommitStatus(t.Context(), &app.Config{
+		GitCommitStatus: true, GitScmProvider: "github", GitScmApiUrl: config.HttpUrl(server.URL),
+	}, logger.New(logger.LevelCritical).Logger, webhook.ParsedPayload{
+		Source:    webhook.PayloadSourceGit,
+		CommitSHA: plumbing.NewHash("0123456789012345678901234567890123456789"),
+		FullName:  "owner/repo",
+		CloneURL:  "https://github.com/owner/repo.git",
+		WebURL:    "https://github.com/owner/repo",
+		Ref:       "refs/heads/renovate/x",
+	}, "staging", stages.NewSkippedRunError([]stages.SkippedStack{{
+		Name:   "web",
+		Reason: stages.SkipReasonWebhookFilter,
+		Detail: "`^refs/heads/main$` does not match `refs/heads/renovate/x`",
+	}}))
+
+	if received.Name != "doco-cd/staging/deploy" || received.Status != "completed" || received.Conclusion != "skipped" {
+		t.Fatalf("unexpected skipped check: %+v", received)
+	}
+
+	if received.Output.Title != "Skipped: webhook filter did not match" {
+		t.Fatalf("output title = %q", received.Output.Title)
+	}
+
+	wantRow := "| `web` | Webhook filter did not match: `^refs/heads/main$` does not match `refs/heads/renovate/x` |"
+	if !strings.Contains(received.Output.Summary, wantRow) || !strings.Contains(received.Output.Summary, "`refs/heads/renovate/x` at `0123456`") {
+		t.Fatalf("output summary = %q, want row %q", received.Output.Summary, wantRow)
+	}
+}
+
+func TestPostSkippedWebhookCommitStatusUsesRunContext(t *testing.T) {
+	type postedStatus struct {
+		State       string `json:"state"`
+		Description string `json:"description"`
+		Context     string `json:"context"`
+	}
+
+	var received postedStatus
+
+	git.ConfigureAuthResolver([]git.ScopedAuthConfig{{Domains: []string{"git.example.com"}}}, "", "", testGitAccessToken, "", git.GitHubAppConfig{})
+	t.Cleanup(configureTestGitAuth)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/version" {
+			_, _ = w.Write([]byte(`{"version":"1.25.0"}`))
+
+			return
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode status: %v", err)
+		}
+
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	for _, tt := range []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{name: "default", want: commitstatus.DeployContext},
+		{name: "blank target", target: " \t ", want: commitstatus.DeployContext},
+		{name: "production", target: "production", want: "doco-cd/production/deploy"},
+		{name: "staging", target: "staging", want: "doco-cd/staging/deploy"},
+		{name: "trimmed target", target: " production ", want: "doco-cd/production/deploy"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			received = postedStatus{}
+
+			postSkippedWebhookCommitStatus(t.Context(), &app.Config{
+				GitCommitStatus: true,
+				GitScmProvider:  string(commitstatus.ProviderGitea),
+				GitScmApiUrl:    config.HttpUrl(server.URL),
+			}, logger.New(logger.LevelCritical).Logger, webhook.ParsedPayload{
+				Source:    webhook.PayloadSourceGit,
+				CommitSHA: plumbing.NewHash("0123456789012345678901234567890123456789"),
+				FullName:  "owner/repo",
+				CloneURL:  "https://git.example.com/owner/repo.git",
+				WebURL:    "https://git.example.com/owner/repo",
+			}, tt.target, stages.ErrSkipDeployment)
+
+			if received.State != "skipped" || received.Description != "Skipped" {
+				t.Fatalf("unexpected skipped status: %+v", received)
+			}
+
+			if received.Context != tt.want {
+				t.Fatalf("context = %q, want %q", received.Context, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunWebhookSynchronouslyIgnoresRequestCancellation(t *testing.T) {
+	t.Parallel()
+
+	applicationCtx, cancelApplication := context.WithCancel(t.Context())
+	runs := newTestControlPlaneRuns(t, testControlPlaneRunsOptions{applicationCtx: applicationCtx})
+	jobID := runs.Accept("webhook", controlplane.RunTriggerWebhook, controlplane.RunMetadata{})
+
+	requestCtx, cancelRequest := context.WithCancel(t.Context())
+	runCtx := make(chan context.Context, 1)
+	result := make(chan error, 1)
+
+	go func() {
+		result <- runs.Execute(requestCtx, jobID, controlplane.RunExecution{
+			Mode:         controlplane.RunSynchronousDetached,
+			PanicContext: "webhook deployment",
+			PanicError:   errWebhookDeploymentPanicked,
+		}, func(ctx context.Context) (controlplane.RunResult, error) {
+			runCtx <- ctx
+
+			<-ctx.Done()
+
+			return controlplane.RunResult{}, ctx.Err()
+		})
+	}()
+
+	ctx := <-runCtx
+
+	cancelRequest()
+
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("webhook run cancelled with request: %v", err)
+	}
+
+	cancelApplication()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("webhook run error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("webhook run did not stop during application shutdown")
+	}
+
+	runs.CloseAndWait()
+}
+
+// fakeSourcePreparer returns a canned result for concurrency tests without
+// touching disk or the network.
+type fakeSourcePreparer struct {
+	repoName string
+}
+
+func (f fakeSourcePreparer) Prepare(context.Context, source.Request) (source.Result, error) {
+	return source.Result{
+		SourceType: config.SourceTypeGit,
+		RepoName:   f.repoName,
+		Revision:   "0123456789012345678901234567890123456789",
+	}, nil
+}
+
+// fakeContextResolver satisfies controlplane.DockerContextResolver without a
+// real Docker daemon; Deployment.Deploy only checks the error return of Get,
+// never the resolved docker.ContextClient value itself.
+type fakeContextResolver struct{}
+
+func (fakeContextResolver) Get(context.Context, string) (docker.ContextClient, error) {
+	return docker.ContextClient{}, nil
+}
+
+// fakeReconciler is a minimal controlplane.Reconciler fake letting tests
+// observe/control what happens once a webhook event reaches deployment.
+// deploy is called synchronously by controlplane.Deployment.Deploy for every event.
+type fakeReconciler struct {
+	deploy func(ctx context.Context, req reconciliation.DeployRequest) error
+}
+
+func (f fakeReconciler) Deploy(ctx context.Context, req reconciliation.DeployRequest) error {
+	return f.deploy(ctx, req)
+}
+
+// newConcurrencyTestHandler builds an orchestrationHandler whose deployment
+// operation is backed entirely by fakes (no source checkout, no Docker
+// daemon), so tests can drive real WebhookHandler HTTP requests and observe
+// exactly how many reach the reconciler concurrently.
+func newConcurrencyTestHandler(t *testing.T, deploy func(ctx context.Context, req reconciliation.DeployRequest) error) orchestrationHandler {
+	t.Helper()
+
+	appConfig, err := app.GetConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	appConfig.GitCommitStatus = false
+
+	log := logger.New(logger.LevelCritical)
+
+	mountPoint := container.MountPoint{
+		Type:        "bind",
+		Source:      t.TempDir(),
+		Destination: t.TempDir(),
+		Mode:        "rw",
+	}
+
+	deployment, err := controlplane.NewDeployment(controlplane.DeploymentDependencies{
+		SourcePreparer: fakeSourcePreparer{repoName: "kimdre/doco-cd"},
+		Reconciler:     fakeReconciler{deploy: deploy},
+		Contexts:       fakeContextResolver{},
+		DataMountPoint: mountPoint,
+	})
+	if err != nil {
+		t.Fatalf("failed to create fake deployment operation: %v", err)
+	}
+
+	return orchestrationHandler{
+		appConfig:  appConfig,
+		log:        log,
+		testName:   test.ConvertTestName(t.Name()),
+		deployment: deployment,
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			appConfig:      appConfig,
+			dataMountPoint: mountPoint,
+			log:            log,
+		}),
+	}
+}
+
+// newConcurrencyTestWebhookRequest builds a signed GitHub push webhook
+// request for target - a per-request customTarget standing in for "which
+// stack this event deploys", since these tests drive WebhookHandler directly
+// (bypassing the HTTP mux that would otherwise populate it from the path).
+func newConcurrencyTestWebhookRequest(t *testing.T, appConfig *app.Config, target string) *http.Request {
+	t.Helper()
+
+	payload, err := os.ReadFile(filepath.Join(WorkingDir, githubPayloadFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := newWebhookRequest(t, restserver.WebhookPath+"?wait=true", payload, appConfig)
+	req.SetPathValue("customTarget", target)
+
+	return req
+}
+
+func TestWebhookHandlerSkippedCommitStatusIncludesTarget(t *testing.T) {
+	h := newConcurrencyTestHandler(t, func(context.Context, reconciliation.DeployRequest) error {
+		return stages.NewSkippedRunError([]stages.SkippedStack{{
+			Name: "web", Reason: stages.SkipReasonNoChanges,
+		}})
+	})
+
+	var received struct {
+		Context     string `json:"context"`
+		Description string `json:"description"`
+		State       string `json:"state"`
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/version" {
+			_, _ = w.Write([]byte(`{"version":"1.25.0"}`))
+
+			return
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&received); err != nil {
+			t.Errorf("decode status: %v", err)
+		}
+
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	h.appConfig.GitCommitStatus = true
+	h.appConfig.GitScmProvider = string(commitstatus.ProviderGitea)
+	h.appConfig.GitScmApiUrl = config.HttpUrl(server.URL)
+
+	rr := httptest.NewRecorder()
+	h.WebhookHandler(rr, newConcurrencyTestWebhookRequest(t, h.appConfig, "production"))
+
+	if rr.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want %d: %s", rr.Code, http.StatusAccepted, rr.Body.String())
+	}
+
+	if received.Context != "doco-cd/production/deploy" || received.Description != "Skipped: no changes detected" ||
+		received.State != "skipped" {
+		t.Fatalf("unexpected skipped status: %+v", received)
+	}
+}
+
+// TestWebhookHandlerDifferentTargetsRunConcurrently proves that removing the
+// former repository-wide webhook lock (acquireWebhookRepoLock/lock.RepoLock)
+// lets two webhook events for the same repository, targeting different
+// stacks, reach the reconciler at the same time instead of queuing behind one another.
+func TestWebhookHandlerDifferentTargetsRunConcurrently(t *testing.T) {
+	encryption.SetupAgeKeyEnvVar(t)
+
+	started := make(chan string, 2)
+	release := make(chan struct{})
+
+	h := newConcurrencyTestHandler(t, func(_ context.Context, req reconciliation.DeployRequest) error {
+		started <- req.Metadata.Target
+
+		<-release
+
+		return nil
+	})
+
+	stackA := t.Name() + "/stack-a"
+	stackB := t.Name() + "/stack-b"
+	reqA := newConcurrencyTestWebhookRequest(t, h.appConfig, stackA)
+	reqB := newConcurrencyTestWebhookRequest(t, h.appConfig, stackB)
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	go func() {
+		defer wg.Done()
+
+		h.WebhookHandler(httptest.NewRecorder(), reqA)
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		h.WebhookHandler(httptest.NewRecorder(), reqB)
+	}()
+
+	seen := make(set.Set[string], 2)
+
+	for range 2 {
+		select {
+		case target := <-started:
+			seen.Add(target)
+		case <-time.After(time.Second):
+			close(release)
+			t.Fatal("expected both different-stack webhook events to reach the reconciler without serializing")
+		}
+	}
+
+	if !seen.Contains(stackA) || !seen.Contains(stackB) {
+		close(release)
+		t.Fatalf("expected both stacks to reach the reconciler, got %v", seen)
+	}
+
+	close(release)
+	wg.Wait()
+}
+
+// TestWebhookHandlerSameTargetStillSerializesViaStackLock proves that even
+// without the removed repository-wide webhook lock, two webhook events for
+// the same repository AND the same stack still cannot run concurrently: the
+// per-stack lock (internal/lock.LockStack/UnlockStack), applied deep inside
+// the real deployment path (internal/docker.Deploy), still serializes them.
+// The fake reconciler below stands in for that call site by taking the same
+// lock the real one does.
+func TestWebhookHandlerSameTargetStillSerializesViaStackLock(t *testing.T) {
+	encryption.SetupAgeKeyEnvVar(t)
+
+	const simulatedWork = 100 * time.Millisecond
+
+	stackKey := t.Name() + "/shared-stack"
+
+	var (
+		mu      sync.Mutex
+		overlap bool
+		active  bool
+	)
+
+	h := newConcurrencyTestHandler(t, func(context.Context, reconciliation.DeployRequest) error {
+		lock.LockStack(stackKey)
+		defer lock.UnlockStack(stackKey)
+
+		mu.Lock()
+		if active {
+			overlap = true
+		}
+
+		active = true
+		mu.Unlock()
+
+		time.Sleep(simulatedWork)
+
+		mu.Lock()
+		active = false
+		mu.Unlock()
+
+		return nil
+	})
+
+	reqA := newConcurrencyTestWebhookRequest(t, h.appConfig, "shared-stack")
+	reqB := newConcurrencyTestWebhookRequest(t, h.appConfig, "shared-stack")
+
+	var wg sync.WaitGroup
+
+	wg.Add(2)
+
+	start := time.Now()
+
+	go func() {
+		defer wg.Done()
+
+		h.WebhookHandler(httptest.NewRecorder(), reqA)
+	}()
+
+	go func() {
+		defer wg.Done()
+
+		h.WebhookHandler(httptest.NewRecorder(), reqB)
+	}()
+
+	wg.Wait()
+
+	if overlap {
+		t.Fatal("expected same-stack webhook events to serialize via the per-stack lock, but they overlapped")
+	}
+
+	if elapsed := time.Since(start); elapsed < 2*simulatedWork {
+		t.Fatalf("expected same-stack webhook events to run sequentially (>= %v), took %v", 2*simulatedWork, elapsed)
+	}
+}
 
 const (
 	githubPayloadFile          = "testdata/github_payload.json"
 	githubPayloadFileSwarmMode = "testdata/github_payload_swarm_mode.json"
 	webhookTestPollInterval    = 100 * time.Millisecond
-	composeContent             = `services:
-  nginx:
+)
+
+// webhookFixtureFiles backs the local, network-independent fixture repo used
+// by TestHandlerData_WebhookHandler in non-swarm mode, so that test doesn't
+// depend on cloning the live kimdre/doco-cd GitHub repository.
+var webhookFixtureFiles = map[string]string{
+	".doco-cd.yaml": `
+name: webhook-test-deploy
+compose_files:
+  - test.compose.yaml
+`,
+	"test.compose.yaml": `
+services:
+  app:
     image: nginx:latest
     ports:
-      - "80"
-`
-)
+      - "80"  # use random published port
+    volumes:
+      - ./:/usr/share/nginx/html
+`,
+	"index.html": "webhook test fixture index page\n",
+}
 
 func newWebhookRequest(t *testing.T, url string, payload []byte, appConfig *app.Config) *http.Request {
 	t.Helper()
@@ -88,16 +572,29 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 	stackName := test.ConvertTestName(t.Name())
 
 	payloadFile := githubPayloadFile
-	cloneUrl := "https://github.com/kimdre/doco-cd.git"
-	indexPath := path.Join("test", "index.html")
+	// payloadCloneUrl is the clone_url baked into the webhook payload fixture
+	// file. In non-swarm mode it is rewritten below (via SourceURLRewrites) to
+	// a local, ephemeral fixture repository so this test doesn't depend on
+	// the live kimdre/doco-cd GitHub repository.
+	payloadCloneUrl := "https://github.com/kimdre/doco-cd.git"
+	indexPath := "index.html"
 
-	if swarm.GetModeEnabled() {
+	var cloneUrl string
+
+	if SwarmModeEnabled {
 		payloadFile = githubPayloadFileSwarmMode
 		cloneUrl = "https://github.com/kimdre/doco-cd_tests.git"
 		indexPath = path.Join("html", "index.html")
+	} else {
+		_, fixtureCloneURL, _ := newLocalFixtureRepo(t, webhookFixtureFiles)
+		cloneUrl = fixtureCloneURL
 	}
 
-	indexPath = path.Join(tmpDir, git.GetRepoName(cloneUrl), indexPath)
+	// The repository content actually deployed lives under the store's
+	// per-revision artifact directory, not directly at repoBaseDir - its
+	// exact revision subdirectory name isn't known until after the webhook
+	// deploys, so it's resolved via glob below.
+	repoBaseDir := path.Join(tmpDir, git.GetRepoName(cloneUrl))
 
 	payload, err := os.ReadFile(filepath.Join(WorkingDir, payloadFile))
 	if err != nil {
@@ -116,7 +613,17 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	useConfiguredGitAuth(t, appConfig)
+
 	appConfig.GitCommitStatus = false
+
+	if !SwarmModeEnabled {
+		// Route the payload's clone URL to the local fixture repo created
+		// above, so this test never clones the live kimdre/doco-cd repo.
+		appConfig.SourceURLRewrites = map[string]string{
+			payloadCloneUrl: cloneUrl,
+		}
+	}
 
 	log := logger.New(logger.LevelCritical)
 
@@ -134,21 +641,32 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		}
 	})
 
-	h := handlerData{
-		dockerCli:  dockerCli,
-		appConfig:  appConfig,
-		appVersion: app.Version,
-		dataMountPoint: container.MountPoint{
-			Type:        "bind",
-			Source:      tmpDir,
-			Destination: tmpDir,
-			Mode:        "rw",
-		},
-		log:      log,
-		testName: stackName,
+	mountPoint := container.MountPoint{
+		Type:        "bind",
+		Source:      tmpDir,
+		Destination: tmpDir,
+		Mode:        "rw",
 	}
 
-	req := newWebhookRequest(t, webhookPath+"?wait=true", minifiedPayload.Bytes(), appConfig)
+	h := orchestrationHandler{
+		appConfig: appConfig,
+		log:       log,
+		testName:  stackName,
+
+		deployment: newTestDeployment(t, appConfig, mountPoint, reconciliation.Dependencies{
+			AppConfig:      appConfig,
+			DataMountPoint: mountPoint,
+			DockerCLI:      dockerCli,
+		}),
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			appConfig:      appConfig,
+			dataMountPoint: mountPoint,
+			dockerCli:      dockerCli,
+			log:            log,
+		}),
+	}
+
+	req := newWebhookRequest(t, restserver.WebhookPath+"?wait=true", minifiedPayload.Bytes(), appConfig)
 
 	rr := httptest.NewRecorder()
 	handler := http.HandlerFunc(h.WebhookHandler)
@@ -183,12 +701,12 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 		testContainerPort string
 	)
 
-	if swarm.GetModeEnabled() {
+	if SwarmModeEnabled {
 		t.Log("Testing in Swarm mode")
 
 		inspectName := stackName + "_" + "test"
 
-		svc, err := docker.WaitForSwarmService(ctx, t, dockerClient, inspectName, 30*time.Second)
+		svc, err := waitForSwarmService(ctx, t, dockerClient, inspectName, 30*time.Second)
 		if err != nil {
 			t.Fatalf("Failed to find swarm service for test container: %v", err)
 		}
@@ -251,7 +769,12 @@ func TestHandlerData_WebhookHandler(t *testing.T) {
 
 	bodyString := string(bodyBytes)
 
-	fileContent, err := os.ReadFile(indexPath) // #nosec G304
+	indexMatches, err := filepath.Glob(filepath.Join(repoBaseDir, "artifacts", "*", indexPath))
+	if err != nil || len(indexMatches) == 0 {
+		t.Fatalf("failed to locate %s under %s (glob error: %v)", indexPath, repoBaseDir, err)
+	}
+
+	fileContent, err := os.ReadFile(indexMatches[0]) // #nosec G304
 	if err != nil {
 		t.Fatalf("Failed to read index.html file: %v", err)
 	}
@@ -341,20 +864,28 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	useConfiguredGitAuth(t, appConfig)
+
 	appConfig.GitCommitStatus = false
 
 	log := logger.New(logger.LevelCritical)
 
-	h := handlerData{
-		appConfig:  appConfig,
-		appVersion: app.Version,
-		dataMountPoint: container.MountPoint{
-			Type:        "bind",
-			Source:      t.TempDir(),
-			Destination: t.TempDir(),
-			Mode:        "rw",
-		},
-		log: log,
+	mountPoint := container.MountPoint{
+		Type:        "bind",
+		Source:      t.TempDir(),
+		Destination: t.TempDir(),
+		Mode:        "rw",
+	}
+
+	h := orchestrationHandler{
+		appConfig: appConfig,
+		log:       log,
+
+		controlPlaneRuns: newTestControlPlaneRuns(t, testControlPlaneRunsOptions{
+			appConfig:      appConfig,
+			dataMountPoint: mountPoint,
+			log:            log,
+		}),
 	}
 
 	testCases := []struct {
@@ -363,11 +894,11 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 	}{
 		{
 			name: "Default async when wait not set",
-			url:  webhookPath,
+			url:  restserver.WebhookPath,
 		},
 		{
 			name: "Synchronous when wait=true",
-			url:  webhookPath + "?wait=true",
+			url:  restserver.WebhookPath + "?wait=true",
 		},
 	}
 
@@ -381,14 +912,40 @@ func TestWebhookHandler_WaitQueryParam(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			h.testName = test.ConvertTestName(t.Name())
+			// Copy the shared handler so parallel subtests do not race on testName.
+			handler := h
+			handler.testName = test.ConvertTestName(t.Name())
 
 			rr := httptest.NewRecorder()
-			h.WebhookHandler(rr, req)
+			handler.WebhookHandler(rr, req)
 
 			if rr.Code == 0 {
 				t.Fatalf("expected recorder to have a status code")
 			}
 		})
 	}
+}
+
+// waitForSwarmService waits until a swarm service exists (and optionally has published ports).
+func waitForSwarmService(ctx context.Context, t *testing.T, cli client.APIClient, serviceName string, timeout time.Duration) (swarmTypes.Service, error) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+
+	var lastErr error
+
+	for time.Now().Before(deadline) {
+		result, err := cli.ServiceInspect(ctx, serviceName, client.ServiceInspectOptions{
+			InsertDefaults: true,
+		})
+		if err == nil {
+			return result.Service, nil
+		}
+
+		lastErr = err
+
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return swarmTypes.Service{}, fmt.Errorf("timed out waiting for service %s after %s: %w", serviceName, timeout.String(), lastErr)
 }

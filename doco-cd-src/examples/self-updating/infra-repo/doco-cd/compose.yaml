@@ -1,0 +1,48 @@
+services:
+  doco-cd:
+    # Pin by tag + digest and let Renovate open the bump PR.
+    # A moving tag like "latest" turns every restart into an unreviewed upgrade.
+    image: ghcr.io/kimdre/doco-cd:0.125.1@sha256:38198abbda1b55da7a7f37a7924b2ccdcc0583bd24466b7c2103ef6cd2ffc828
+    restart: unless-stopped
+
+    # No container_name or host ports lets auto use scale_out for a
+    # zero-downtime handover. If either is required, auto uses applier instead.
+    # Reach the API through a reverse proxy on this network.
+
+    environment:
+      TZ: Europe/Berlin
+      SELF_UPDATE_ENABLED: "true"
+      SELF_UPDATE_STRATEGY: auto
+      POLL_CONFIG: |
+        - url: https://github.com/example/infra.git
+          reference: main
+          interval: 300
+      # Private repository: uncomment these two lines, the "secrets" lines below
+      # and the top-level "secrets" block. See the Getting Started guide.
+      # GIT_AUTH_DOMAINS lists the hosts that receive the token.
+      # GIT_ACCESS_TOKEN_FILE: /run/secrets/git_access_token
+      # GIT_AUTH_DOMAINS: "- domains: [github.com]"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - data:/data
+
+    # The health gate decides whether the new version is kept. Without a
+    # healthcheck doco-cd falls back to running `doco-cd healthcheck` inside
+    # the new container, which is slower and less precise.
+    healthcheck: # runs the image's built-in /healthcheck command
+      interval: 10s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    # secrets:
+    #   - git_access_token
+
+volumes:
+  data:
+
+# Path of the token file.
+# secrets:
+#   git_access_token:
+#     file: /opt/doco-cd/git-access-token

@@ -4,7 +4,39 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 )
+
+// Outcome distinguishes lifecycle events that legacy commit statuses conflate.
+type Outcome string
+
+const (
+	OutcomeQueued     Outcome = "queued"
+	OutcomeInProgress Outcome = "in_progress"
+	OutcomeDeferred   Outcome = "deferred"
+	OutcomeSkipped    Outcome = "skipped"
+	OutcomeTimedOut   Outcome = "timed_out"
+)
+
+// Backend selects the provider API used to publish a reporting attempt.
+type Backend string
+
+const (
+	// BackendStatus uses legacy commit statuses, supported by all providers.
+	BackendStatus Backend = "status"
+	// BackendChecks uses GitHub Checks, which support native queued, skipped, and timed-out results.
+	BackendChecks Backend = "checks"
+)
+
+// Target identifies a reporting attempt without storing its credentials.
+type Target struct {
+	Backend    Backend   `json:"backend"`
+	ExternalID string    `json:"external_id,omitempty"`
+	CheckRunID int64     `json:"check_run_id,omitempty"`
+	AppID      string    `json:"app_id,omitempty"`
+	Scope      string    `json:"scope,omitempty"`
+	StartedAt  time.Time `json:"started_at,omitzero"`
+}
 
 // State represents the commit status state sent to the Git provider.
 type State string
@@ -32,6 +64,11 @@ func ContextForStack(target, stack string) string {
 	}
 
 	return BaseContext + "/" + stack
+}
+
+// ContextForRun keeps the configuration target in reports without a stack name.
+func ContextForRun(target string) string {
+	return ContextForStack(target, "deploy")
 }
 
 // Provider identifies which SCM API to use when posting a commit status.
@@ -75,11 +112,18 @@ func ParseProvider(s string) (Provider, error) {
 // Status holds the information to post as a commit status.
 type Status struct {
 	State       State
+	Outcome     Outcome
 	Description string
+	// Summary optionally explains the status in Markdown. Only GitHub check
+	// runs show it, other providers only show the description.
+	Summary string
 	// Context is the label shown in the Git UI (e.g. "doco-cd/demo").
 	// Defaults to BaseContext when empty.
 	Context   string
 	TargetURL string // optional link to deployment logs
+	// Phase is the current phase of a running deployment, e.g. "pulling
+	// images". GitHub check runs show it in their title.
+	Phase string
 }
 
 // Post posts a commit status to the appropriate Git provider.

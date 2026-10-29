@@ -17,42 +17,42 @@ import (
 	"github.com/kimdre/doco-cd/internal/git"
 )
 
-type level int
+type Level int
 
 const (
-	Info    level = iota // Informational messages
+	Info    Level = iota // Informational messages
 	Success              // Successful operations
 	Warning              // Warning messages indicating potential issues
 	Failure              // Error messages indicating failure of operations
 )
 
-var logLevels = map[level]string{
+var logLevels = map[Level]string{
 	Info:    "info",
 	Success: "success",
 	Warning: "warning",
 	Failure: "failure",
 }
 
-var levelEmojis = map[level]string{
+var levelEmojis = map[Level]string{
 	Info:    "ℹ️",
 	Success: "✅",
 	Warning: "⚠️",
 	Failure: "❌",
 }
 
-var (
-	appriseConfigMu    sync.RWMutex
-	appriseApiURL      = ""
-	appriseNotifyUrls  = ""
-	appriseNotifyLevel = Info
-	appriseTemplate    *template.Template // template rendering the notification body; defaults to defaultTemplate
-)
-
 const (
 	maxAppriseErrorResponseBodyBytes = 4 * 1024
 	redactedURL                      = "[REDACTED_URL]"
 	redactedValue                    = "[REDACTED]"
+
+	// appriseRequestTimeout bounds one request to Apprise, which answers only after
+	// delivering to every notify URL. Notifications are sent from the deployment
+	// path, so an unresponsive Apprise server would otherwise stall it for good.
+	appriseRequestTimeout = 30 * time.Second
 )
+
+// appriseClient sends the requests to Apprise.
+var appriseClient = &http.Client{Timeout: appriseRequestTimeout}
 
 var urlLikePattern = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s,"]+`)
 
@@ -64,6 +64,10 @@ var defaultTemplate = template.Must(template.New("notification").Parse("{{ .Defa
 
 // ErrNotifyFailed is returned when the Apprise request fails due to invalid notify URLs or unreachable service.
 var ErrNotifyFailed = errors.New("request to apprise failed")
+
+// ErrNotifyPartial is returned when Apprise delivered to at least one configured
+// destination but another destination failed.
+var ErrNotifyPartial = fmt.Errorf("%w: partial delivery", ErrNotifyFailed)
 
 // ErrInvalidTemplate is returned when the configured notification body template fails to parse or execute.
 var ErrInvalidTemplate = errors.New("invalid notification template")
@@ -77,20 +81,90 @@ type appriseRequest struct {
 }
 
 type Metadata struct {
-	Repository          string
-	Stack               string
-	Context             string // Docker context the stack is deployed to (empty = default context)
-	Target              string // Custom webhook/poll target suffix (e.g., "prod-vm" for .doco-cd.prod-vm.yml)
-	Revision            string
-	JobID               string
-	TraceID             string
-	ReconciliationEvent string
-	AffectedActorKind   string
-	AffectedActorID     string
-	AffectedActorName   string
-	Commits             []git.CommitInfo // commits deployed since the last deploy; empty on first deploy/failure/OCI
-	Duration            time.Duration    // time from job start to the notification; zero when no deploy/destroy ran
-	ChangedServices     []string         // services force-recreated by this deploy or with image digest drift; empty when the whole stack is (re)deployed
+	Repository               string
+	Stack                    string
+	Context                  string // Docker context the stack is deployed to (empty = default context)
+	Target                   string // Custom webhook/poll target suffix (e.g., "prod-vm" for .doco-cd.prod-vm.yml)
+	Revision                 string
+	JobID                    string
+	TraceID                  string
+	ReconciliationEvent      string
+	AffectedActorKind        string
+	AffectedActorID          string
+	AffectedActorName        string
+	Commits                  []git.CommitInfo // commits deployed since the last deploy; empty on first deploy/failure/OCI
+	Duration                 time.Duration    // time from job start to the notification; zero when no deploy/destroy ran
+	ChangedServices          []string         // services force-recreated by this deploy, or whose image moved; empty on the first deployment of a stack
+	DeploymentTargetObserver func(stack, context string)
+}
+
+// Config defines the immutable Apprise settings and failure-repeat behavior of a Notifier.
+type Config struct {
+	APIURL                string
+	NotifyURLs            string
+	NotifyLevel           string
+	BodyTemplate          string
+	FailureRepeatInterval time.Duration
+}
+
+// Sender is the notification capability consumed by application services.
+type Sender interface {
+	Send(level Level, title, message string, metadata Metadata, opts ...SendOption) error
+}
+
+// LevelEnabler is implemented by senders that can tell, before a notification is
+// built, whether a notification of a level would be delivered at all.
+type LevelEnabler interface {
+	Enabled(level Level) bool
+}
+
+// WouldSend reports whether sender delivers notifications of level. Building a
+// notification can need repository reads (short SHA, changelog), which callers
+// skip when nothing would be delivered. Senders that cannot tell are assumed to
+// deliver every level.
+func WouldSend(sender Sender, level Level) bool {
+	if sender == nil {
+		return false
+	}
+
+	if enabler, ok := sender.(LevelEnabler); ok {
+		return enabler.Enabled(level)
+	}
+
+	return true
+}
+
+// Notifier owns notification configuration and repeat-failure state.
+type Notifier struct {
+	apiURL       string
+	notifyURLs   string
+	notifyLevel  Level
+	bodyTemplate *template.Template
+
+	failureMu             sync.Mutex
+	lastFailures          map[string]failureRecord
+	failureRepeatInterval time.Duration
+}
+
+// New constructs an instance-owned notifier and validates its body template.
+func New(config Config) (*Notifier, error) {
+	bodyTemplate, err := validateTemplate(config.BodyTemplate)
+	if err != nil {
+		return nil, err
+	}
+
+	if bodyTemplate == nil {
+		bodyTemplate = defaultTemplate
+	}
+
+	return &Notifier{
+		apiURL:                config.APIURL,
+		notifyURLs:            config.NotifyURLs,
+		notifyLevel:           parseLevel(config.NotifyLevel),
+		bodyTemplate:          bodyTemplate,
+		lastFailures:          make(map[string]failureRecord),
+		failureRepeatInterval: config.FailureRepeatInterval,
+	}, nil
 }
 
 // TemplateData is the data exposed to a user-configured notification body template.
@@ -122,15 +196,13 @@ func validateTemplate(tmpl string) (*template.Template, error) {
 	sample := TemplateData{
 		Level: logLevels[Success], Emoji: levelEmojis[Success],
 		Title: "Deployment completed", Message: "sample",
-		Metadata: Metadata{
-			Repository: "github.com/acme/app", Stack: "app", Context: "default",
-			Revision: "refs/heads/main (abc123)", JobID: "sample",
-			Commits: []git.CommitInfo{
-				{Hash: "abc123", ShortHash: "abc123", Subject: "sample commit", Author: "Jane Doe"},
-			},
-			Duration:        42 * time.Second,
-			ChangedServices: []string{"app"},
+		Repository: "github.com/acme/app", Stack: "app", Context: "default",
+		Revision: "refs/heads/main (abc123)", JobID: "sample",
+		Commits: []git.CommitInfo{
+			{Hash: "abc123", ShortHash: "abc123", Subject: "sample commit", Author: "Jane Doe"},
 		},
+		Duration:        42 * time.Second,
+		ChangedServices: []string{"app"},
 	}
 	if err := t.Execute(io.Discard, sample); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidTemplate, err)
@@ -140,7 +212,7 @@ func validateTemplate(tmpl string) (*template.Template, error) {
 }
 
 // parseLevel converts a string representation of a log level to the level type.
-func parseLevel(level string) level {
+func parseLevel(level string) Level {
 	switch level {
 	case logLevels[Info]:
 		return Info
@@ -157,6 +229,11 @@ func parseLevel(level string) level {
 
 // send a notification to the Apprise service.
 func send(apiUrl, notifyUrls, title, message, level string) error {
+	return sendWithClient(appriseClient, apiUrl, notifyUrls, title, message, level)
+}
+
+// sendWithClient sends a notification to the Apprise service with client.
+func sendWithClient(client *http.Client, apiUrl, notifyUrls, title, message, level string) error {
 	jsonData, err := json.Marshal(appriseRequest{
 		NotifyUrls: notifyUrls,
 		Title:      title,
@@ -167,7 +244,7 @@ func send(apiUrl, notifyUrls, title, message, level string) error {
 		return fmt.Errorf("failed to marshal appriseRequest: %w", err)
 	}
 
-	resp, err := http.Post(apiUrl, "application/json", bytes.NewBuffer(jsonData)) // #nosec G107
+	resp, err := client.Post(apiUrl, "application/json", bytes.NewBuffer(jsonData)) // #nosec G107
 	if err != nil {
 		if strings.Contains(err.Error(), "malformed HTTP status code") {
 			return ErrNotifyFailed
@@ -187,7 +264,7 @@ func send(apiUrl, notifyUrls, title, message, level string) error {
 	case http.StatusNoContent:
 		return nil
 	case http.StatusFailedDependency:
-		return fmt.Errorf("%w: apprise request failed with status: %s%s", ErrNotifyFailed, resp.Status, appriseResponseErrorDetails(resp))
+		return fmt.Errorf("%w: apprise request failed with status: %s%s", ErrNotifyPartial, resp.Status, appriseResponseErrorDetails(resp))
 	default:
 		return fmt.Errorf("apprise request failed with status: %s%s", resp.Status, appriseResponseErrorDetails(resp))
 	}
@@ -368,38 +445,6 @@ func redactSensitiveText(s string) string {
 	return strings.Join(strings.Fields(redacted), " ")
 }
 
-// SetAppriseConfig sets the configuration for the Apprise notification service.
-// bodyTemplate is an optional Go text/template rendering the notification body;
-// an empty string keeps the built-in format (defaultTemplate). An invalid
-// template is rejected.
-func SetAppriseConfig(apiURL, notifyUrls, notifyLevel, bodyTemplate string) error {
-	t, err := validateTemplate(bodyTemplate)
-	if err != nil {
-		return err
-	}
-
-	if t == nil {
-		t = defaultTemplate
-	}
-
-	appriseConfigMu.Lock()
-	defer appriseConfigMu.Unlock()
-
-	appriseApiURL = apiURL
-	appriseNotifyUrls = notifyUrls
-	appriseNotifyLevel = parseLevel(notifyLevel)
-	appriseTemplate = t
-
-	return nil
-}
-
-func getAppriseConfig() (string, string, level, *template.Template) {
-	appriseConfigMu.RLock()
-	defer appriseConfigMu.RUnlock()
-
-	return appriseApiURL, appriseNotifyUrls, appriseNotifyLevel, appriseTemplate
-}
-
 // SendOption customizes how a notification is rendered/sent.
 type SendOption func(*sendOptions)
 
@@ -417,11 +462,21 @@ func WithoutBodyTemplate() SendOption {
 	}
 }
 
-// Send sends a notification using the Apprise service based on the provided configuration and parameters.
-func Send(level level, title, message string, metadata Metadata, opts ...SendOption) error {
-	apiURL, notifyURLs, notifyLevel, bodyTemplate := getAppriseConfig()
+// configured reports whether notifications are set up at all.
+func (n *Notifier) configured() bool {
+	return n != nil && n.apiURL != "" && n.notifyURLs != ""
+}
 
-	if apiURL == "" || notifyURLs == "" {
+// Enabled reports whether Send delivers notifications of level: notifications are
+// configured and level is at or above the configured notify level. Send may still
+// suppress an unchanged repeat of a failure that was already reported.
+func (n *Notifier) Enabled(level Level) bool {
+	return n.configured() && level >= n.notifyLevel
+}
+
+// Send sends a notification using this notifier's Apprise configuration.
+func (n *Notifier) Send(level Level, title, message string, metadata Metadata, opts ...SendOption) error {
+	if !n.configured() {
 		return nil
 	}
 
@@ -429,16 +484,28 @@ func Send(level level, title, message string, metadata Metadata, opts ...SendOpt
 	// next failure of that stack is sent even if it repeats an older one. Done
 	// before the level check, so a configured level cannot leave stale state.
 	if level == Success {
-		clearFailure(failureKey(metadata))
+		n.clearFailure(failureKey(metadata))
 	}
 
-	if level < notifyLevel {
+	if level < n.notifyLevel {
 		return nil // Do not send notification if the level is lower than the configured level
 	}
 
-	// Suppress a failure that is already reported and unchanged, see failure_repeat.go.
-	if level == Failure && !shouldSendFailure(failureKey(metadata), failureFingerprint(title, message), time.Now()) {
-		return nil
+	var (
+		failureID     string
+		failureHash   string
+		failureSentAt time.Time
+	)
+
+	if level == Failure {
+		failureID = failureKey(metadata)
+		failureHash = failureFingerprint(title, message)
+		failureSentAt = time.Now()
+
+		// Suppress a failure that is already reported and unchanged, see failure_repeat.go.
+		if !n.shouldSendFailure(failureID, failureHash, failureSentAt) {
+			return nil
+		}
 	}
 
 	var o sendOptions
@@ -446,6 +513,7 @@ func Send(level level, title, message string, metadata Metadata, opts ...SendOpt
 		opt(&o)
 	}
 
+	bodyTemplate := n.bodyTemplate
 	if o.skipBodyTemplate {
 		bodyTemplate = nil // renderTemplate falls back to the built-in default body
 	}
@@ -454,15 +522,19 @@ func Send(level level, title, message string, metadata Metadata, opts ...SendOpt
 
 	title = formatTitle(level, title, metadata)
 
-	err := send(apiURL, notifyURLs, title, message, logLevels[level])
+	err := send(n.apiURL, n.notifyURLs, title, message, logLevels[level])
 	if err != nil {
+		if level == Failure && !errors.Is(err, ErrNotifyPartial) {
+			n.clearUnsentFailure(failureID, failureHash, failureSentAt)
+		}
+
 		return fmt.Errorf("failed to send notification: %w", err)
 	}
 
 	return nil
 }
 
-func formatTitle(level level, title string, metadata Metadata) string {
+func formatTitle(level Level, title string, metadata Metadata) string {
 	formattedTitle := strings.TrimSpace(title)
 
 	if strings.TrimSpace(metadata.ReconciliationEvent) != "" {
@@ -493,6 +565,15 @@ func (d TemplateData) DefaultBody() string {
 
 	if m.Stack != "" {
 		fields["stack"] = m.Stack
+
+		contextName := strings.TrimSpace(m.Context)
+		if contextName == "" {
+			contextName = "default"
+		}
+
+		fields["context"] = contextName
+	} else if strings.TrimSpace(m.Context) != "" {
+		fields["context"] = strings.TrimSpace(m.Context)
 	}
 
 	if m.Revision != "" {
@@ -584,7 +665,7 @@ func (d TemplateData) DefaultBody() string {
 // (defaultTemplate when t is nil). On execution failure it falls back to the
 // built-in body so an alert is never dropped because of a template mistake
 // (config-time validation catches most).
-func renderTemplate(t *template.Template, level level, title, message string, m Metadata) string {
+func renderTemplate(t *template.Template, level Level, title, message string, m Metadata) string {
 	if t == nil {
 		t = defaultTemplate
 	}

@@ -16,7 +16,7 @@ import (
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/poll"
 	"github.com/kimdre/doco-cd/internal/git"
-	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/syncwindow"
 )
 
 const Name = "doco-cd" // Name of the application
@@ -24,6 +24,8 @@ const Name = "doco-cd" // Name of the application
 var (
 	Version            = "dev" // Version of the application, to be set during build time
 	ErrInvalidLogLevel = validation.TextError{Err: errors.New("invalid log level, must be one of debug, info, warn, error")}
+	// ErrUnscopedGitCredential is returned when a global HTTP(S) Git credential has no GIT_AUTH_DOMAINS scope.
+	ErrUnscopedGitCredential = errors.New("global Git HTTP(S) credentials must be scoped with GIT_AUTH_DOMAINS")
 )
 
 // Config is used to configure this application
@@ -48,9 +50,9 @@ type Config struct {
 	SourceURLRewrites             map[string]string      `yaml:"-"`                                                                                              // SourceURLRewrites holds normalized source URL rewrite rules used by webhook and poll git sources.
 	GitAccessToken                string                 `env:"GIT_ACCESS_TOKEN"`                                                                                // GitAccessToken is the access token used to authenticate with the Git server (e.g. GitHub) for private repositories
 	GitAccessTokenUser            string                 `env:"GIT_ACCESS_TOKEN_USER,notEmpty" envDefault:"oauth2"`                                              // GitAccessTokenUser is the username paired with GitAccessToken for HTTP(S) clone/fetch. Needed by providers whose tokens have a fixed username (e.g. GitLab deploy tokens). Defaults to oauth2.
-	GitCommitStatus               bool                   `env:"GIT_COMMIT_STATUS,notEmpty" envDefault:"false"`                                                   // GitCommitStatus controls whether doco-cd reports deployment outcomes as commit statuses to the source Git provider (requires GIT_ACCESS_TOKEN, or a configured GitHub App with "Commit statuses: Read and write" permission)
+	GitCommitStatus               bool                   `env:"GIT_COMMIT_STATUS,notEmpty" envDefault:"false"`                                                   // GitCommitStatus enables deployment reporting: resolved GitHub App installation auth uses check runs with "Checks: Read and write"; token-only GitHub auth and other providers use commit statuses with status-write permission.
 	GitScmProvider                string                 `env:"GIT_SCM_PROVIDER,notEmpty" envDefault:"auto"`                                                     // GitScmProvider overrides automatic SCM provider detection for commit statuses. Valid values: auto, github, gitlab, gitea, azuredevops (forgejo is accepted as an alias for gitea). Useful for self-hosted instances whose hostname does not reveal the product (e.g. git.mycompany.com running GitLab).
-	GitScmApiUrl                  config.HttpUrl         `env:"GIT_SCM_API_URL" validate:"httpUrl"`                                                              // GitScmApiUrl overrides the inferred SCM API base URL for commit status calls (e.g. https://git.example.com).
+	GitScmApiUrl                  config.HttpUrl         `env:"GIT_SCM_API_URL" validate:"httpUrl"`                                                              // GitScmApiUrl overrides the inferred SCM API base URL for commit status and native GitHub Checks calls (e.g. https://git.example.com).
 	GitAccessTokenFile            string                 `env:"GIT_ACCESS_TOKEN_FILE,file"`                                                                      // GitAccessTokenFile is the file containing the GitAccessToken
 	GitHubAppID                   string                 `env:"GITHUB_APP_ID"`                                                                                   // GitHubAppID is the GitHub App identifier used to mint installation access tokens
 	GitHubAppIDFile               string                 `env:"GITHUB_APP_ID_FILE,file"`                                                                         // GitHubAppIDFile is the file containing the GitHub App identifier
@@ -60,15 +62,20 @@ type Config struct {
 	GitAuthDomainsYAML            string                 `env:"GIT_AUTH_DOMAINS"`                                                                                // GitAuthDomainsYAML is the YAML configuration for domain-scoped Git credentials
 	GitAuthDomainsFile            string                 `env:"GIT_AUTH_DOMAINS_FILE,file"`                                                                      // GitAuthDomainsFile is the file containing the YAML configuration for domain-scoped Git credentials
 	GitAuthDomains                []git.ScopedAuthConfig `yaml:"-"`                                                                                              // GitAuthDomains holds parsed domain-scoped Git credentials
+	GitAuthAllowAnyHost           bool                   `env:"GIT_AUTH_ALLOW_ANY_HOST,notEmpty" envDefault:"false"`                                             // GitAuthAllowAnyHost sends global HTTP(S) Git credentials to all hosts without a GIT_AUTH_DOMAINS match. Insecure.
 	GitCloneDepth                 int                    `env:"GIT_CLONE_DEPTH,notEmpty" envDefault:"0" validate:"min=0"`                                        // GitCloneDepth limits the number of commits to fetch. 0 means full clone (no depth limit). A positive value enables shallow clones.
 	GitCloneSubmodules            bool                   `env:"GIT_CLONE_SUBMODULES,notEmpty" envDefault:"true"`                                                 // GitCloneSubmodules controls whether git submodules are cloned
 	SSHPrivateKey                 string                 `env:"SSH_PRIVATE_KEY"`                                                                                 // SSHPrivateKey is the SSH private key used for SSH authentication with Git repositories
 	SSHPrivateKeyFile             string                 `env:"SSH_PRIVATE_KEY_FILE,file"`                                                                       // SSHPrivateKeyFile is the file containing the SSHPrivateKey
 	SSHPrivateKeyPassphrase       string                 `env:"SSH_PRIVATE_KEY_PASSPHRASE"`                                                                      // SSHPrivateKeyPassphrase is the passphrase for the SSH private key, if applicable
 	SSHPrivateKeyPassphraseFile   string                 `env:"SSH_PRIVATE_KEY_PASSPHRASE_FILE,file"`                                                            // SSHPrivateKeyPassphraseFile is the file containing the SSHPrivateKeyPassphrase
+	SSHKnownHostsFile             string                 `env:"SSH_KNOWN_HOSTS_FILE"`                                                                            // SSHKnownHostsFile is an operator-managed known_hosts file used to verify Git SSH hosts.
 	SkipTLSVerification           bool                   `env:"SKIP_TLS_VERIFICATION,notEmpty" envDefault:"false"`                                               // SkipTLSVerification skips the TLS verification when cloning repositories.
 	DockerQuietDeploy             bool                   `env:"DOCKER_QUIET_DEPLOY,notEmpty" envDefault:"true"`                                                  // DockerQuietDeploy suppresses the status output of dockerCli in deployments (e.g. pull, create, start)
+	VersionCheckEnabled           bool                   `env:"VERSION_CHECK_ENABLED,notEmpty" envDefault:"true"`                                                // VersionCheckEnabled controls the startup release lookup and new-version announcement.
 	SchedulerEnabled              bool                   `env:"SCHEDULER_ENABLED,notEmpty" envDefault:"true"`                                                    // SchedulerEnabled controls whether the built-in scheduled job runner is started in this doco-cd instance
+	McpEnabled                    bool                   `env:"MCP_ENABLED,notEmpty" envDefault:"false"`                                                         // McpEnabled enables the built-in MCP server and requires API_SECRET.
+	OpenAPIEnabled                bool                   `env:"OPENAPI_ENABLED,notEmpty" envDefault:"false"`                                                     // OpenAPIEnabled exposes the runtime OpenAPI document and Swagger UI.
 	DockerSwarmFeatures           bool                   `env:"DOCKER_SWARM_FEATURES,notEmpty" envDefault:"true"`                                                // DockerSwarmFeatures enables the usage Docker Swarm features in the application if it has detected that it is running in a Docker Swarm environment
 	DockerSwarmConfigRetention    int                    `env:"DOCKER_SWARM_CONFIG_RETENTION,notEmpty" envDefault:"0" validate:"min=-1"`                         // DockerSwarmConfigRetention is the global default number of old Swarm config revisions to keep per resource (excluding the active one). -1 disables automatic pruning.
 	DockerSwarmSecretRetention    int                    `env:"DOCKER_SWARM_SECRET_RETENTION,notEmpty" envDefault:"0" validate:"min=-1"`                         // DockerSwarmSecretRetention is the global default number of old Swarm secret revisions to keep per resource (excluding the active one). -1 disables automatic pruning.
@@ -76,11 +83,18 @@ type Config struct {
 	DataHostPath                  string                 `env:"DATA_HOST_PATH"`                                                                                  // DataHostPath is the optional Docker daemon host path backing DataMountPath.
 	DeployConfigBaseDir           string                 `env:"DEPLOY_CONFIG_BASE_DIR" envDefault:"/"`                                                           // DeployConfigBaseDir is the base directory (relative to the repository root) where deployment configuration files will be searched for.
 	PassEnv                       bool                   `env:"PASS_ENV"`                                                                                        // PassEnv controls whether environment variables from the doco-cd container should be passed to the deployment environment for docker compose variable interpolation. Use with caution, as this may expose sensitive information to the deployment environment.
+	InterpolateExternalSecrets    bool                   `env:"INTERPOLATE_EXTERNAL_SECRETS"`                                                                    // InterpolateExternalSecrets enables Compose-style interpolation in legacy external secret references using the doco-cd process environment.
+	InterpolateResolvedSecrets    bool                   `env:"INTERPOLATE_RESOLVED_SECRETS"`                                                                    // InterpolateResolvedSecrets enables Compose-style interpolation of one resolved external secret's value referencing another (e.g. DB_URL containing ${DB_PASSWORD}). Only other external secrets are consulted; the doco-cd process environment is never used for this lookup.
 	PollConfigYAML                string                 `env:"POLL_CONFIG"`                                                                                     // PollConfigYAML is the unparsed string containing the PollConfig in YAML format
 	PollConfigFile                string                 `env:"POLL_CONFIG_FILE,file"`                                                                           // PollConfigFile is the file containing the PollConfig in YAML format
 	PollConfig                    []poll.Config          `yaml:"-"`                                                                                              // PollConfig is the YAML configuration for polling Git repositories for changes
-	MaxPayloadSize                int64                  `env:"MAX_PAYLOAD_SIZE,notEmpty" envDefault:"1048576"`                                                  // MaxPayloadSize is the maximum size of the payload in bytes that the HTTP server will accept (default 1MB = 1048576 bytes)
+	SyncWindowsYAML               string                 `env:"SYNC_WINDOWS"`                                                                                    // SyncWindowsYAML is the unparsed YAML list of sync windows that restrict when deployments may change stacks
+	SyncWindowsFile               string                 `env:"SYNC_WINDOWS_FILE,file"`                                                                          // SyncWindowsFile is the file containing the sync windows in YAML format
+	SyncWindows                   *syncwindow.Policy     `yaml:"-"`                                                                                              // SyncWindows is the parsed sync window policy. It is never nil after GetConfig.
+	MaxPayloadSize                int64                  `env:"MAX_PAYLOAD_SIZE,notEmpty" envDefault:"1048576" validate:"min=1"`                                 // MaxPayloadSize is the maximum size of the payload in bytes that the HTTP server will accept (default 1MB = 1048576 bytes)
 	MetricsPort                   uint16                 `env:"METRICS_PORT,notEmpty" envDefault:"9120" validate:"min=1,max=65535"`                              // MetricsPort is the port the prometheus metrics server will listen on
+	PprofEnabled                  bool                   `env:"PPROF_ENABLED,notEmpty" envDefault:"false"`                                                       // PprofEnabled enables the loopback-only Go runtime profiling server.
+	PprofPort                     uint16                 `env:"PPROF_PORT,notEmpty" envDefault:"6060" validate:"min=1,max=65535"`                                // PprofPort is the loopback port used by the Go runtime profiling server.
 	AppriseApiURL                 config.HttpUrl         `env:"APPRISE_API_URL" validate:"httpUrl"`                                                              // AppriseApiURL is the URL of the Apprise notification service
 	AppriseNotifyUrls             string                 `env:"APPRISE_NOTIFY_URLS"`                                                                             // AppriseNotifyUrls is a comma-separated list of URLs to notify via the Apprise notification service
 	AppriseNotifyUrlsFile         string                 `env:"APPRISE_NOTIFY_URLS_FILE,file"`                                                                   // AppriseNotifyUrlsFile is the file containing the AppriseNotifyUrls
@@ -91,6 +105,7 @@ type Config struct {
 	SecretProvider                string                 `env:"SECRET_PROVIDER"`                                                                                 // SecretProvider is the secret provider/manager to use for retrieving secrets (e.g. bitwarden secrets manager)
 	MaxDeploymentLoopCount        uint                   `env:"MAX_DEPLOYMENT_LOOP_COUNT,notEmpty" envDefault:"2" validate:"min=0"`                              // Maximum allowed deployment loops before a forced deployment is triggered
 	MaxConcurrentDeployments      uint                   `env:"MAX_CONCURRENT_DEPLOYMENTS,notEmpty" envDefault:"4" validate:"min=1"`                             // Maximum number of concurrent deployments allowed
+	MaxConcurrentPreDeployments   uint                   `env:"MAX_CONCURRENT_PREDEPLOYMENTS,notEmpty" envDefault:"8" validate:"min=1"`                          // Maximum number of concurrent pre-deployment (initialization and change detection) operations allowed
 	OciVerifyMaxWorkers           uint                   `env:"OCI_VERIFY_MAX_WORKERS,notEmpty" envDefault:"1" validate:"min=1,max=10"`                          // Maximum number of workers used per OCI signature verification (clamped to 10)
 	OciTrustPolicyYAML            string                 `env:"OCI_TRUST_POLICY"`                                                                                // OciTrustPolicyYAML contains the app-level OCI signature trust policy as YAML
 	OciTrustPolicyFile            string                 `env:"OCI_TRUST_POLICY_FILE,file"`                                                                      // OciTrustPolicyFile is the file containing OCI trust policy YAML
@@ -100,6 +115,15 @@ type Config struct {
 	CertRotationEnabled           bool                   `env:"CERT_ROTATION_ENABLED,notEmpty" envDefault:"false"`                                               // CertRotationEnabled enables the built-in watcher that automatically rotates certificates issued through rotation-capable external secret providers (e.g. OpenBao PKI roles)
 	CertRotationThreshold         time.Duration          `env:"CERT_ROTATION_THRESHOLD,notEmpty" envDefault:"72h" validate:"min=1"`                              // CertRotationThreshold is how far ahead of a certificate's expiry doco-cd triggers a rotation
 	CertRotationCheckInterval     time.Duration          `env:"CERT_ROTATION_CHECK_INTERVAL,notEmpty" envDefault:"1h" validate:"min=1"`                          // CertRotationCheckInterval is how often the certificate rotation watcher checks deployed certificates for upcoming expiry
+	ArtifactGCEnabled             bool                   `env:"ARTIFACT_GC_ENABLED,notEmpty" envDefault:"true"`                                                  // ArtifactGCEnabled enables the built-in sweeper that removes old, unreferenced published source artifacts (Git revisions/OCI digests) to reclaim disk space and limit how long decrypted SOPS secrets linger on disk
+	ArtifactGCRetentionRecords    int                    `env:"ARTIFACT_GC_RETENTION_RECORDS,notEmpty" envDefault:"2" validate:"min=0"`                          // ArtifactGCRetentionRecords is the number of most-recent unreferenced artifacts kept per repository/artifact, regardless of ArtifactGCRetentionTTL
+	ArtifactGCRetentionTTL        time.Duration          `env:"ARTIFACT_GC_RETENTION_TTL,notEmpty" envDefault:"1m" validate:"min=0"`                             // ArtifactGCRetentionTTL is how long an unreferenced artifact beyond ArtifactGCRetentionRecords is kept before it becomes eligible for removal
+	ArtifactGCInterval            time.Duration          `env:"ARTIFACT_GC_INTERVAL,notEmpty" envDefault:"10m" validate:"min=1"`                                 // ArtifactGCInterval is how often the artifact garbage collector sweeps for removable artifacts (it also always sweeps once at startup)
+	SourceGCEnabled               bool                   `env:"SOURCE_GC_ENABLED,notEmpty" envDefault:"false"`                                                   // SourceGCEnabled enables the built-in sweeper that evicts the Git mirrors, submodule mirrors and published artifacts of source stores that have not been used for longer than SourceGCRetentionTTL and are not referenced by any container, service or task
+	SourceGCRetentionTTL          time.Duration          `env:"SOURCE_GC_RETENTION_TTL,notEmpty" envDefault:"168h" validate:"min=1h"`                            // SourceGCRetentionTTL is how long a source store must have been unused before its caches become eligible for eviction. It must be longer than the longest poll interval, or polled sources are refetched from scratch
+	SourceGCInterval              time.Duration          `env:"SOURCE_GC_INTERVAL,notEmpty" envDefault:"1h" validate:"min=1m"`                                   // SourceGCInterval is how often the source garbage collector looks for evictable source stores (the first eviction pass runs one interval after startup)
+	SelfUpdateEnabled             bool                   `env:"SELF_UPDATE_ENABLED,notEmpty" envDefault:"false"`                                                 // SelfUpdateEnabled lets doco-cd deploy the stack that contains its own container. Without it such a deployment is refused instead of killing this process mid-deploy.
+	SelfUpdateStrategy            string                 `env:"SELF_UPDATE_STRATEGY,notEmpty" envDefault:"auto" validate:"oneof=auto scale_out applier"`         // SelfUpdateStrategy is how doco-cd replaces its own container: scale_out starts a second container and hands over, applier delegates to a throwaway clone, auto picks scale_out unless the compose file rules it out
 }
 
 // GetConfig returns the app Config.
@@ -126,9 +150,18 @@ func GetConfig() (*Config, error) {
 		return nil, fmt.Errorf("%w: %w", config.ErrParseConfigFailed, err)
 	}
 
+	if cfg.McpEnabled && cfg.ApiSecret == "" {
+		return nil, errors.New("MCP_ENABLED requires API_SECRET")
+	}
+
 	err = cfg.parsePollConfig()
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse poll config: %w", err)
+	}
+
+	err = cfg.parseSyncWindows()
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse sync windows: %w", err)
 	}
 
 	err = cfg.parseGitAuthDomains()
@@ -184,6 +217,16 @@ func GetConfig() (*Config, error) {
 		return nil, fmt.Errorf("HTTP_PORT and METRICS_PORT cannot be the same port number: %d", cfg.HttpPort)
 	}
 
+	if cfg.PprofEnabled {
+		if cfg.PprofPort == cfg.HttpPort {
+			return nil, fmt.Errorf("PPROF_PORT and HTTP_PORT cannot be the same port number: %d", cfg.PprofPort)
+		}
+
+		if cfg.PprofPort == cfg.MetricsPort {
+			return nil, fmt.Errorf("PPROF_PORT and METRICS_PORT cannot be the same port number: %d", cfg.PprofPort)
+		}
+	}
+
 	cfg.HttpTLSCertFile = strings.TrimSpace(cfg.HttpTLSCertFile)
 	cfg.HttpTLSKeyFile = strings.TrimSpace(cfg.HttpTLSKeyFile)
 
@@ -220,18 +263,6 @@ func GetConfig() (*Config, error) {
 		if !path.IsAbs(cfg.DataHostPath) {
 			return nil, fmt.Errorf("DATA_HOST_PATH must be an absolute Unix path: %q", cfg.DataHostPath)
 		}
-	}
-
-	notification.SetFailureRepeatInterval(cfg.AppriseNotifyRepeatInterval)
-
-	err = notification.SetAppriseConfig(
-		string(cfg.AppriseApiURL),
-		cfg.AppriseNotifyUrls,
-		cfg.AppriseNotifyLevel,
-		cfg.AppriseNotifyBodyTemplate,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to configure notifications: %w", err)
 	}
 
 	return &cfg, nil
@@ -318,7 +349,23 @@ func (cfg *Config) validateGitAuthConfig() error {
 		cfg.GitHubAppInstallationID = 0
 	}
 
+	inheritsGlobalHTTP := false
+
 	for i, entry := range cfg.GitAuthDomains {
+		if len(entry.Domains) == 0 {
+			return fmt.Errorf("GIT_AUTH_DOMAINS[%d]: at least one domain is required", i)
+		}
+
+		for _, domain := range entry.Domains {
+			if err := git.ValidateDomainPattern(domain); err != nil {
+				return fmt.Errorf("GIT_AUTH_DOMAINS[%d]: %w", i, err)
+			}
+		}
+
+		if !entry.HasHTTPCredential() {
+			inheritsGlobalHTTP = true
+		}
+
 		hasToken := strings.TrimSpace(entry.GitAccessToken) != ""
 		hasSSH := strings.TrimSpace(entry.SSHPrivateKey) != ""
 		hasApp := strings.TrimSpace(entry.GitHubAppID) != "" || strings.TrimSpace(entry.GitHubAppPrivateKey) != ""
@@ -334,7 +381,46 @@ func (cfg *Config) validateGitAuthConfig() error {
 		}
 	}
 
+	// Global HTTP(S) credentials are only sent to hosts of GIT_AUTH_DOMAINS entries without their own
+	// HTTP(S) credential. Without such an entry the global credential is never used, which is a config error.
+	// GIT_AUTH_ALLOW_ANY_HOST is the explicit opt-out: the global credential then goes to all unmatched hosts.
+	if (globalToken != "" || hasCompleteGlobalApp) && !inheritsGlobalHTTP && !cfg.GitAuthAllowAnyHost {
+		return fmt.Errorf("%w: %s is set, but no GIT_AUTH_DOMAINS entry lists the hosts that may receive it. "+
+			"Add an entry without its own HTTP(S) credential, for example GIT_AUTH_DOMAINS='- domains: [github.com]', "+
+			"or move the credential into a scoped GIT_AUTH_DOMAINS entry", ErrUnscopedGitCredential, cfg.GlobalGitHTTPCredentialName())
+	}
+
 	return nil
+}
+
+// GlobalGitHTTPCredentialName returns the environment variable names of the configured global HTTP(S) Git credential.
+// It returns an empty string when no global HTTP(S) credential is set.
+func (cfg *Config) GlobalGitHTTPCredentialName() string {
+	switch {
+	case cfg.GitHubAppID != "" && cfg.GitHubAppPrivateKey != "":
+		return "GITHUB_APP_ID and GITHUB_APP_PRIVATE_KEY"
+	case strings.TrimSpace(cfg.GitAccessToken) != "":
+		return "GIT_ACCESS_TOKEN"
+	default:
+		return ""
+	}
+}
+
+// ConfigureGitAuth applies the Git credentials of the config to the global Git credential resolver.
+func (cfg *Config) ConfigureGitAuth() {
+	git.ConfigureAuthResolver(
+		cfg.GitAuthDomains,
+		cfg.SSHPrivateKey,
+		cfg.SSHPrivateKeyPassphrase,
+		cfg.GitAccessToken,
+		cfg.GitAccessTokenUser,
+		git.GitHubAppConfig{
+			ID:             cfg.GitHubAppID,
+			PrivateKey:     cfg.GitHubAppPrivateKey,
+			InstallationID: cfg.GitHubAppInstallationID,
+		},
+		git.WithAllowAnyHost(cfg.GitAuthAllowAnyHost),
+	)
 }
 
 // parsePollConfig parses the PollConfig from either the PollConfigYAML string or the PollConfigFile.
@@ -352,6 +438,27 @@ func (cfg *Config) parsePollConfig() error {
 	}
 
 	cfg.PollConfig = []poll.Config{} // Default to an empty slice if no config is provided
+
+	return nil
+}
+
+// parseSyncWindows parses the sync window policy from either SYNC_WINDOWS or SYNC_WINDOWS_FILE.
+func (cfg *Config) parseSyncWindows() error {
+	if strings.TrimSpace(cfg.SyncWindowsYAML) != "" && strings.TrimSpace(cfg.SyncWindowsFile) != "" {
+		return syncwindow.ErrBothConfigSet
+	}
+
+	data := cfg.SyncWindowsYAML
+	if strings.TrimSpace(data) == "" {
+		data = cfg.SyncWindowsFile
+	}
+
+	policy, err := syncwindow.Parse(data)
+	if err != nil {
+		return err
+	}
+
+	cfg.SyncWindows = policy
 
 	return nil
 }

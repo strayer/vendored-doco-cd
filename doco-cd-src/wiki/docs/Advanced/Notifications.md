@@ -12,15 +12,22 @@ For that, specify the required settings in the app `environment` section and add
 
 ## Settings
 
-| Key                        | Type   | Description                                                                                                                                                                                                 | Default value |
-|----------------------------|--------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
-| `APPRISE_API_URL`          | string | The URL of the Apprise API to send notifications to (e.g. `http://apprise:8000/notify`)                                                                                                                     |               |
-| `APPRISE_NOTIFY_URLS`      | string | A comma-separated list of Apprise-URLs to send notifications to the [supported services/platforms](https://appriseit.com/services/) (e.g. `pover://{user_key}@{token},mailto://{user}:{password}@{domain}`) |               |
-| `APPRISE_NOTIFY_URLS_FILE` | string | Path to the file inside the container containing the Apprise-URLs (see `APPRISE_NOTIFY_URLS`). Mutually exclusive with `APPRISE_NOTIFY_URLS`.                                                               |               |
-| `APPRISE_NOTIFY_LEVEL`     | string | The minimum level of notifications to send. Possible values: `info`, `success`, `warning`, `failure`                                                                                                        | `success`     |
-| `APPRISE_NOTIFY_REPEAT_INTERVAL` | duration | How long an unchanged failure notification is suppressed before it is sent again as a reminder (see [Repeated failures](#repeated-failures)). `0` sends every failure.                                        | `1h`          |
-| `APPRISE_NOTIFY_BODY_TEMPLATE`  | string | Optional [Go `text/template`](https://pkg.go.dev/text/template) rendering the notification body (see [Custom notification body](#custom-notification-body)). Empty uses the built-in format.                  |               |
-| `APPRISE_NOTIFY_BODY_TEMPLATE_FILE` | string | Path to a file inside the container containing the template (see `APPRISE_NOTIFY_BODY_TEMPLATE`). Mutually exclusive with `APPRISE_NOTIFY_BODY_TEMPLATE`.                                                          |               |
+| Key                                 | Type     | Description                                                                                                                                                                                                 | Default value |
+|-------------------------------------|----------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
+| `APPRISE_API_URL`                   | string   | The URL of the Apprise API to send notifications to (e.g. `http://apprise:8000/notify`)                                                                                                                     |               |
+| `APPRISE_NOTIFY_URLS`               | string   | A comma-separated list of Apprise-URLs to send notifications to the [supported services/platforms](https://appriseit.com/services/) (e.g. `pover://{user_key}@{token},mailto://{user}:{password}@{domain}`) |               |
+| `APPRISE_NOTIFY_URLS_FILE`          | string   | Path to the file inside the container containing the Apprise-URLs (see `APPRISE_NOTIFY_URLS`). Mutually exclusive with `APPRISE_NOTIFY_URLS`.                                                               |               |
+| `APPRISE_NOTIFY_LEVEL`              | string   | The minimum level of notifications to send. Possible values: `info`, `success`, `warning`, `failure`                                                                                                        | `success`     |
+| `APPRISE_NOTIFY_REPEAT_INTERVAL`    | duration | How long an unchanged failure notification is suppressed before it is sent again as a reminder (see [Repeated failures](#repeated-failures)). `0` sends every failure.                                      | `1h`          |
+| `APPRISE_NOTIFY_BODY_TEMPLATE`      | string   | Optional [Go `text/template`](https://pkg.go.dev/text/template) rendering the notification body (see [Custom notification body](#custom-notification-body)). Empty uses the built-in format.                |               |
+| `APPRISE_NOTIFY_BODY_TEMPLATE_FILE` | string   | Path to a file inside the container containing the template (see `APPRISE_NOTIFY_BODY_TEMPLATE`). Mutually exclusive with `APPRISE_NOTIFY_BODY_TEMPLATE`.                                                   |               |
+
+A request to the Apprise API fails if Apprise does not answer within 30 seconds, so an unresponsive Apprise server cannot hold up deployments.
+
+## Release announcements
+
+Doco-CD checks for new releases once at startup.
+Set [`VERSION_CHECK_ENABLED`](../App-Settings.md#runtime-settings) to `false` to skip the GitHub release lookup, new-version warning, and Apprise release announcement.
 
 ## Example `docker-compose.yml`
 
@@ -95,16 +102,16 @@ When a notification is sent, the following metadata fields are included in the n
 
 ## Custom notification body
 
-By default the notification body is the message followed by the [metadata fields](#metadata-fields) as `key: value` lines. Set `APPRISE_NOTIFY_BODY_TEMPLATE` (or `APPRISE_NOTIFY_BODY_TEMPLATE_FILE`) to a [Go `text/template`](https://pkg.go.dev/text/template) to render the body yourself — useful to drop noisy fields, add a host label, or produce a one-liner when several stacks report into one channel.
+By default the notification body is the message followed by the [metadata fields](#metadata-fields) as `key: value` lines. Set `APPRISE_NOTIFY_BODY_TEMPLATE` (or `APPRISE_NOTIFY_BODY_TEMPLATE_FILE`) to a [Go `text/template`](https://pkg.go.dev/text/template) to render the body yourself. This is useful to drop noisy fields, add a host label, or produce a one-liner when several stacks report into one channel.
 
 The template is validated at startup: a syntax error or a reference to an unknown field stops doco-cd from starting. The title (emoji + optional `[R]` marker + title text) is not affected by the template.
 
 !!! warning "Don't swallow failure reasons"
 
-    The template replaces the default body for **every** notification level, and on `failure` the error text is only carried by `{{ .Message }}` — a template that never references it produces failure notifications with no failure reason at all (the title only says `Deployment failed`; the details then live only in the logs). On `success`, `.Message` is largely redundant with the title, so compact templates should include it guarded by level:
+    The template replaces the default body for **every** notification level, and on `failure` the error text is only carried by `{{ .Message }}`. A template that never references it produces failure notifications with no failure reason at all (the title only says `Deployment failed`; the details then live only in the logs). On `success`, `.Message` is largely redundant with the title, so compact templates should include it guarded by level:
 
     ```
-    {{ if ne .Level "success" }} — {{ .Message }}{{ end }}
+    {{ if ne .Level "success" }} - {{ .Message }}{{ end }}
     ```
 
 The following fields are available:
@@ -127,8 +134,8 @@ The following fields are available:
 | `.AffectedActorKind`  | `container` or `service`                                                 |
 | `.AffectedActorID`    | Affected container/service ID                                            |
 | `.AffectedActorName`  | Affected container/service name                                          |
-| `.Commits`            | Commits deployed since the last deploy (see [Commit changelog](#commit-changelog)) |
-| `.Duration`           | Time the deployment (or destroy) took, from job start to the notification, e.g. `12.483s`. Zero where no deployment ran (reconciliation restarts, scheduled jobs) — hide it with `{{if .Duration}}...{{end}}` |
+| `.Commits`            | Commits that changed this stack since the last deploy (see [Commit changelog](#commit-changelog)) |
+| `.Duration`           | Time the deployment (or destroy) took, from job start to the notification, e.g. `12.483s`. Zero where no deployment ran (reconciliation restarts, scheduled jobs); hide it with `{{if .Duration}}...{{end}}` |
 | `.ChangedServices`    | Sorted names of the services changed by this deploy: force-recreated ones (changed mounted/referenced files or a changed auto-discovery label) plus services whose image digest changed in the registry (detected with [`force_image_pull`](../Deploy-Settings.md)). Empty when the whole stack is (re)deployed for other reasons, e.g. a compose config change (including image tag changes in the compose file), state drift or `force_recreate` |
 
 `{{ .DefaultBody }}` renders the built-in body (message + metadata), so you can extend the default format instead of replacing it, e.g. `{{ .DefaultBody }}\nhost: my-vm`.
@@ -137,10 +144,10 @@ The following fields are available:
 
     ```yaml
     environment:
-      APPRISE_NOTIFY_BODY_TEMPLATE: "{{.Emoji}} {{if .Target}}{{.Target}}/{{end}}{{.Stack}} — {{.Message}} ({{.Revision}})"
+      APPRISE_NOTIFY_BODY_TEMPLATE: "{{.Emoji}} {{if .Target}}{{.Target}}/{{end}}{{.Stack}} - {{.Message}} ({{.Revision}})"
     ```
 
-    renders e.g. `✅ prod-vm/app — Successfully deployed stack app (main (abc123))` for target `prod-vm`, or `✅ app — Successfully deployed stack app (main (abc123))` without a custom target.
+    renders e.g. `✅ prod-vm/app - Successfully deployed stack app (main (abc123))` for target `prod-vm`, or `✅ app - Successfully deployed stack app (main (abc123))` without a custom target.
 
 ### Commit changelog
 
@@ -165,7 +172,21 @@ Printing an entry directly (`{{ . }}`) gives `shortHash subject`.
         {{ end }}
     ```
 
-Up to 50 commits are listed. After a rebase or force-push the list starts from the point where the histories diverged.
+Only commits that changed a file of the stack are listed, like `git log -- <paths>`. The paths are the ones the compose project resolves to: the compose files, `configs:`, `secrets:`, `env_file:`, bind mount sources and build contexts, plus the deploy config file (`.doco-cd.yml` or `.doco-cd.<target>.yml`) that declares the stack. A repository that holds several stacks therefore gets a changelog per stack instead of everything that happened in the repository. Where the stack resolves to no path inside the repository, or covers the repository root, all commits of the range are listed.
+
+The deploy config counts as a whole file, so a commit that changes one document of it is listed by every stack of that file that deploys afterwards.
+
+Merged branches are handled like `git log` does: the commits of a merged pull request are listed, the merge commit itself only when it changed the stack's files compared to every parent, e.g. a resolved conflict.
+
+A few changes cannot be attributed to a stack and are therefore not listed:
+
+- Files pulled in with `include:` or `extends: file:`, because Compose resolves them away and the loaded project no longer names them.
+- Services of a profile that is not active, their files do not belong to the deployed stack.
+- Stacks that live in a Git submodule, a submodule bump only changes the submodule path in the parent repository.
+
+A build context matches everything below it, so a second stack placed inside the build context of another one shows up in both changelogs.
+
+Up to 50 commits are listed, counted after that filtering. A walk reads at most 5000 commits, so a stack that was not touched for a very long time gets a truncated list and a warning in the log. After a rebase or force-push the list starts from the point where the histories diverged.
 
 The changelog is best-effort: with a small `GIT_CLONE_DEPTH` the previously deployed commit may sit beyond the shallow boundary, in which case the list is truncated or omitted. It never blocks the notification.
 

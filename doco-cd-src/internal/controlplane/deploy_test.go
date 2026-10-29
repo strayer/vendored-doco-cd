@@ -1,0 +1,642 @@
+package controlplane_test
+
+import (
+	"context"
+	"errors"
+	"testing"
+
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/moby/moby/api/types/container"
+
+	"github.com/kimdre/doco-cd/internal/commitstatus"
+	"github.com/kimdre/doco-cd/internal/common/validation"
+	"github.com/kimdre/doco-cd/internal/config"
+	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/controlplane"
+	"github.com/kimdre/doco-cd/internal/docker"
+	"github.com/kimdre/doco-cd/internal/logger"
+	"github.com/kimdre/doco-cd/internal/notification"
+	"github.com/kimdre/doco-cd/internal/reconciliation"
+	"github.com/kimdre/doco-cd/internal/source"
+	"github.com/kimdre/doco-cd/internal/stages"
+	"github.com/kimdre/doco-cd/internal/syncwindow"
+	"github.com/kimdre/doco-cd/internal/webhook"
+)
+
+type fakeSourcePreparer struct {
+	result source.Result
+	err    error
+
+	calls   int
+	lastReq source.Request
+}
+
+func (f *fakeSourcePreparer) Prepare(_ context.Context, req source.Request) (source.Result, error) {
+	f.calls++
+	f.lastReq = req
+
+	return f.result, f.err
+}
+
+func TestDeploy_CleanupRefreshResolvesCurrentSourceWithoutRedeploying(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{
+		SourceType: config.SourceTypeGit, RepoName: "owner/repo", Revision: "first", OCITrusted: true,
+	}}
+	reconciler := &fakeReconciler{}
+	deployment := newTestDeployment(t, preparer, reconciler)
+	request := validDeploymentRequest()
+	request.Ref = "main"
+	request.Payload.CommitSHA = plumbing.NewHash("0123456789abcdef0123456789abcdef01234567")
+	request.Payload.Digest = "old-digest"
+
+	request.Payload.Trigger = request.Payload.CommitSHA.String()
+	if err := deployment.Deploy(t.Context(), request); err != nil {
+		t.Fatal(err)
+	}
+
+	preparer.result.Revision = "current"
+
+	refreshed, release, err := reconciler.lastReq.RefreshCleanup(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	if preparer.calls != 2 || reconciler.calls != 1 || refreshed.Repository.Revision != "current" ||
+		refreshed.RefreshCleanup == nil {
+		t.Fatalf("cleanup refresh redeployed or reused old source: %+v", refreshed.Repository)
+	}
+
+	if got := preparer.lastReq.Payload; got.CommitSHA != plumbing.ZeroHash || got.Digest != "" || got.Trigger != "" {
+		t.Fatalf("cleanup refresh pinned to old webhook: %+v", got)
+	}
+
+	if preparer.lastReq.Ref != "main" || refreshed.Origin != "" {
+		t.Fatal("cleanup refresh lost its reference or kept a manual override")
+	}
+}
+
+func TestDeploy_CleanupRefreshKeepsResolvedDefaultReference(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{
+		SourceType: config.SourceTypeGit, RepoName: "owner/repo", Revision: "first",
+		Payload: webhook.ParsedPayload{Ref: "refs/heads/main"},
+	}}
+	reconciler := &fakeReconciler{}
+
+	deployment := newTestDeployment(t, preparer, reconciler)
+	if err := deployment.Deploy(t.Context(), validDeploymentRequest()); err != nil {
+		t.Fatal(err)
+	}
+
+	if reconciler.lastReq.Repository.ResolvedReference != "refs/heads/main" {
+		t.Fatal("cleanup scope lost the resolved default reference")
+	}
+
+	refreshed, release, err := reconciler.lastReq.RefreshCleanup(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+
+	if preparer.lastReq.Ref != "refs/heads/main" ||
+		refreshed.Repository.ResolvedReference != reconciler.lastReq.Repository.ResolvedReference {
+		t.Fatal("cleanup refresh changed the resolved default reference")
+	}
+}
+
+type fakeReconciler struct {
+	err error
+
+	calls   int
+	lastReq reconciliation.DeployRequest
+}
+
+func (f *fakeReconciler) Deploy(_ context.Context, req reconciliation.DeployRequest) error {
+	f.calls++
+	f.lastReq = req
+
+	return f.err
+}
+
+type fakeDockerContextResolver struct {
+	err   error
+	calls int
+}
+
+func (f *fakeDockerContextResolver) Get(_ context.Context, _ string) (docker.ContextClient, error) {
+	f.calls++
+	return docker.ContextClient{}, f.err
+}
+
+func newTestDeployment(t *testing.T, preparer controlplane.SourcePreparer, reconciler controlplane.Reconciler) *controlplane.Deployment {
+	t.Helper()
+
+	d, err := controlplane.NewDeployment(controlplane.DeploymentDependencies{
+		SourcePreparer: preparer,
+		Reconciler:     reconciler,
+		Contexts:       &fakeDockerContextResolver{},
+		DataMountPoint: container.MountPoint{Type: "bind", Source: "/src", Destination: "/dst"},
+	})
+	if err != nil {
+		t.Fatalf("NewDeployment() error = %v", err)
+	}
+
+	return d
+}
+
+func TestDeploy_DockerCapabilityErrorShortCircuitsBeforeSourcePreparation(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{}
+	reconciler := &fakeReconciler{}
+	contexts := &fakeDockerContextResolver{err: errors.New("docker info failed")}
+
+	d, err := controlplane.NewDeployment(controlplane.DeploymentDependencies{
+		SourcePreparer: preparer,
+		Reconciler:     reconciler,
+		Contexts:       contexts,
+		DataMountPoint: container.MountPoint{Type: "bind", Source: "/src", Destination: "/dst"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = d.Deploy(t.Context(), validDeploymentRequest())
+
+	var deploymentErr controlplane.DeploymentError
+	if !errors.As(err, &deploymentErr) {
+		t.Fatalf("expected DeploymentError, got %v", err)
+	}
+
+	if deploymentErr.HTTPStatusCode != 500 || deploymentErr.Response.Error() != "failed to check if docker host is running in swarm mode" {
+		t.Fatalf("unexpected deployment error: %#v", deploymentErr)
+	}
+
+	if contexts.calls != 1 || preparer.calls != 0 || reconciler.calls != 0 {
+		t.Fatalf("calls: contexts=%d, preparer=%d, reconciler=%d", contexts.calls, preparer.calls, reconciler.calls)
+	}
+}
+
+func validDeploymentRequest() controlplane.DeploymentRequest {
+	return controlplane.DeploymentRequest{
+		Logger:     logger.New(logger.LevelCritical).Logger,
+		JobTrigger: stages.JobTriggerWebhook,
+		SourceType: config.SourceTypeGit,
+		SourceRef:  "https://example.com/owner/repo.git",
+	}
+}
+
+func TestDeploymentRequest_AllowsDefaultSourceType(t *testing.T) {
+	t.Parallel()
+
+	err := validation.Validate(controlplane.DeploymentRequest{
+		Logger:     logger.New(logger.LevelCritical).Logger,
+		JobTrigger: stages.JobTriggerWebhook,
+		SourceRef:  "https://github.com/owner/repo.git",
+	})
+	if err != nil {
+		t.Fatalf("DeploymentRequest with default source type must validate: %v", err)
+	}
+}
+
+func TestDeploy_InvalidRequest(t *testing.T) {
+	t.Parallel()
+
+	d := newTestDeployment(t, &fakeSourcePreparer{}, &fakeReconciler{})
+
+	err := d.Deploy(t.Context(), controlplane.DeploymentRequest{})
+
+	var de controlplane.DeploymentError
+
+	if !errors.As(err, &de) {
+		t.Fatalf("expected DeploymentError, got %v (%T)", err, err)
+	}
+
+	if de.HTTPStatusCode != 500 {
+		t.Fatalf("expected 500, got %d", de.HTTPStatusCode)
+	}
+
+	if !errors.Is(de.Response, source.ErrInvalidRequest) {
+		t.Fatalf("response = %v, want %v", de.Response, source.ErrInvalidRequest)
+	}
+
+	if !errors.Is(err, source.ErrInvalidRequest) {
+		t.Fatalf("expected invalid request identity to be preserved, got %v", err)
+	}
+}
+
+func TestDeploy_SourcePreparerError_MapsToBadRequest(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{err: fmt400Err()}
+	reconciler := &fakeReconciler{}
+	d := newTestDeployment(t, preparer, reconciler)
+
+	err := d.Deploy(t.Context(), validDeploymentRequest())
+
+	var de controlplane.DeploymentError
+
+	if !errors.As(err, &de) {
+		t.Fatalf("expected DeploymentError, got %v (%T)", err, err)
+	}
+
+	if de.HTTPStatusCode != 400 {
+		t.Fatalf("expected 400, got %d", de.HTTPStatusCode)
+	}
+
+	if !errors.Is(de.Response, source.ErrInvalidSourceType) {
+		t.Fatalf("response = %v, want %v", de.Response, source.ErrInvalidSourceType)
+	}
+
+	// The early source-preparation failure must short-circuit the pipeline:
+	// reconciliation (and any later commit-status reporting it would trigger)
+	// must never run.
+	if reconciler.calls != 0 {
+		t.Fatalf("expected reconciler not to be called after a source preparation failure, got %d calls", reconciler.calls)
+	}
+}
+
+func TestDeploy_SourcePreparerError_Mapping(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		err          error
+		wantStatus   int
+		wantResponse error
+	}{
+		{
+			name:         "invalid request",
+			err:          errWrap(source.ErrInvalidRequest, "invalid"),
+			wantStatus:   500,
+			wantResponse: source.ErrInvalidRequest,
+		},
+		{
+			name:         "unsupported trigger",
+			err:          errWrap(source.ErrUnsupportedJobTrigger, "invalid"),
+			wantStatus:   400,
+			wantResponse: source.ErrUnsupportedJobTrigger,
+		},
+		{
+			name:         "unclassified failure",
+			err:          errors.New("unexpected preparer failure"),
+			wantStatus:   500,
+			wantResponse: source.ErrPrepare,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := newTestDeployment(t, &fakeSourcePreparer{err: tt.err}, &fakeReconciler{})
+
+			err := d.Deploy(t.Context(), validDeploymentRequest())
+
+			var de controlplane.DeploymentError
+			if !errors.As(err, &de) {
+				t.Fatalf("expected DeploymentError, got %v (%T)", err, err)
+			}
+
+			if de.HTTPStatusCode != tt.wantStatus {
+				t.Fatalf("status = %d, want %d", de.HTTPStatusCode, tt.wantStatus)
+			}
+
+			if !errors.Is(de.Response, tt.wantResponse) {
+				t.Fatalf("response = %v, want %v", de.Response, tt.wantResponse)
+			}
+
+			if !errors.Is(err, tt.wantResponse) {
+				t.Fatalf("expected response identity %v to be preserved, got %v", tt.wantResponse, err)
+			}
+		})
+	}
+}
+
+func TestDeploymentError_ErrorHandlesMissingValues(t *testing.T) {
+	t.Parallel()
+
+	cause := errors.New("cause")
+
+	tests := []struct {
+		name string
+		err  controlplane.DeploymentError
+		want string
+	}{
+		{name: "empty", err: controlplane.DeploymentError{}, want: ""},
+		{name: "cause only", err: controlplane.DeploymentError{Cause: cause}, want: "cause"},
+		{name: "response only", err: controlplane.DeploymentError{Response: source.ErrPrepare}, want: "failed to prepare source"},
+		{name: "response and cause", err: controlplane.DeploymentError{Response: source.ErrPrepare, Cause: cause}, want: "failed to prepare source: cause"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.err.Error(); got != tt.want {
+				t.Fatalf("Error() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func fmt400Err() error {
+	return errWrap(source.ErrInvalidSourceType, "invalid")
+}
+
+func errWrap(sentinel error, detail string) error {
+	return &wrappedTestError{sentinel: sentinel, detail: detail}
+}
+
+type wrappedTestError struct {
+	sentinel error
+	detail   string
+}
+
+func (e *wrappedTestError) Error() string { return e.sentinel.Error() + ": " + e.detail }
+func (e *wrappedTestError) Unwrap() error { return e.sentinel }
+
+func TestDeploy_SourcePreparerError_MapsToInternalServerError(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{err: errWrap(source.ErrGitClone, "network unreachable")}
+	reconciler := &fakeReconciler{}
+	d := newTestDeployment(t, preparer, reconciler)
+
+	err := d.Deploy(t.Context(), validDeploymentRequest())
+
+	var de controlplane.DeploymentError
+
+	if !errors.As(err, &de) {
+		t.Fatalf("expected DeploymentError, got %v (%T)", err, err)
+	}
+
+	if de.HTTPStatusCode != 500 {
+		t.Fatalf("expected 500, got %d", de.HTTPStatusCode)
+	}
+
+	if !errors.Is(de.Response, source.ErrGitClone) {
+		t.Fatalf("response = %v, want %v", de.Response, source.ErrGitClone)
+	}
+
+	if reconciler.calls != 0 {
+		t.Fatalf("expected reconciler not to be called after a source preparation failure, got %d calls", reconciler.calls)
+	}
+}
+
+func TestDeploy_Success_AdaptsResultAndInvokesObserver(t *testing.T) {
+	t.Parallel()
+
+	deployConfigs := []*deploy.Config{
+		{Name: "stack-a", Context: "ctx-a"},
+		{Name: "stack-b", Context: "ctx-b"},
+	}
+
+	preparer := &fakeSourcePreparer{result: source.Result{
+		SourceType:    config.SourceTypeGit,
+		RepoName:      "owner/repo",
+		PathInternal:  "/dst/owner/repo",
+		PathExternal:  "/src/owner/repo",
+		Revision:      "deadbeef",
+		OCITrusted:    true,
+		DeployConfigs: deployConfigs,
+	}}
+	reconciler := &fakeReconciler{}
+	d := newTestDeployment(t, preparer, reconciler)
+
+	var observed [][2]string
+
+	req := validDeploymentRequest()
+	req.Metadata = notification.Metadata{
+		DeploymentTargetObserver: func(stack, context string) {
+			observed = append(observed, [2]string{stack, context})
+		},
+	}
+
+	if err := d.Deploy(t.Context(), req); err != nil {
+		t.Fatalf("Deploy() error = %v", err)
+	}
+
+	if preparer.calls != 1 {
+		t.Fatalf("expected source preparer to be called once, got %d", preparer.calls)
+	}
+
+	if reconciler.calls != 1 {
+		t.Fatalf("expected reconciler to be called once, got %d", reconciler.calls)
+	}
+
+	got := reconciler.lastReq.Repository
+
+	want := stages.RepositoryData{
+		Source:          config.SourceTypeGit,
+		SourceUrl:       req.SourceRef,
+		ConfigSourceUrl: req.SourceRef,
+		Name:            "owner/repo",
+		PathInternal:    "/dst/owner/repo",
+		PathExternal:    "/src/owner/repo",
+		Revision:        "deadbeef",
+		ConfigRevision:  "deadbeef",
+		ConfigPath:      "/src/owner/repo",
+		OCITrusted:      true,
+	}
+	if got != want {
+		t.Fatalf("Repository = %+v, want %+v", got, want)
+	}
+
+	if len(reconciler.lastReq.DeployConfigs) != 2 {
+		t.Fatalf("expected 2 deploy configs to be passed through, got %d", len(reconciler.lastReq.DeployConfigs))
+	}
+
+	wantObserved := [][2]string{{"stack-a", "ctx-a"}, {"stack-b", "ctx-b"}}
+	if len(observed) != len(wantObserved) {
+		t.Fatalf("observed = %v, want %v", observed, wantObserved)
+	}
+
+	for i := range wantObserved {
+		if observed[i] != wantObserved[i] {
+			t.Fatalf("observed[%d] = %v, want %v", i, observed[i], wantObserved[i])
+		}
+	}
+}
+
+func TestDeploy_Success_PopulatesMirrorDirAndResolvedReference(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{
+		SourceType:   config.SourceTypeGit,
+		RepoName:     "owner/repo",
+		PathInternal: "/dst/owner/repo",
+		PathExternal: "/src/owner/repo",
+		Revision:     "deadbeef",
+		MirrorDir:    "/dst/owner/repo/mirror",
+	}}
+	reconciler := &fakeReconciler{}
+	d := newTestDeployment(t, preparer, reconciler)
+
+	req := validDeploymentRequest()
+	req.Ref = "main"
+
+	if err := d.Deploy(t.Context(), req); err != nil {
+		t.Fatalf("Deploy() error = %v", err)
+	}
+
+	got := reconciler.lastReq.Repository
+
+	if got.MirrorDir != preparer.result.MirrorDir {
+		t.Fatalf("Repository.MirrorDir = %q, want %q", got.MirrorDir, preparer.result.MirrorDir)
+	}
+
+	if got.ResolvedReference != req.Ref {
+		t.Fatalf("Repository.ResolvedReference = %q, want %q", got.ResolvedReference, req.Ref)
+	}
+}
+
+func TestDeploy_ReconciliationFailure_MapsToInternalServerError(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+	reconciler := &fakeReconciler{err: errors.New("compose up failed")}
+	d := newTestDeployment(t, preparer, reconciler)
+
+	err := d.Deploy(t.Context(), validDeploymentRequest())
+
+	var de controlplane.DeploymentError
+
+	if !errors.As(err, &de) {
+		t.Fatalf("expected DeploymentError, got %v (%T)", err, err)
+	}
+
+	if de.HTTPStatusCode != 500 {
+		t.Fatalf("expected 500, got %d", de.HTTPStatusCode)
+	}
+
+	if de.Response.Error() != "deployment failed" {
+		t.Fatalf("unexpected response: %q", de.Response)
+	}
+}
+
+func TestDeploy_PreservesErrWebhookFilterMismatchIdentity(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+	reconciler := &fakeReconciler{err: stages.ErrWebhookFilterMismatch}
+	d := newTestDeployment(t, preparer, reconciler)
+
+	err := d.Deploy(t.Context(), validDeploymentRequest())
+
+	if !errors.Is(err, stages.ErrWebhookFilterMismatch) {
+		t.Fatalf("expected ErrWebhookFilterMismatch identity to be preserved, got %v", err)
+	}
+
+	if de, ok := errors.AsType[controlplane.DeploymentError](err); ok {
+		t.Fatalf("expected ErrWebhookFilterMismatch not to be wrapped in a DeploymentError, got %+v", de)
+	}
+}
+
+func TestDeploy_PreservesWebhookSkipIdentity(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+	reconciler := &fakeReconciler{err: stages.ErrSkipDeployment}
+	d := newTestDeployment(t, preparer, reconciler)
+
+	err := d.Deploy(t.Context(), validDeploymentRequest())
+	if !errors.Is(err, stages.ErrSkipDeployment) {
+		t.Fatalf("expected ErrSkipDeployment identity to be preserved, got %v", err)
+	}
+
+	if de, ok := errors.AsType[controlplane.DeploymentError](err); ok {
+		t.Fatalf("expected ErrSkipDeployment not to be wrapped in a DeploymentError, got %+v", de)
+	}
+}
+
+func TestDeploy_KeepsPollSkipAsSuccess(t *testing.T) {
+	t.Parallel()
+
+	preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+	reconciler := &fakeReconciler{err: stages.ErrSkipDeployment}
+	d := newTestDeployment(t, preparer, reconciler)
+	req := validDeploymentRequest()
+	req.JobTrigger = stages.JobTriggerPoll
+
+	if err := d.Deploy(t.Context(), req); err != nil {
+		t.Fatalf("expected poll skip to remain successful, got %v", err)
+	}
+}
+
+func TestDeploy_ReportsPollSyncWindowDeferral(t *testing.T) {
+	t.Parallel()
+
+	for _, trigger := range []stages.JobTrigger{stages.JobTriggerPoll, stages.JobTriggerWebhook} {
+		preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+		blocked := &stages.SyncWindowBlockedError{Stacks: []string{"stack"}, Windows: []string{"freeze"}}
+		reconciler := &fakeReconciler{err: blocked}
+		d := newTestDeployment(t, preparer, reconciler)
+		req := validDeploymentRequest()
+		req.JobTrigger = trigger
+
+		err := d.Deploy(t.Context(), req)
+		if got, ok := errors.AsType[*stages.SyncWindowBlockedError](err); !ok || got != blocked {
+			t.Fatalf("%s: Deploy() error = %v, want the sync window error", trigger, err)
+		}
+	}
+}
+
+func TestDeploy_PreservesRetrySuppression(t *testing.T) {
+	t.Parallel()
+
+	for _, trigger := range []stages.JobTrigger{stages.JobTriggerPoll, stages.JobTriggerWebhook} {
+		preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+		suppressed := &stages.RetrySuppressedError{Stacks: []stages.RetrySuppressedStack{{
+			Name: "stack", Revision: "failed", Reason: "budget_exhausted",
+		}}}
+		d := newTestDeployment(t, preparer, &fakeReconciler{err: suppressed})
+		req := validDeploymentRequest()
+		req.JobTrigger = trigger
+
+		err := d.Deploy(t.Context(), req)
+		if err != suppressed {
+			t.Fatalf("%s: Deploy() = %v, want original suppression", trigger, err)
+		}
+	}
+}
+
+func TestDeploy_PassesDeploymentOrigin(t *testing.T) {
+	t.Parallel()
+
+	for ctx, want := range map[context.Context]syncwindow.Origin{
+		t.Context(): syncwindow.OriginAutomatic,
+		controlplane.WithDeploymentOrigin(t.Context(), syncwindow.OriginManual): syncwindow.OriginManual,
+	} {
+		preparer := &fakeSourcePreparer{result: source.Result{DeployConfigs: []*deploy.Config{{Name: "stack"}}}}
+		reconciler := &fakeReconciler{}
+		d := newTestDeployment(t, preparer, reconciler)
+
+		if err := d.Deploy(ctx, validDeploymentRequest()); err != nil {
+			t.Fatalf("Deploy() error = %v", err)
+		}
+
+		if reconciler.lastReq.Origin != want {
+			t.Fatalf("reconciliation origin = %q, want %q", reconciler.lastReq.Origin, want)
+		}
+	}
+}
+
+// TestCommitStatusEarlyFailure_SkipsWithoutBlockingDeployment is a sanity check that
+// commitstatus.ResolveRequest (used by internal/source to report early Git
+// clone/config-resolution failures before controlplane ever runs
+// reconciliation) safely no-ops without credentials, so a Deployment.Deploy
+// failure path never blocks on commit-status reporting.
+func TestCommitStatusEarlyFailure_SkipsWithoutBlockingDeployment(t *testing.T) {
+	t.Parallel()
+
+	_, ok := commitstatus.ResolveRequest(logger.New(logger.LevelCritical).Logger, commitstatus.RequestParams{
+		Enabled:     true,
+		SourceIsGit: true,
+		SourceURL:   "https://example.com/owner/repo.git",
+		CommitSHA:   "deadbeef",
+	})
+	if ok {
+		t.Fatal("expected ResolveRequest to skip without configured credentials")
+	}
+}

@@ -2,13 +2,12 @@ package stages
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
-	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -18,9 +17,47 @@ import (
 	"github.com/kimdre/doco-cd/internal/docker"
 	"github.com/kimdre/doco-cd/internal/filesystem"
 	"github.com/kimdre/doco-cd/internal/git"
+	sourcecache "github.com/kimdre/doco-cd/internal/source/cache"
 	"github.com/kimdre/doco-cd/internal/source/oci"
+	"github.com/kimdre/doco-cd/internal/source/store"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
+
+func mergeDeploymentEnvironment(config *deploy.Config) {
+	if len(config.Environment) == 0 {
+		return
+	}
+
+	if config.Internal.Environment == nil {
+		config.Internal.Environment = make(map[string]string)
+	}
+
+	maps.Copy(config.Internal.Environment, config.Environment)
+}
+
+func useDeploymentGitRepository(repository *RepositoryData, repositoryURL config.GitUrl) {
+	repository.Source = config.SourceTypeGit
+	repository.SourceUrl = string(repositoryURL)
+	repository.Name = git.GetRepoName(repository.SourceUrl)
+}
+
+func loadConfigSourceFiles(deployConfig *deploy.Config, sourcePath string) error {
+	if deployConfig.Internal.ConfigSourceFilesLoaded {
+		return nil
+	}
+
+	if err := deploy.LoadLocalDotEnv(deployConfig, sourcePath); err != nil {
+		return fmt.Errorf("failed to parse local env files: %w", err)
+	}
+
+	if err := deploy.LoadExternalSecretsFiles(deployConfig, sourcePath); err != nil {
+		return fmt.Errorf("failed to parse local external secrets files: %w", err)
+	}
+
+	deployConfig.Internal.ConfigSourceFilesLoaded = true
+
+	return nil
+}
 
 // RunInitStage executes the initialization stage logic for the deployment process.
 func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) error {
@@ -35,12 +72,11 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 	if s.JobTrigger == JobTriggerWebhook {
 		// Skip deployment if the webhook event does not match the filter
 		if s.DeployConfig.WebhookEventFilter != "" {
-			filter := regexp.MustCompile(s.DeployConfig.WebhookEventFilter)
-			if !filter.MatchString(s.Payload.Ref) {
+			if !s.MatchesWebhookEventFilter() {
 				stageLog.Debug("reference does not match the webhook event filter, skipping deployment",
 					slog.String("webhook_filter", s.DeployConfig.WebhookEventFilter), slog.String("ref", s.Payload.Ref))
 
-				return ErrSkipDeployment
+				return s.WebhookFilterMismatch()
 			}
 
 			stageLog.Debug("reference matches the webhook event filter, proceeding with deployment",
@@ -49,30 +85,62 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 	}
 
 	if s.DeployConfig.RepositoryUrl != "" {
-		s.Repository.SourceUrl = string(s.DeployConfig.RepositoryUrl)
-		s.Repository.Name = git.GetRepoName(s.Repository.SourceUrl)
+		useDeploymentGitRepository(s.Repository, s.DeployConfig.RepositoryUrl)
 
-		// Load local (without remote: prefix) dotenv files before paths get updated to remote repository
-		// Remote dotenv files get read later
-		err = deploy.LoadLocalDotEnv(s.DeployConfig, s.Repository.PathInternal)
-		if err != nil {
-			return fmt.Errorf("failed to parse local env files: %w", err)
+		// Reconciliation reuses files loaded from the immutable config artifact during the initial deployment. This keeps
+		// later runs independent of that artifact after GC removes it.
+		if err = loadConfigSourceFiles(s.DeployConfig, s.Repository.PathInternal); err != nil {
+			return err
 		}
 	}
 
-	s.Repository.PathInternal, err = filesystem.VerifyAndSanitizePath(filepath.Join(s.Docker.DataMountPoint.Destination, s.Repository.Name), s.Docker.DataMountPoint.Destination) // Path inside the container
-	if err != nil {
-		return fmt.Errorf("failed to verify and sanitize internal filesystem path: %w", err)
-	}
+	// A stack tracking the same repository/reference that Prepare already resolved for this job
+	// (the common case for auto-discovered stacks on the triggering branch) can reuse that
+	// resolution instead of paying for its own redundant fetch: Prepare already ran Resolve+Publish
+	// once for the whole job, and RunInitStage would otherwise re-run gitStore.Resolve (a real
+	// network fetch guarded by the mirror's exclusive path lock) for every single matched stack,
+	// serializing them all behind that one shared mirror.
+	// A stack that overrides git_depth needs its own Resolve: Prepare mirrors at the global
+	// depth, and reusing that shallower mirror would hide the history the stack asked for from
+	// the deployed-commit lookup and the changed-file/changelog comparisons in the later stages.
+	fastPathEligible := s.DeployConfig.RepositoryUrl == "" &&
+		s.Repository.Source != config.SourceTypeOCI &&
+		s.Repository.MirrorDir != "" &&
+		s.Repository.Revision != "" &&
+		s.Repository.PathInternal != "" &&
+		resolvedReferenceMatches(s.Repository.ResolvedReference, s.DeployConfig.Reference) &&
+		s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth) == s.AppConfig.GitCloneDepth
 
-	s.Repository.PathExternal, err = filesystem.VerifyAndSanitizePath(filepath.Join(s.Docker.DataMountPoint.Source, s.Repository.Name), s.Docker.DataMountPoint.Source) // Path on the host
-	if err != nil {
-		return fmt.Errorf("failed to verify and sanitize external filesystem path: %w", err)
+	// Git sources deliberately reset to the store's base directory here:
+	// the store below republishes this stack's own reference out of it.
+	// For OCI sources Prepare already resolved these paths to the published artifact directory,
+	// and recomputing them would point the deployment at the base directory instead -
+	// which holds the pull cache and every published artifact, but no compose file.
+	// The fast path above keeps Prepare's already-published artifact paths instead: there is
+	// nothing left to republish, so resetting to the base directory here would just be undone.
+	if (s.Repository.Source != config.SourceTypeOCI && !fastPathEligible) || s.DeployConfig.RepositoryUrl != "" {
+		s.Repository.PathInternal, err = filesystem.VerifyAndSanitizePath(filepath.Join(s.Docker.DataMountPoint.Destination, s.Repository.Name), s.Docker.DataMountPoint.Destination) // Path inside the container
+		if err != nil {
+			return fmt.Errorf("failed to verify and sanitize internal filesystem path: %w", err)
+		}
+
+		s.Repository.PathExternal, err = filesystem.VerifyAndSanitizePath(filepath.Join(s.Docker.DataMountPoint.Source, s.Repository.Name), s.Docker.DataMountPoint.Source) // Path on the host
+		if err != nil {
+			return fmt.Errorf("failed to verify and sanitize external filesystem path: %w", err)
+		}
 	}
 
 	if s.Repository.Source == config.SourceTypeOCI {
-		if _, err := os.Stat(s.Repository.PathInternal); err != nil {
-			return fmt.Errorf("failed to access extracted OCI artifact directory: %w", err)
+		artifactsDir := filepath.Dir(s.Repository.PathInternal)
+		if filepath.Base(artifactsDir) != store.ArtifactsSubdir {
+			return fmt.Errorf("invalid OCI artifact path: %s", s.Repository.PathInternal)
+		}
+
+		storeBaseDir := filepath.Dir(artifactsDir)
+
+		s.releaseGCLock, err = sourcecache.AcquireSharedGCPathLock(storeBaseDir)
+		if err != nil {
+			return fmt.Errorf("acquire artifact GC lock: %w", err)
 		}
 
 		override := oci.SelectTrustPolicyOverride(s.DeployConfig.Oci, s.DeployConfig.Internal.OciTrustPolicyOverrideTrusted)
@@ -86,14 +154,48 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 			}
 		}
 
+		ociStore, err := store.NewOCIStore(store.OCIStoreOptions{
+			Log:                 stageLog,
+			ArtifactRef:         s.Repository.SourceUrl,
+			BaseDir:             storeBaseDir,
+			CustomTarget:        s.DeployConfig.Internal.ConfigTarget,
+			DeployConfigBaseDir: s.AppConfig.DeployConfigBaseDir,
+			TrustPolicy:         s.AppConfig.OciTrustPolicy,
+			TrustPolicyOverride: override,
+			VerifyMaxWorkers:    s.AppConfig.OciVerifyMaxWorkers,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to initialize OCI store: %w", err)
+		}
+
+		artifact, err := ociStore.Publish(ctx, store.Revision(s.Repository.Revision))
+		if err != nil {
+			return fmt.Errorf("failed to publish OCI artifact %s: %w", s.Repository.Revision, err)
+		}
+
+		s.Repository.PathInternal = artifact.Path
+
 		err = deploy.LoadLocalDotEnv(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
 		if err != nil {
 			return fmt.Errorf("failed to parse env files from OCI artifact: %w", err)
 		}
 
+		err = deploy.LoadExternalSecretsFiles(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
+		if err != nil {
+			return fmt.Errorf("failed to parse external secrets files from OCI artifact: %w", err)
+		}
+
+		mergeDeploymentEnvironment(s.DeployConfig)
+		deploy.MergeExternalSecretsFromFiles(s.DeployConfig)
+
+		if err := s.checkDestroyOwnership(ctx); err != nil {
+			return err
+		}
+
 		s.Log = s.Log.With(
 			slog.String("stack", s.DeployConfig.Name),
 			slog.String("repository", s.Repository.Name),
+			slog.String("revision", s.Repository.Revision),
 		)
 
 		return nil
@@ -105,121 +207,131 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		slog.String("reference", s.DeployConfig.Reference),
 	)
 
-	auth, err := git.GetAuthMethod(s.Repository.SourceUrl, s.AppConfig.SSHPrivateKey, s.AppConfig.SSHPrivateKeyPassphrase, s.AppConfig.GitAccessToken)
+	// This deployment may resolve a different repository or revision than
+	// Prepare did. Hold that store's GC gate until RunStages finishes.
+	//
+	// The GC gate is always keyed by the store's base directory (not the resolved artifact directory),
+	// matching every other acquisition of this lock (Prepare, OCI branch above, GC sweep itself).
+	// In the fast path below, s.Repository.PathInternal already points at Prepare's
+	// resolved artifact directory rather than the base directory - it must be recomputed here
+	// rather than reused, or this would take a lock on the wrong path and not actually exclude GC.
+	gcBaseDir, err := filesystem.VerifyAndSanitizePath(filepath.Join(s.Docker.DataMountPoint.Destination, s.Repository.Name), s.Docker.DataMountPoint.Destination)
 	if err != nil {
-		return fmt.Errorf("failed to get auth method: %w", err)
+		return fmt.Errorf("failed to verify and sanitize internal filesystem path: %w", err)
 	}
 
-	// Attempt to fetch the remote repository before checking if we can skip cloning/updating,
-	// to ensure we have the latest commits and references available locally
-	if s.DeployConfig.RepositoryUrl != "" {
-		repo, err := git.OpenRepository(s.Repository.PathInternal)
-		switch {
-		case err == nil:
-			err = git.FetchRepository(repo, s.Repository.SourceUrl, s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
-			if err != nil {
-				// If fetch failed with corruption indicators, attempt repair
-				if git.IsCorruptionError(err) {
-					stageLog.Warn("detected corruption during fetch, attempting repository repair",
-						slog.String("path", s.Repository.PathExternal))
-
-					if _, repairErr := git.RepairRepository(s.Repository.PathInternal, s.Repository.SourceUrl, s.DeployConfig.Reference,
-						s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules,
-						s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth), stageLog); repairErr != nil {
-						return fmt.Errorf("failed to fetch repository and repair attempt failed: %w (repair error: %v)", err, repairErr)
-					}
-				} else {
-					return fmt.Errorf("failed to fetch repository: %w", err)
-				}
-			}
-		case errors.Is(err, git.ErrRepositoryNotExists): // Continue without fetching the repository, it will be cloned later
-		default:
-			return fmt.Errorf("failed to open repository: %w", err)
-		}
-	}
-
-	// Check if we can skip cloning/updating because the previous run (initial or a prior deploy config)
-	skipCloneUpdate, err := git.MatchesHead(s.Repository.PathInternal, s.DeployConfig.Reference)
+	s.releaseGCLock, err = sourcecache.AcquireSharedGCPathLock(gcBaseDir)
 	if err != nil {
-		return fmt.Errorf("failed to check if repository matches remote and reference: %w", err)
+		return fmt.Errorf("acquire artifact GC lock: %w", err)
 	}
 
-	if s.DeployConfig.RepositoryUrl != "" {
-		if skipCloneUpdate {
-			stageLog.Debug("skipping clone of remote repository, already at correct state",
-				slog.String("url", s.Repository.SourceUrl),
-				slog.String("reference", s.DeployConfig.Reference))
-		} else {
-			stageLog.Debug("repository URL provided, cloning remote repository")
-
-			_, err = git.CloneRepository(s.Repository.PathInternal, s.Repository.SourceUrl, s.DeployConfig.Reference,
-				s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
-			if err != nil && !errors.Is(err, git.ErrRepositoryAlreadyExists) {
-				return fmt.Errorf("failed to clone repository: %w", err)
-			}
-
-			stageLog.Info("cloned remote repository",
-				slog.String("url", s.Repository.SourceUrl),
-				slog.String("path", s.Repository.PathExternal))
+	if fastPathEligible {
+		// Prepare already resolved and published this exact repository/reference for this job -
+		// reuse that artifact/revision/mirror as-is instead of re-running Resolve+Publish (a real
+		// network fetch) for this stack too. The mirror is only probed here to fail fast if it is
+		// unreadable; the handle is deliberately discarded, because later stages must open their
+		// own short-lived handle per read (see StageManager.withMirrorRead).
+		if err := verifyMirrorReadable(s.Repository.MirrorDir); err != nil {
+			return err
 		}
 
-		// Now also load remote dotenv files
-		err = deploy.LoadLocalDotEnv(s.DeployConfig, filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory))
-		if err != nil {
-			return fmt.Errorf("failed to parse remote env files: %w", err)
-		}
-	}
-
-	if len(s.DeployConfig.Environment) > 0 {
-		if s.DeployConfig.Internal.Environment == nil {
-			s.DeployConfig.Internal.Environment = make(map[string]string)
-		}
-
-		maps.Copy(s.DeployConfig.Internal.Environment, s.DeployConfig.Environment)
-	}
-
-	if s.DeployConfig.Destroy.Enabled {
-		// Skip deployment if another project with the same name already exists
-		// Check if containers do not belong to this repository or if doco-cd does not manage the stack
-		correctRepo := true
-
-		serviceLabels, err := docker.GetServiceLabels(ctx, s.Docker.Cmd.Client(), s.Docker.SwarmMode, s.DeployConfig.Name)
-		if err != nil {
-			return fmt.Errorf("failed to retrieve service labels: %w", err)
-		}
-
-		for _, labels := range serviceLabels {
-			name, ok := labels[docker.DocoCDLabels.Source.Name]
-
-			if !ok || name != git.GetFullName(s.Repository.SourceUrl) {
-				correctRepo = false
-				break
-			}
-		}
-
-		if !correctRepo {
-			return fmt.Errorf("%w: %s: skipping deployment", ErrDeploymentConflict, s.DeployConfig.Name)
-		}
-	}
-
-	// Skip UpdateRepository if the previous run already cloned/updated with the same URL and reference
-	if skipCloneUpdate {
-		stageLog.Debug("skipping checkout, already at correct reference",
+		stageLog.Debug("reusing already-resolved repository artifact",
+			slog.String("url", s.Repository.SourceUrl),
 			slog.String("reference", s.DeployConfig.Reference),
+			slog.String("revision", s.Repository.Revision),
 			slog.String("path", s.Repository.PathExternal))
-
-		s.Repository.Git, err = git.OpenRepository(s.Repository.PathInternal)
-		if err != nil {
-			return fmt.Errorf("failed to open repository: %w", err)
-		}
 	} else {
-		stageLog.Debug("checking out reference "+s.DeployConfig.Reference, slog.String("path", s.Repository.PathExternal))
-
-		s.Repository.Git, err = git.UpdateRepository(s.Repository.PathInternal, s.Repository.SourceUrl, s.DeployConfig.Reference,
-			s.AppConfig.SkipTLSVerification, s.AppConfig.HttpProxy, auth, s.AppConfig.GitCloneSubmodules, s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth))
-		if err != nil {
-			return fmt.Errorf("failed to checkout repository: %w", err)
+		// Ask the immutable per-revision store for this stack's reference,
+		// rather than checking out a path shared with every other stack/
+		// reference using the same repository (whether that's the primary
+		// source repository, or one named by this stack's own RepositoryUrl).
+		// GitStore locks its own mirror internally, so concurrent stacks
+		// resolving different references (or the same one) no longer need a
+		// wrapping lock here to stay correct.
+		gitStore, gitStoreErr := store.NewGitStore(store.GitStoreOptions{
+			Log:                     stageLog,
+			CloneURL:                s.Repository.SourceUrl,
+			BaseDir:                 s.Repository.PathInternal,
+			SSHPrivateKey:           s.AppConfig.SSHPrivateKey,
+			SSHPrivateKeyPassphrase: s.AppConfig.SSHPrivateKeyPassphrase,
+			SkipTLSVerify:           s.AppConfig.SkipTLSVerification,
+			ProxyOptions:            s.AppConfig.HttpProxy,
+			CloneSubmodules:         s.AppConfig.GitCloneSubmodules,
+			Depth:                   s.DeployConfig.ResolveGitDepth(s.AppConfig.GitCloneDepth),
+		})
+		if gitStoreErr != nil {
+			return fmt.Errorf("failed to initialize git store: %w", gitStoreErr)
 		}
+
+		revision, resolveErr := gitStore.Resolve(ctx, s.DeployConfig.Reference)
+		if resolveErr != nil {
+			return fmt.Errorf("failed to resolve reference %s: %w", s.DeployConfig.Reference, resolveErr)
+		}
+
+		artifact, pErr := gitStore.Publish(ctx, revision)
+		if pErr != nil {
+			return fmt.Errorf("failed to publish artifact for revision %s: %w", revision, pErr)
+		}
+
+		rel, relErr := filepath.Rel(s.Docker.DataMountPoint.Destination, artifact.Path)
+		if relErr != nil {
+			return fmt.Errorf("failed to compute external path for artifact: %w", relErr)
+		}
+
+		s.Repository.PathInternal = artifact.Path
+		s.Repository.PathExternal = filepath.Join(s.Docker.DataMountPoint.Source, rel)
+
+		// This stack deploys exactly this revision - its deploy config may name a
+		// different reference (or a different repository) than the event that
+		// triggered the run resolved to. Recording it means later stages compare
+		// against and label with what was published here, instead of re-resolving
+		// the reference against a mirror another run may have advanced in the meantime.
+		s.Repository.Revision = string(revision)
+		s.resolvedOwnReference = true
+
+		s.Repository.MirrorDir = gitStore.MirrorDir()
+
+		if err := verifyMirrorReadable(s.Repository.MirrorDir); err != nil {
+			return err
+		}
+
+		stageLog.Debug("resolved repository artifact",
+			slog.String("url", s.Repository.SourceUrl),
+			slog.String("reference", s.DeployConfig.Reference),
+			slog.String("revision", string(revision)),
+			slog.String("path", s.Repository.PathExternal))
+	}
+
+	// Load the dotenv and external secrets files that belong to the repository resolved above,
+	// relative to this stack's working directory.
+	//
+	// This must run unconditionally. When RepositoryUrl is set it is the second pass that picks up
+	// the "remote:"-prefixed entries loadConfigSourceFiles deliberately left behind. When it is not
+	// set - by far the most common case, a deploy config living in the repository that triggered
+	// the deployment - this is the only pass there is, and gating it meant dotenv and external
+	// secrets files were never loaded at all for those stacks.
+	envFileKind := "local"
+	if s.DeployConfig.RepositoryUrl != "" {
+		envFileKind = "remote"
+	}
+
+	sourceFilesPath := filepath.Join(s.Repository.PathInternal, s.DeployConfig.WorkingDirectory)
+
+	err = deploy.LoadLocalDotEnv(s.DeployConfig, sourceFilesPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse %s env files: %w", envFileKind, err)
+	}
+
+	err = deploy.LoadExternalSecretsFiles(s.DeployConfig, sourceFilesPath)
+	if err != nil {
+		return fmt.Errorf("failed to parse %s external secrets files: %w", envFileKind, err)
+	}
+
+	mergeDeploymentEnvironment(s.DeployConfig)
+	deploy.MergeExternalSecretsFromFiles(s.DeployConfig)
+
+	if err := s.checkDestroyOwnership(ctx); err != nil {
+		return err
 	}
 
 	if s.JobTrigger == JobTriggerPoll {
@@ -253,14 +365,156 @@ func (s *StageManager) RunInitStage(ctx context.Context, stageLog *slog.Logger) 
 		s.Log = s.Log.With(
 			slog.String("stack", s.DeployConfig.Name),
 			slog.String("repository", s.Repository.Name),
+			slog.String("revision", s.Repository.Revision),
 		)
 	} else {
 		s.Log = s.Log.With(
 			slog.String("stack", s.DeployConfig.Name),
 			slog.String("repository", s.Repository.Name),
 			slog.String("reference", s.DeployConfig.Reference),
+			slog.String("revision", s.Repository.Revision),
 		)
 	}
 
 	return nil
+}
+
+// resolvedReferenceMatches treats a webhook's fully qualified branch reference
+// as equivalent to the short branch name accepted by deployment configs, see
+// git.ReferenceMatches.
+func resolvedReferenceMatches(resolvedReference, configuredReference string) bool {
+	return git.ReferenceMatches(resolvedReference, configuredReference)
+}
+
+// checkDestroyOwnership returns ErrDeploymentConflict if the deploy config destroys a stack with services
+// that doco-cd did not deploy from the repository of the job.
+func (s *StageManager) checkDestroyOwnership(ctx context.Context) error {
+	if !s.DeployConfig.Destroy.Enabled {
+		return nil
+	}
+
+	serviceLabels, err := docker.GetServiceLabels(ctx, s.Docker.Cmd.Client(), s.Docker.SwarmMode, s.DeployConfig.Name)
+	if err != nil {
+		return fmt.Errorf("failed to retrieve service labels: %w", err)
+	}
+
+	if !servicesBelongToRepository(serviceLabels, s.Repository) {
+		return fmt.Errorf("%w: %s: skipping deployment", ErrDeploymentConflict, s.DeployConfig.Name)
+	}
+
+	return nil
+}
+
+// servicesBelongToRepository reports whether all services with serviceLabels were deployed from repository.
+// A stack is labeled with the repository its deploy config was read from, or, with a repository_url, with
+// the repository it is deployed from, depending on the trigger. URLs prove ownership including source
+// type and host; name aliases alone are insufficient. Explicit destroy accepts OCI revisions of the
+// same repository, while auto-discovery cleanup remains scoped to a stable source reference.
+func servicesBelongToRepository(serviceLabels map[docker.Service]docker.Labels, repository *RepositoryData) bool {
+	if len(serviceLabels) == 0 {
+		return true
+	}
+
+	if repository == nil {
+		return false
+	}
+
+	sourceType, sourceName := destroySourceIdentity(repository.SourceUrl)
+
+	configType, configName := destroySourceIdentity(sourceURLForLabels(repository))
+	if sourceName == "" || configName == "" || sourceType != config.NormalizeSourceType(repository.Source) {
+		return false
+	}
+
+	for _, labels := range serviceLabels {
+		name, ok := labels[docker.DocoCDLabels.Source.Name]
+		if !ok || !docker.RepositoryLabelMatches(name, repository.Name, repository.SourceUrl, repository.ConfigSourceUrl) {
+			return false
+		}
+
+		labelType := config.SourceType(strings.TrimSpace(labels[docker.DocoCDLabels.Source.Type]))
+		if labelType != "" && labelType != sourceType && labelType != configType {
+			return false
+		}
+
+		labelURL := strings.TrimSpace(labels[docker.DocoCDLabels.Source.URL])
+		if labelURL == "" {
+			// Legacy services without URLs must carry both a source type and the full,
+			// host-qualified repository name. A hostless webhook name is ambiguous.
+			qualifiedName := strings.TrimSpace(name)
+
+			matchesSource := labelType == sourceType && qualifiedName == sourceName
+
+			matchesConfig := labelType == configType && qualifiedName == configName
+			if !matchesSource && !matchesConfig {
+				return false
+			}
+
+			continue
+		}
+
+		urlType, urlName := destroySourceIdentity(labelURL)
+
+		matchesSource := urlType == sourceType && urlName == sourceName
+
+		matchesConfig := urlType == configType && urlName == configName
+		if urlName == "" || !matchesSource && !matchesConfig {
+			return false
+		}
+
+		if labelType != "" && labelType != urlType {
+			// An OCI config's repository_url poll labels the Git deployment payload,
+			// while Source.URL still identifies the OCI config. This is the known
+			// cross-type relationship; other conflicting URL/type pairs fail closed.
+			if sourceType != config.SourceTypeGit || configType != config.SourceTypeOCI ||
+				labelType != sourceType || urlType != configType || urlName != configName ||
+				!docker.RepositoryLabelMatches(name, repository.SourceUrl) {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// destroySourceIdentity validates rather than applying cache/name aliases, which deliberately
+// erase distinctions that matter when authorizing destruction. Native Git URLs are not OCI
+// references. Parse OCI before other Git forms so digests cannot be mistaken for scp-style URLs.
+func destroySourceIdentity(sourceURL string) (config.SourceType, string) {
+	sourceURL = strings.TrimSpace(sourceURL)
+	if sourceURL == "" {
+		return "", ""
+	}
+
+	if !git.IsNativeGit(sourceURL) && config.OciUrl(sourceURL).Validate() == nil {
+		return config.SourceTypeOCI, oci.RepositoryNameFromArtifact(sourceURL)
+	}
+
+	if config.GitUrl(sourceURL).Validate() == nil {
+		return config.SourceTypeGit, git.GetRepoName(config.NormalizeGitURL(sourceURL))
+	}
+
+	return "", ""
+}
+
+// MatchesWebhookEventFilter reports whether this run should proceed based on
+// its trigger, configured webhook filter, and payload reference.
+func (s *StageManager) MatchesWebhookEventFilter() bool {
+	return WebhookEventFilterMatches(s.JobTrigger, s.DeployConfig.WebhookEventFilter, s.Payload)
+}
+
+// WebhookEventFilterMatches reports whether a job with trigger and payload passes the webhook event filter.
+// Only webhook jobs are filtered. An invalid filter matches nothing; deploy config validation rejects it.
+func WebhookEventFilterMatches(trigger JobTrigger, filter string, payload *webhook.ParsedPayload) bool {
+	if trigger != JobTriggerWebhook || filter == "" {
+		return true
+	}
+
+	if payload == nil {
+		return false
+	}
+
+	re, err := regexp.Compile(filter)
+
+	return err == nil && re.MatchString(payload.Ref)
 }

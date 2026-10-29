@@ -4,8 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/kimdre/doco-cd/internal/config/app"
@@ -13,10 +11,10 @@ import (
 )
 
 func (s *StageManager) RunDestroyStage(ctx context.Context, stageLog *slog.Logger) error {
-	s.Stages.Deploy.StartedAt = time.Now()
+	s.Stages.Destroy.StartedAt = time.Now()
 
 	defer func() {
-		s.Stages.Deploy.FinishedAt = time.Now()
+		s.Stages.Destroy.FinishedAt = time.Now()
 	}()
 
 	stageLog.Debug("destroying stack")
@@ -32,7 +30,7 @@ func (s *StageManager) RunDestroyStage(ctx context.Context, stageLog *slog.Logge
 	// If no containers are found, skip the destruction step
 	if len(serviceLabels) == 0 {
 		stageLog.Info("no services found for the stack, skipping destruction")
-		return ErrSkipDeployment
+		return NothingToDestroy()
 	}
 
 	// Find deployed commit and external secrets hash from labels of deployed services
@@ -50,42 +48,6 @@ func (s *StageManager) RunDestroyStage(ctx context.Context, stageLog *slog.Logge
 	err = docker.DestroyStack(stageLog, &ctx, &s.Docker.Cmd, s.DeployConfig, s.Docker.SwarmMode)
 	if err != nil {
 		return fmt.Errorf("failed to destroy stack: %w", err)
-	}
-
-	if s.Docker.SwarmMode && s.DeployConfig.Destroy.RemoveVolumes {
-		err = docker.RemoveLabeledVolumes(ctx, s.Docker.Cmd.Client(), s.Docker.SwarmMode, s.DeployConfig.Name)
-		if err != nil {
-			return fmt.Errorf("failed to remove volumes: %w", err)
-		}
-	}
-
-	if s.DeployConfig.Destroy.RemoveRepoDir {
-		// Remove the repository directory after destroying the stack
-		stageLog.Debug("removing deployment directory", slog.String("path", s.Repository.PathExternal))
-		// Check if the parent directory has multiple subdirectories/repos
-		parentDir := filepath.Dir(s.Repository.PathInternal)
-
-		subDirs, err := os.ReadDir(parentDir)
-		if err != nil {
-			return fmt.Errorf("failed to read parent directory: %w", err)
-		}
-
-		if len(subDirs) > 1 {
-			// Do not remove the parent directory if it has multiple subdirectories
-			stageLog.Debug("remove deployment directory but keep parent directory as it has multiple subdirectories", slog.String("path", s.Repository.PathInternal))
-
-			// Remove only the repository directory
-			err = os.RemoveAll(s.Repository.PathInternal)
-			if err != nil {
-				return fmt.Errorf("failed to remove repository directory: %w", err)
-			}
-		} else {
-			// Remove the parent directory if it has only one subdirectory
-			err = os.RemoveAll(parentDir)
-			if err != nil {
-				return fmt.Errorf("failed to remove deployment directory: %w", err)
-			}
-		}
 	}
 
 	return nil

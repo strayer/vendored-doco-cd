@@ -5,39 +5,123 @@ tags:
 
 # Application Settings
 
-## General Settings
+This page describes the settings that can be used to configure the doco-cd application.
+The settings can be set via environment variables, a `.env` file, or Docker secrets.
 
-The application can be configured using the following environment variables:
+??? example "Example `docker-compose.yml`"
 
-<!-- Sort table with https://sortfilterreordermarkdowntables.com/ -->
-| Key                          | Type           | Description                                                                                                                                                                                                                                                                                                                                                                                             | Default                                                       |
-|------------------------------|----------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------|
-| `API_SECRET`                 | string         | Secret that is used to authenticate requests to the REST API (see [REST API](Endpoints/REST-API.md))                                                                                                                                                                                                                                                                                                    | Rest API is disabled when not specified                       |
-| `API_SECRET_FILE`            | string         | Path to the file containing the API secret (Mutually exclusive with `API_SECRET`).                                                                                                                                                                                                                                                                                                                      |                                                               |
-| `DATA_HOST_PATH`             | string         | Optional source path of the deployment data mount as seen by the target Docker daemon. See [Remote Docker daemons](Docker-Settings.md#remote-docker-daemons).                                                                                                                                                                                                                                           | Automatically detected                                        |
-| `DATA_MOUNT_PATH`            | string         | Destination path of the writable deployment data mount inside the doco-cd container (set this if you do not mount the data volume at `/data`).                                                                                                                                                                                                                                                          | `/data`                                                       |
-| `DEPLOY_CONFIG_BASE_DIR`     | string         | Relative Path to the directory containing the deployment configuration files **in all repositories**. **NOTE**: This does not affect/alter the `working_dir` path in the deploy config. It must still be relative to the repository root.                                                                                                                                                               | `/`                                                           |
-| `HTTP_PORT`                  | number         | Port on which the application will listen for incoming webhooks, API requests and [healthchecks](Endpoints/Healthcheck.md)                                                                                                                                                                                                                                                                              | `80`                                                          |
-| `HTTP_TLS_CERT_FILE`           | string         | Path to the PEM certificate file used by the main webhook/API/healthcheck and metrics servers. HTTPS is enabled automatically when both `HTTP_TLS_CERT_FILE` and `HTTP_TLS_KEY_FILE` are set.                                                                                                                                                                                                          |                                                               |
-| `HTTP_TLS_KEY_FILE`            | string         | Path to the PEM private key file used by the main webhook/API/healthcheck and metrics servers. HTTPS is enabled automatically when both `HTTP_TLS_CERT_FILE` and `HTTP_TLS_KEY_FILE` are set.                                                                                                                                                                                                          |                                                               |
-| `HTTP_PROXY`                 | string         | HTTP proxy to use for outgoing requests (e.g. `http://username:password@proxy.com:8080`)                                                                                                                                                                                                                                                                                                                | Ignored when not specified                                    |
-| `TRUSTED_PROXY_HEADER`       | string         | HTTP header name containing the client's original IP address. Only used when the remote peer's IP is in `TRUSTED_PROXY_NETWORKS`. Header names are matched case-insensitively. When set to `X-Forwarded-For` (the default), falls back to the [RFC 7239](https://tools.ietf.org/html/rfc7239) `Forwarded` header if `X-Forwarded-For` is absent. A custom header is used exclusively, with no fallback. | `X-Forwarded-For`                                             |
-| `TRUSTED_PROXY_NETWORKS`     | list           | Comma-separated CIDR ranges that identify trusted proxies. When the remote peer matches one of these ranges, doco-cd reads the client IP from the header specified in `TRUSTED_PROXY_HEADER`.                                                                                                                                                                                                           | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128` |
-| `LOG_LEVEL`                  | string         | Log level of the app. Possible values: `debug`, `info`, `warn`, `error`                                                                                                                                                                                                                                                                                                                                 | `INFO`                                                        |
-| `MAX_CONCURRENT_DEPLOYMENTS` | number         | Maximum number of concurrent deployments allowed                                                                                                                                                                                                                                                                                                                                                        | `4`                                                           |
-| `MAX_DEPLOYMENT_LOOP_COUNT`  | number         | When the deployment loop detection should trigger a forced re-deployment on consecutive deployments for the same commit. Set to `0`, to disable the detection logic.                                                                                                                                                                                                                                    | `2`                                                           |
-| `MAX_PAYLOAD_SIZE`           | number         | The maximum size of the webhook payload in bytes that the HTTP server will accept                                                                                                                                                                                                                                                                                                                       | `1048576` (1MB = 1 * 1024 * 1024)                             |
-| `METRICS_PORT`               | number         | Port on which the application will expose [Prometheus metrics](Endpoints/Metrics.md)                                                                                                                                                                                                                                                                                                                    | `9120`                                                        |
-| `OCI_INSECURE_REGISTRIES`    | list           | Comma-separated OCI registry `host[:port]` entries for [Compose includes](https://docs.docker.com/compose/how-tos/multiple-compose-files/include). **TLS verification is disabled** for these registries; use only for trusted registries.                                                                                                                                                              | Ignored when not specified                                    |
-| `PASS_ENV`                   | boolean        | Controls whether environment variables from the doco-cd container should be passed to the deployment environment for docker compose variable interpolation. Use with caution, as this may expose sensitive information to the deployment environment.                                                                                                                                                   | `false`                                                       |
-| `POLL_CONFIG`                | list           | A list/array of poll configurations provided in YAML format (see [Poll Settings](Poll-Settings.md))                                                                                                                                                                                                                                                                                                     | Ignored when not specified                                    |
-| `POLL_CONFIG_FILE`           | string         | Path to the file inside the container containing the poll configurations in YAML format (see [Poll Settings](Poll-Settings.md))                                                                                                                                                                                                                                                                         | Ignored when not specified                                    |
-| `SCHEDULER_ENABLED`          | boolean        | Controls whether this doco-cd instance starts the built-in [job scheduler](Advanced/Job-Scheduling.md). Disable it on secondary/[self-updater](Advanced/Self-Updating.md) instances that should not trigger scheduled jobs.                                                                                                                                                                             | `true`                                                        |
-| `TZ`                         | string         | The [timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) used in the container.                                                                                                                                                                                                                                                                                                     | `UTC`                                                         |
-| `WEBHOOK_SECRET`             | string         | Secret that is used by webhooks for authentication to the application                                                                                                                                                                                                                                                                                                                                   | Webhook endpoint is disabled when not specified               |
-| `WEBHOOK_SECRET_FILE`        | string         | Path to the file containing the webhook secret (mutually exclusive with `WEBHOOK_SECRET`).                                                                                                                                                                                                                                                                                                              |                                                               |
-| `SOURCE_URL_REWRITES`        | map of strings | YAML map of git source URL rewrite rules, applied to both webhook and poll deployments. See [Source URL Rewrites](#source-url-rewrites).                                                                                                                                                                                                                                                                | Ignored when not specified                                    |
-| `SOURCE_URL_REWRITES_FILE`   | string         | Path to a file containing `SOURCE_URL_REWRITES` YAML (mutually exclusive with `SOURCE_URL_REWRITES`).                                                                                                                                                                                                                                                                                                   |                                                               |
+    ```ini title=".env"
+    GIT_ACCESS_TOKEN=<your Git token>
+    GIT_AUTH_DOMAINS=- domains: [github.com]
+    ```
+
+    ```yaml title="docker-compose.yml" hl_lines="8-15 23-28"
+    services:
+      app:
+        container_name: doco-cd
+        image: ghcr.io/kimdre/doco-cd:latest
+        restart: unless-stopped
+        ports:
+          - "80:80"
+        env_file:
+          - .env
+        environment:
+          TZ: Europe/Berlin
+          LOG_LEVEL: INFO
+          WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret #(1)!
+        secrets:
+          - webhook_secret
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - data:/data
+
+    volumes:
+      data:
+
+    secrets:
+      webhook_secret:
+        file: ./webhook_secret.txt
+    ```
+
+    1. The file name after the `/run/secrets/` path is the name of the secret
+
+## Runtime Settings
+
+| Key                     | Type    | Description                                                                                                                                                                                                                 | Default |
+|-------------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `LOG_LEVEL`             | string  | Log level of the app. Possible values: `debug`, `info`, `warn`, `error`                                                                                                                                                     | `INFO`  |
+| `VERSION_CHECK_ENABLED` | boolean | Checks for new doco-cd releases at startup. When disabled, skips the GitHub release lookup, new-version warning, and release announcement.                                                                                  | `true`  |
+| `SCHEDULER_ENABLED`     | boolean | Controls whether this doco-cd instance starts the built-in [job scheduler](Advanced/Job-Scheduling.md). Disable it on secondary/[self-updater](Advanced/Self-Updating.md) instances that should not trigger scheduled jobs. | `true`  |
+| `SELF_UPDATE_ENABLED`   | boolean | Allows doco-cd to deploy the stack that contains its own container (see [Self-Updating](Advanced/Self-Updating.md)). When disabled, such a deployment is refused with an error instead of being attempted.                  | `false` |
+| `SELF_UPDATE_STRATEGY`  | string  | How doco-cd replaces its own container: `scale_out` starts a second container and hands over without downtime, `applier` delegates to a throwaway clone, `auto` picks `scale_out` unless the compose file rules it out.     | `auto`  |
+| `SYNC_WINDOWS`          | list    | A YAML list of [sync windows](Advanced/Sync-Windows.md) that restrict when deployments may change stacks.                                                                                                                   |         |
+| `SYNC_WINDOWS_FILE`     | string  | Path to a file inside the container containing the [sync windows](Advanced/Sync-Windows.md) in YAML format (mutually exclusive with `SYNC_WINDOWS`).                                                                        |         |
+| `TZ`                    | string  | The [timezone](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones) used in the container.                                                                                                                         | `UTC`   |
+
+!!! question "For Docker-specific settings, see [Docker Settings](Docker-Settings.md)."
+
+## API and Webhook Settings
+
+| Key                   | Type    | Description                                                                                                                                                                                   | Default                                         |
+|-----------------------|---------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|
+| `API_SECRET`          | string  | Secret that is used to authenticate requests to the REST API (see [REST API](Endpoints/REST-API.md))                                                                                          | Rest API is disabled when not specified         |
+| `API_SECRET_FILE`     | string  | Path to the file containing the API secret (Mutually exclusive with `API_SECRET`).                                                                                                            |                                                 |
+| `METRICS_PORT`        | number  | Port on which the application will expose [Prometheus metrics](Endpoints/Metrics.md)                                                                                                          | `9120`                                          |
+| `MCP_ENABLED`         | boolean | Enables the [MCP server](Endpoints/MCP-Server.md) at `/mcp`. Requires an API secret from `API_SECRET` or `API_SECRET_FILE`; requests use the same `x-api-key` authentication as the REST API. | `false`                                         |
+| `OPENAPI_ENABLED`     | boolean | Exposes public REST and webhook [OpenAPI specifications and Swagger UIs](Endpoints/REST-API.md#openapi-documentation) under `/openapi/` and `/docs/`.                                         | `false`                                         |
+| `WEBHOOK_SECRET`      | string  | Secret that is used by webhooks for authentication to the application                                                                                                                         | Webhook endpoint is disabled when not specified |
+| `WEBHOOK_SECRET_FILE` | string  | Path to the file containing the webhook secret (mutually exclusive with `WEBHOOK_SECRET`).                                                                                                    |
+
+## HTTP and Network Settings
+
+| Key                      | Type   | Description                                                                                                                                                                                                                                                                                                                                                                                             | Default                                                       |
+|--------------------------|--------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------|
+| `HTTP_PORT`              | number | Port on which the application will listen for incoming webhooks, API requests and [healthchecks](Endpoints/Healthcheck.md)                                                                                                                                                                                                                                                                              | `80`                                                          |
+| `HTTP_PROXY`             | string | HTTP proxy to use for outgoing requests (e.g. `******proxy.com:8080`)                                                                                                                                                                                                                                                                                                                                   | Ignored when not specified                                    |
+| `HTTP_TLS_CERT_FILE`     | string | Path to the PEM certificate file used by the main webhook/API/healthcheck and metrics servers. HTTPS is enabled automatically when both `HTTP_TLS_CERT_FILE` and `HTTP_TLS_KEY_FILE` are set.                                                                                                                                                                                                           |                                                               |
+| `HTTP_TLS_KEY_FILE`      | string | Path to the PEM private key file used by the main webhook/API/healthcheck and metrics servers. HTTPS is enabled automatically when both `HTTP_TLS_CERT_FILE` and `HTTP_TLS_KEY_FILE` are set.                                                                                                                                                                                                           |                                                               |
+| `MAX_PAYLOAD_SIZE`       | number | The maximum size of the webhook payload in bytes that the HTTP server will accept. For example 1 MB is `1048576` (1 * 1024 * 1024)                                                                                                                                                                                                                                                                      | `1048576`                                                     |
+| `TRUSTED_PROXY_HEADER`   | string | HTTP header name containing the client's original IP address. Only used when the remote peer's IP is in `TRUSTED_PROXY_NETWORKS`. Header names are matched case-insensitively. When set to `X-Forwarded-For` (the default), falls back to the [RFC 7239](https://tools.ietf.org/html/rfc7239) `Forwarded` header if `X-Forwarded-For` is absent. A custom header is used exclusively, with no fallback. | `X-Forwarded-For`                                             |
+| `TRUSTED_PROXY_NETWORKS` | list   | Comma-separated CIDR ranges that identify trusted proxies. When the remote peer matches one of these ranges, doco-cd reads the client IP from the header specified in `TRUSTED_PROXY_HEADER`.                                                                                                                                                                                                           | `127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,::1/128` |
+
+## Storage Settings
+
+| Key               | Type   | Description                                                                                                                                                    | Default                |
+|-------------------|--------|----------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------|
+| `DATA_HOST_PATH`  | string | Optional source path of the artifact storage mount as seen by the target Docker daemon. See [Remote Docker daemons](Docker-Settings.md#remote-docker-daemons). | Automatically detected |
+| `DATA_MOUNT_PATH` | string | Destination path of the writable artifact storage mount inside the doco-cd container (set this if you do not mount the data volume at `/data`).                | `/data`                |
+
+### Artifact Garbage Collection Settings
+
+| Key                             | Type     | Description                                                                                                                                                                                                                                                                                                                                  | Default |
+|---------------------------------|----------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------|
+| `ARTIFACT_GC_ENABLED`           | boolean  | Enables the built-in sweeper that removes old, unreferenced published source artifacts (Git revisions/OCI digests) to reclaim disk space and limit how long decrypted SOPS secrets remain on disk. See [Artifact Garbage Collection](Reference/Artifact-Storage.md#garbage-collection).                                                      | `true`  |
+| `ARTIFACT_GC_INTERVAL`          | duration | How often the artifact garbage collector sweeps for removable artifacts (it also always sweeps once at startup). Accepts a [Go duration](https://pkg.go.dev/time#ParseDuration).                                                                                                                                                             | `10m`   |
+| `ARTIFACT_GC_RETENTION_RECORDS` | number   | Number of most-recent unreferenced artifacts kept per repository/artifact, regardless of `ARTIFACT_GC_RETENTION_TTL`.                                                                                                                                                                                                                        | `2`     |
+| `ARTIFACT_GC_RETENTION_TTL`     | duration | How long an unreferenced artifact beyond `ARTIFACT_GC_RETENTION_RECORDS` is kept before it becomes eligible for removal. Accepts a [Go duration](https://pkg.go.dev/time#ParseDuration).                                                                                                                                                     | `1m`    |
+
+Garbage collection only removes unreferenced immutable artifacts according to the retention settings above.
+Shared source directories, Git mirrors, submodule mirrors and mutable `live/` data are not removed by the sweeper.
+Destroying a stack also keeps its shared source directory; see [Source directory retention](Reference/Artifact-Storage.md#source-directory-retention).
+
+### Source Garbage Collection Settings
+
+| Key                       | Type     | Description                                                                                                                     | Default |
+|---------------------------|----------|---------------------------------------------------------------------------------------------------------------------------------|---------|
+| `SOURCE_GC_ENABLED`       | boolean  | Enable cleanup of unused source caches. See [Source garbage collection](Reference/Artifact-Storage.md#source-garbage-collection). | `false` |
+| `SOURCE_GC_INTERVAL`      | duration | Time between sweeps. The first sweep runs one interval after startup. Minimum: `1m`. Accepts a [Go duration](https://pkg.go.dev/time#ParseDuration). | `1h`    |
+| `SOURCE_GC_RETENTION_TTL` | duration | Minimum idle time before eviction. Minimum: `1h`. Accepts a [Go duration](https://pkg.go.dev/time#ParseDuration). | `168h`  |
+
+## OCI Registry Settings
+
+| Key                       | Type | Description                                                                                                                                                                                                                                | Default                    |
+|---------------------------|------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|----------------------------|
+| `OCI_INSECURE_REGISTRIES` | list | Comma-separated OCI registry `host[:port]` entries for [Compose includes](https://docs.docker.com/compose/how-tos/multiple-compose-files/include). **TLS verification is disabled** for these registries; use only for trusted registries. | Ignored when not specified |
+
+### Pulling images from a private registry
+
+If you want to pull images from a private registry, see [Container Registry Authentication](Advanced/Container-Registry-Authentication.md).
+
 
 ## Notification Settings
 
@@ -76,12 +160,13 @@ The settings in the `.env` file must be in the format `#!ini KEY=VALUE` or `#!ya
 Example `.env` file:
 ```ini title=".env"
 GIT_ACCESS_TOKEN=xxx
+GIT_AUTH_DOMAINS=- domains: [github.com]
 WEBHOOK_SECRET=xxx
 ```
 
 #### Multiline YAML options
 
-For multiline YAML options like `POLL_CONFIG` and `SOURCE_URL_REWRITES`, the `.env` file format does not support multiline values. Instead, use the corresponding `*_FILE` environment variables to point to separate YAML files:
+For multiline YAML options like `POLL_CONFIG`, `SOURCE_URL_REWRITES` and `SYNC_WINDOWS`, the `.env` file format does not support multiline values. Instead, use the corresponding `*_FILE` environment variables to point to separate YAML files:
 
 ```ini title=".env"
 POLL_CONFIG_FILE=/mnt/poll-config.yaml
@@ -125,12 +210,13 @@ services:
   app:
     environment:
       GIT_ACCESS_TOKEN: xxx
+      GIT_AUTH_DOMAINS: "- domains: [github.com]" # hosts that receive the token
       WEBHOOK_SECRET: xxx
 ```
 
 #### Multiline YAML options
 
-For multiline YAML options like `POLL_CONFIG` and `SOURCE_URL_REWRITES`, use YAML's literal block scalar (`|`):
+For multiline YAML options like `POLL_CONFIG`, `SOURCE_URL_REWRITES` and `SYNC_WINDOWS`, use YAML's literal block scalar (`|`):
 
 ```yaml title="docker-compose.yml"
 services:
@@ -167,7 +253,7 @@ echo "<random secret>" | docker secret create webhook_secret -
 ```
 
 ### Reference Docker Secrets in `docker-compose.yml`
-```yaml title="docker-compose.yml" hl_lines="10-16 24-29"
+```yaml title="docker-compose.yml" hl_lines="10-17 25-30"
 services:
   app:
     container_name: doco-cd
@@ -178,6 +264,7 @@ services:
     environment:
       TZ: Europe/Berlin
       GIT_ACCESS_TOKEN_FILE: /run/secrets/git_access_token # (1)!
+      GIT_AUTH_DOMAINS: "- domains: [github.com]" # hosts that receive the token
       WEBHOOK_SECRET_FILE: /run/secrets/webhook_secret
     secrets: # (2)!
       - git_access_token
@@ -219,52 +306,3 @@ To check the status of the service, you can use the following command:
 ```sh
 docker service ps doco-cd_app
 ```
-
-## Pulling images from a private registry
-
-If you want to pull images from a private registry, see [Container Registry Authentication](Advanced/Container-Registry-Authentication.md) in the wiki.
-
-## Source URL Rewrites
-
-`SOURCE_URL_REWRITES` (and `SOURCE_URL_REWRITES_FILE`) let you rewrite git source URLs before doco-cd clones them. Rules apply to both webhook- and poll-triggered deployments.
-
-This is useful when your Git provider advertises a public URL (in webhook payloads or poll configs) but doco-cd should clone through an internal network path instead — for example when your Forgejo instance is behind a reverse proxy with a public domain, but is reachable directly over a Docker network.
-
-Two match strategies are supported:
-
-- **URL/URI prefix** — e.g. `https://forgejo.example.com/` or `git@forgejo.example.com:`.
-  The matched prefix in the source URL is replaced with the configured target, and the repository path is appended as-is.
-    - HTTPS URLs should end with `/` to avoid partial host matches.
-    - SCP-style SSH URLs (e.g. `git@host:`) **must** end with `:` — it is the mandatory separator between host and repository path in SCP syntax (`user@host:path/repo.git`).
-    - SCP syntax cannot express a port number. Use `ssh://` syntax when targeting a non-standard port (e.g. `"ssh://git@forgejo.internal:2222/"`).
-- **Host/domain** — e.g. `forgejo.example.com`. Only the host (and optional port) is replaced; scheme, credentials, and path are preserved.
-
-Rules are matched in order of specificity (longest key first).
-
-!!! example
-
-    ```yaml title="Some possible examples"
-    SOURCE_URL_REWRITES:
-      # HTTPS → internal HTTP (key ends with / to avoid partial-host matches)
-      "https://forgejo.example.com/": "http://forgejo:3000/"
-      # Host-only match (replaces host+port, keeps scheme/path)
-      "forgejo.example.com": "forgejo:3000"
-      # SCP-style SSH → SCP-style SSH (the trailing : is required — it is the SCP host/path separator)
-      # OR: SCP-style SSH → ssh:// with non-standard port (SCP syntax cannot carry a port number)
-      # Pick one of these two, not both (YAML map keys must be unique):
-      # "git@forgejo.example.com:": "git@forgejo.internal:"
-      # "git@forgejo.example.com:": "ssh://git@forgejo.internal:2222/"
-    ```
-
-    In your doco-cd `docker-compose.yml`, you can set this as follows:
-
-    ```yaml title="docker-compose.yml"
-    services:
-      app:
-        environment:
-          SOURCE_URL_REWRITES: |
-            # HTTP variant:
-            "forgejo.example.com": "forgejo:3000"
-            # SSH variant with explicit port:
-            "git@forgejo.example.com:": "ssh://git@forgejo:2222/"
-    ```

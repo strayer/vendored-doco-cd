@@ -3,28 +3,47 @@ package restapi
 import (
 	"net/http"
 	"testing"
-
-	"github.com/kimdre/doco-cd/internal/config/app"
 )
 
 func TestValidateApiKey(t *testing.T) {
 	t.Parallel()
 
-	appConfig, err := app.GetConfig()
-	if err != nil {
-		t.Fatalf("Failed to get app config: %v", err)
-	}
+	const apiKey = "test_api_secret"
 
 	testCases := []struct {
 		name       string
 		apiKey     string
 		checkKey   string
+		setHeader  bool
 		shouldPass bool
 	}{
-		{"Valid API Key", appConfig.ApiSecret, appConfig.ApiSecret, true},
-		{"Invalid API Key", appConfig.ApiSecret, "invalid_key", false},
-		{"Missing API Key", appConfig.ApiSecret, "", false},
-		{"Unset API Key", "", "", false},
+		{
+			name:       "Valid API Key",
+			apiKey:     apiKey,
+			checkKey:   apiKey,
+			setHeader:  true,
+			shouldPass: true,
+		},
+		{
+			name:       "Invalid API Key",
+			apiKey:     apiKey,
+			checkKey:   "test_apiSecret2",
+			setHeader:  true,
+			shouldPass: false,
+		},
+		{
+			name:       "Missing API Key",
+			apiKey:     apiKey,
+			setHeader:  false,
+			shouldPass: false,
+		},
+		{
+			name:       "Unset API Key",
+			apiKey:     "",
+			checkKey:   "",
+			setHeader:  true,
+			shouldPass: false,
+		},
 	}
 
 	for _, tc := range testCases {
@@ -36,7 +55,7 @@ func TestValidateApiKey(t *testing.T) {
 				t.Fatalf("Failed to create request: %v", err)
 			}
 
-			if tc.apiKey != "" {
+			if tc.setHeader {
 				req.Header.Add(KeyHeader, tc.checkKey)
 			}
 

@@ -2,20 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
 
-	"github.com/docker/cli/cli/command"
-	"github.com/moby/moby/api/types/container"
+	"github.com/go-co-op/gocron/v2"
 
-	"github.com/kimdre/doco-cd/internal/common/id"
-
+	"github.com/kimdre/doco-cd/internal/common/lifecycle"
 	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/poll"
+	"github.com/kimdre/doco-cd/internal/controlplane"
 	"github.com/kimdre/doco-cd/internal/notification"
-	"github.com/kimdre/doco-cd/internal/secretprovider"
+	"github.com/kimdre/doco-cd/internal/selfupdate"
+	"github.com/kimdre/doco-cd/internal/source"
 	"github.com/kimdre/doco-cd/internal/stages"
 
 	"github.com/kimdre/doco-cd/internal/git"
@@ -24,11 +25,6 @@ import (
 	"github.com/kimdre/doco-cd/internal/source/oci"
 	"github.com/kimdre/doco-cd/internal/webhook"
 )
-
-type pollRunner func(ctx context.Context, pollConfig poll.Config, appConfig *app.Config, dataMountPoint container.MountPoint,
-	dockerCli command.Cli, logger *slog.Logger, metadata notification.Metadata, secretProvider *secretprovider.SecretProvider,
-	triggerReason string,
-) error
 
 // Poll trigger reasons, reported in the "polling <entity>" log line's
 // trigger.event field so it's possible to tell a regular interval-driven poll
@@ -46,13 +42,14 @@ const (
 const pollWatcherlessFallbackInterval = 24 * time.Hour
 
 // StartPoll initializes PollJob with the provided configuration and starts the PollHandler goroutine.
-func StartPoll(ctx context.Context, h *handlerData, pollConfig poll.Config, wg *sync.WaitGroup) error {
+func StartPoll(ctx context.Context, h *orchestrationHandler, pollConfig poll.Config, wg *sync.WaitGroup) error {
 	isLocalGit := config.NormalizeSourceType(pollConfig.Source) == config.SourceTypeGit &&
 		git.IsLocalFile(pollConfig.SourceUrl)
 
-	// interval=0 disables polling, unless the source is a local git repo, which
-	// can be driven by a filesystem watcher instead (see pollConfig.Watch).
-	if pollConfig.Interval == 0 && !pollConfig.RunOnce && !isLocalGit {
+	// interval=0 disables polling, unless a schedule is set or the source is a
+	// local git repo, which can be driven by a filesystem watcher instead (see
+	// pollConfig.Watch).
+	if pollConfig.Interval == 0 && pollConfig.Schedule == "" && !pollConfig.RunOnce && !isLocalGit {
 		h.log.Info("polling job disabled by config", "config", &pollConfig)
 
 		return nil
@@ -75,9 +72,9 @@ func StartPoll(ctx context.Context, h *handlerData, pollConfig poll.Config, wg *
 }
 
 // PollHandler handles polling for changes in a configured source.
-func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
+func (h *orchestrationHandler) PollHandler(ctx context.Context, pollJob *poll.Job) {
 	sourceType := config.NormalizeSourceType(pollJob.Config.Source)
-	entity := logEntityForSourceType(sourceType)
+	entity := source.EntityLabel(sourceType)
 
 	repoName := git.GetRepoName(pollJob.Config.SourceUrl)
 	if sourceType == config.SourceTypeOCI {
@@ -92,16 +89,34 @@ func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
 	logger := h.log.With(slog.String(entity, logValue))
 	logger.Debug("Start poll handler")
 
-	runner := h.runPoll
-	if runner == nil {
-		runner = RunPoll
+	// run_once ignores the schedule, like it ignores the interval.
+	var schedule gocron.Cron
+
+	if !pollJob.Config.RunOnce {
+		var scheduleErr error
+
+		schedule, scheduleErr = pollJob.Config.ParseSchedule()
+		if scheduleErr != nil {
+			logger.Error("invalid poll schedule, poll job disabled", log.ErrAttr(scheduleErr))
+
+			return
+		}
+	}
+
+	isLocalGit := sourceType == config.SourceTypeGit && git.IsLocalFile(pollJob.Config.SourceUrl)
+
+	// A schedule restricts polls to its occurrences, so the local repository
+	// watcher, which would poll on every new commit, is not started.
+	if schedule != nil && isLocalGit && pollJob.Config.Watch {
+		logger.Info("local repository watcher disabled because a poll schedule is set",
+			slog.String("schedule", pollJob.Config.Schedule))
 	}
 
 	// For local git repositories, start a filesystem watcher so new commits
 	// trigger deployment immediately without waiting for the next interval.
 	var watchCh <-chan struct{}
 
-	if sourceType == config.SourceTypeGit && git.IsLocalFile(pollJob.Config.SourceUrl) && pollJob.Config.Watch {
+	if isLocalGit && pollJob.Config.Watch && !pollJob.Config.RunOnce && schedule == nil {
 		var watchErr error
 
 		watchCh, watchErr = git.WatchLocalGitRef(ctx, pollJob.Config.SourceUrl, logger)
@@ -119,59 +134,57 @@ func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
 	// fall back to a long safety-net interval instead of spinning in a tight
 	// loop on time.After(0) or never polling again.
 	pollInterval := pollJob.Config.Interval
-	if pollInterval == 0 && watchCh == nil {
+	if pollInterval == 0 && schedule == nil && watchCh == nil && !pollJob.Config.RunOnce {
 		logger.Warn("no watcher and no poll interval configured, falling back to safety-net poll interval",
 			slog.Duration("interval", pollWatcherlessFallbackInterval))
 
 		pollInterval = pollWatcherlessFallbackInterval
 	}
 
-	doRun := func(trigger string) {
-		jobID := id.GenID()
+	nextDelay := func(now time.Time) time.Duration {
+		return pollNextDelay(schedule, pollInterval, now)
+	}
 
-		metadata := notification.Metadata{
-			Repository: repoName,
-			Stack:      "",
-			Target:     pollJob.Config.CustomTarget,
-			Revision:   notification.GetRevision(pollJob.Config.Reference, ""),
-			JobID:      jobID,
-		}
+	timerTrigger := "interval"
+	if schedule != nil {
+		timerTrigger = "schedule"
+	}
 
-		logger.Debug("start poll job", slog.String("trigger", trigger))
-
-		if h.runTracker != nil {
-			h.runTracker.TrackAccepted(jobID, deploymentRunTriggerPoll)
-			h.runTracker.SetMetadata(jobID, repoName, "", notification.GetRevision(pollJob.Config.Reference, ""))
-			h.runTracker.MarkRunning(jobID)
-		}
-
-		triggerReason := pollTriggerDefault
-		if trigger == "watch" {
-			triggerReason = pollTriggerWatch
-		}
-
-		err := runner(ctx, pollJob.Config, h.appConfig, h.dataMountPoint, h.dockerCli, logger, metadata, h.secretProvider, triggerReason)
-
-		if h.runTracker != nil {
-			if err != nil {
-				h.runTracker.MarkFailed(jobID, err.Error())
-			} else {
-				h.runTracker.MarkSucceeded(jobID, "poll completed successfully")
-			}
-		}
-
-		pollJob.LastRun = time.Now().Unix()
-
-		if pollInterval > 0 {
-			pollJob.NextRun = time.Now().Add(pollInterval).Unix()
+	updateNextRun := func() {
+		now := time.Now()
+		if delay := nextDelay(now); delay > 0 {
+			pollJob.NextRun = now.Add(delay).Unix()
 		} else {
 			// Watcher-only mode: no periodic run is scheduled.
 			pollJob.NextRun = 0
 		}
 	}
 
-	// Always run immediately on startup.
-	doRun("startup")
+	doRun := func(trigger string) {
+		logger.Debug("start poll job", slog.String("trigger", trigger))
+
+		triggerReason := pollTriggerDefault
+		if trigger == "watch" {
+			triggerReason = pollTriggerWatch
+		}
+
+		_, _ = h.controlPlaneRuns.RunConfiguredPoll(ctx, pollJob.Config, h.log.Logger, triggerReason)
+
+		pollJob.LastRun = time.Now().Unix()
+
+		updateNextRun()
+	}
+
+	// Interval polls run immediately on startup. Scheduled polls wait for the
+	// next occurrence so a restart never polls outside the schedule.
+	if schedule == nil {
+		doRun("startup")
+	} else {
+		updateNextRun()
+		logger.Info("waiting for next scheduled poll",
+			slog.String("schedule", pollJob.Config.Schedule),
+			slog.String("next_run", time.Unix(pollJob.NextRun, 0).Format(time.RFC3339)))
+	}
 
 	if pollJob.Config.RunOnce {
 		logger.Debug("run_once is set, exiting poll handler after run")
@@ -187,8 +200,8 @@ func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
 		timerC <-chan time.Time
 	)
 
-	if pollInterval > 0 {
-		timer = time.NewTimer(pollInterval)
+	if delay := nextDelay(time.Now()); delay > 0 {
+		timer = time.NewTimer(delay)
 		timerC = timer.C
 
 		defer timer.Stop()
@@ -230,22 +243,18 @@ func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
 			return
 
 		case <-timerC:
-			doRun("interval")
-			resetTimer(pollInterval)
+			doRun(timerTrigger)
+			resetTimer(nextDelay(time.Now()))
 
 		case _, ok := <-watchCh:
 			if !ok {
-				// Watcher closed unexpectedly; fall back to interval polling so
-				// the job keeps running instead of going silent until restart.
-				watchCh = nil
-				pollInterval = pollJob.Config.Interval
-
-				if pollInterval == 0 {
-					pollInterval = pollWatcherlessFallbackInterval
+				fallbackInterval, stop := watcherClosedFallback(ctx, logger, pollJob.Config.Interval)
+				if stop {
+					return
 				}
 
-				logger.Warn("local repository watcher closed, continuing with interval polling",
-					slog.Duration("interval", pollInterval))
+				watchCh = nil
+				pollInterval = fallbackInterval
 
 				resetTimer(pollInterval)
 
@@ -259,7 +268,50 @@ func (h *handlerData) PollHandler(ctx context.Context, pollJob *poll.Job) {
 	}
 }
 
-func pollError(jobLog *slog.Logger, metadata notification.Metadata, err error) {
+// pollNextDelay returns how long to wait before the next timer-driven poll:
+// until the next schedule occurrence if a schedule is set, otherwise the
+// interval. A result of 0 means no timer-driven poll (watcher-only mode or a
+// schedule without further occurrences).
+func pollNextDelay(schedule gocron.Cron, interval time.Duration, now time.Time) time.Duration {
+	if schedule == nil {
+		return interval
+	}
+
+	next := schedule.Next(now)
+	if next.IsZero() {
+		return 0
+	}
+
+	// Next is strictly after now, but guard against a zero or negative delay,
+	// which would disable the timer.
+	return max(next.Sub(now), time.Millisecond)
+}
+
+// watcherClosedFallback decides how PollHandler reacts to a closed local
+// repository watcher channel. During application shutdown it returns
+// stop=true so the handler exits quietly. Otherwise the watcher died
+// unexpectedly: it logs a warning and returns the interval to continue
+// polling with, falling back to the safety-net interval when no interval is
+// configured, so the job keeps running instead of going silent until restart.
+func watcherClosedFallback(ctx context.Context, logger *slog.Logger, configuredInterval time.Duration) (time.Duration, bool) {
+	if ctx.Err() != nil {
+		logger.Debug("ctx is done in poll handler")
+
+		return 0, true
+	}
+
+	fallbackInterval := configuredInterval
+	if fallbackInterval == 0 {
+		fallbackInterval = pollWatcherlessFallbackInterval
+	}
+
+	logger.Warn("local repository watcher closed, continuing with interval polling",
+		slog.Duration("interval", fallbackInterval))
+
+	return fallbackInterval, false
+}
+
+func pollError(jobLog *slog.Logger, metadata notification.Metadata, err error, notifier notification.Sender) {
 	prometheus.PollErrors.WithLabelValues(metadata.Repository).Inc()
 
 	if metadata.Stack != "" {
@@ -274,16 +326,20 @@ func pollError(jobLog *slog.Logger, metadata notification.Metadata, err error) {
 		return
 	}
 
+	if notifier == nil {
+		return
+	}
+
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				logRecoveredPanic(jobLog, "poll error notification", r)
+				log.LogRecoveredPanic(jobLog, "poll error notification", r)
 			}
 		}()
 
 		sendLog := jobLog.With()
 
-		err = notification.Send(notification.Failure, "Poll Job failed", err.Error(), metadata)
+		err = notifier.Send(notification.Failure, "Poll Job failed", err.Error(), metadata)
 		if err != nil {
 			sendLog.Error("failed to send notification", log.ErrAttr(err))
 		}
@@ -294,14 +350,13 @@ func pollError(jobLog *slog.Logger, metadata notification.Metadata, err error) {
 // identifies what caused this run (e.g. "poll" for interval/API-triggered runs, or
 // "poll-watch" when triggered by the local repository filesystem watcher) and is
 // reported in the "polling <entity>" log line's trigger.event field.
-func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config, dataMountPoint container.MountPoint,
-	dockerCli command.Cli, logger *slog.Logger, metadata notification.Metadata, secretProvider *secretprovider.SecretProvider,
-	triggerReason string,
+func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config, logger *slog.Logger, metadata notification.Metadata,
+	triggerReason string, deployment *controlplane.Deployment, notifier notification.Sender,
 ) error {
 	startTime := time.Now()
 	sourceType := config.NormalizeSourceType(pollConfig.Source)
 	sourceRef := pollConfig.SourceUrl
-	entity := logEntityForSourceType(sourceType)
+	entity := source.EntityLabel(sourceType)
 	sourceURLRewriteApplied := false
 
 	if sourceType == config.SourceTypeGit && appConfig != nil {
@@ -318,21 +373,22 @@ func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config,
 		repoName = oci.RepositoryNameFromArtifact(sourceRef)
 	}
 
+	logValue := repoName
+	if sourceType == config.SourceTypeOCI {
+		logValue = sourceRef
+	}
+
 	jobLog := logger.With(
 		slog.String("job_id", metadata.JobID),
+		slog.String(entity, logValue),
 	)
 
 	if sourceURLRewriteApplied {
-		jobLog.Debug("using configured source URL rewrite", slog.String("source_url", sourceRef))
+		jobLog.Debug("using configured source URL rewrite", slog.String("source_url", redactURLUserinfo(sourceRef)))
 	}
 
 	if pollConfig.CustomTarget != "" {
 		jobLog = jobLog.With(slog.String("target", pollConfig.CustomTarget))
-	}
-
-	configVal := log.BuildLogValue(&pollConfig, "Deployments.Internal")
-	if pollConfig.Source == config.SourceTypeOCI {
-		configVal = log.BuildLogValue(&pollConfig, "Reference", "Deployments.Internal")
 	}
 
 	eventValue := triggerReason
@@ -343,7 +399,7 @@ func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config,
 	jobLog.Info("polling "+entity,
 		slog.Group("trigger",
 			slog.String("event", eventValue),
-			slog.Attr{Key: "config", Value: configVal}))
+			slog.Attr{Key: "config", Value: pollConfigLogValue(pollConfig)}))
 
 	// For OCI sources, use the tag from the artifact reference as the deployment reference
 	// (e.g., "latest" from "ghcr.io/org/repo:latest") rather than pollConfig.Reference.
@@ -352,25 +408,105 @@ func RunPoll(ctx context.Context, pollConfig poll.Config, appConfig *app.Config,
 		pollReference = oci.TagFromArtifact(sourceRef)
 	}
 
-	deployErr := handle(ctx, jobLog,
-		appConfig, dataMountPoint, secretProvider, dockerCli,
-		stages.JobTriggerPoll, sourceType, sourceRef, pollReference, false,
-		metadata, pollConfig.CustomTarget, "",
-		pollConfig, webhook.ParsedPayload{},
-	)
+	deployErr := deployment.Deploy(ctx, controlplane.DeploymentRequest{
+		Logger:       jobLog,
+		JobTrigger:   stages.JobTriggerPoll,
+		SourceType:   sourceType,
+		SourceRef:    sourceRef,
+		Ref:          pollReference,
+		Private:      false,
+		Metadata:     metadata,
+		CustomTarget: pollConfig.CustomTarget,
+		TestName:     "",
+		PollConfig:   pollConfig,
+		Payload:      webhook.ParsedPayload{},
+	})
 
-	nextRun := time.Now().Add(pollConfig.Interval).Format(time.RFC3339)
+	nextRun := formatPollNextRun(pollConfig.NextRun(time.Now()))
 	elapsedTime := time.Since(startTime)
 
-	if deployErr != nil {
-		pollError(jobLog, metadata, deployErr)
-		jobLog.Warn("job completed with errors", log.ErrAttr(deployErr), slog.String("elapsed_time", elapsedTime.Truncate(time.Millisecond).String()), slog.String("next_run", nextRun))
-	} else {
-		jobLog.Info("job completed successfully", slog.String("elapsed_time", elapsedTime.Truncate(time.Millisecond).String()), slog.String("next_run", nextRun))
-	}
+	reportPollOutcome(jobLog, metadata, deployErr, notifier, elapsedTime, nextRun)
 
 	prometheus.PollTotal.WithLabelValues(repoName).Inc()
 	prometheus.PollDuration.WithLabelValues(repoName).Observe(elapsedTime.Seconds())
 
 	return deployErr
+}
+
+// formatPollNextRun formats the next poll time for logs. Zero means there is
+// no timer-driven next run (run_once, API-triggered or watcher-only polls).
+func formatPollNextRun(next time.Time) string {
+	if next.IsZero() {
+		return "none"
+	}
+
+	return next.Format(time.RFC3339)
+}
+
+// reportPollOutcome logs how a poll run ended and reports genuine failures.
+// A run interrupted by application shutdown is expected, so it stays at debug
+// level and is neither counted nor notified as a poll failure.
+func reportPollOutcome(
+	jobLog *slog.Logger, metadata notification.Metadata, deployErr error, notifier notification.Sender,
+	elapsedTime time.Duration, nextRun string,
+) {
+	elapsed := slog.String("elapsed_time", elapsedTime.Truncate(time.Millisecond).String())
+
+	switch {
+	case lifecycle.IsCanceled(deployErr):
+		jobLog.Debug("poll job canceled during application shutdown", log.ErrAttr(deployErr), elapsed)
+	case errors.Is(deployErr, selfupdate.ErrHandover):
+		// The successor reports the result once it has proven itself healthy,
+		// so this run is neither a success nor a failure.
+		jobLog.Info("self-update handover in progress", elapsed, slog.String("next_run", nextRun))
+	case errors.Is(deployErr, stages.ErrRetrySuppressed):
+		jobLog.Debug("job skipped by deployment retry policy", slog.String("reason", deployErr.Error()), elapsed, slog.String("next_run", nextRun))
+	case errors.Is(deployErr, stages.ErrSyncWindowBlocked):
+		// An intentional no-op: the next poll inside a window deploys the
+		// latest revision.
+		jobLog.Info("job deferred by sync window", slog.String("reason", deployErr.Error()), elapsed, slog.String("next_run", nextRun))
+	case deployErr != nil:
+		pollError(jobLog, metadata, deployErr, notifier)
+		jobLog.Warn("job completed with errors", log.ErrAttr(deployErr), elapsed, slog.String("next_run", nextRun))
+	default:
+		jobLog.Info("job completed successfully", elapsed, slog.String("next_run", nextRun))
+	}
+}
+
+func pollConfigLogValue(pollConfig poll.Config) slog.Value {
+	type deploymentLogValue struct {
+		Name string `yaml:"name"`
+	}
+
+	type configLogValue struct {
+		Source       config.SourceType    `yaml:"source"`
+		Reference    string               `yaml:"reference"`
+		Interval     time.Duration        `yaml:"interval"`
+		Schedule     string               `yaml:"schedule,omitempty"`
+		CustomTarget string               `yaml:"target"`
+		RunOnce      bool                 `yaml:"run_once"`
+		Deployments  []deploymentLogValue `yaml:"deployments"`
+	}
+
+	deployments := make([]deploymentLogValue, 0, len(pollConfig.Deployments))
+	for _, deployment := range pollConfig.Deployments {
+		if deployment != nil {
+			deployments = append(deployments, deploymentLogValue{Name: deployment.Name})
+		}
+	}
+
+	value := configLogValue{
+		Source:       pollConfig.Source,
+		Reference:    pollConfig.Reference,
+		Interval:     pollConfig.Interval,
+		Schedule:     pollConfig.Schedule,
+		CustomTarget: pollConfig.CustomTarget,
+		RunOnce:      pollConfig.RunOnce,
+		Deployments:  deployments,
+	}
+	if config.NormalizeSourceType(pollConfig.Source) == config.SourceTypeOCI {
+		value.Reference = ""
+	}
+
+	return log.BuildLogValue(value)
 }

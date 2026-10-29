@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/compose/v5/pkg/api"
 
+	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/app"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
 	"github.com/kimdre/doco-cd/internal/lock"
@@ -23,23 +25,34 @@ import (
 // redeploys, distinguishing them from webhook, poll, or scheduled-job triggered redeploys.
 const certRotationTrigger = "cert.rotation"
 
+// ErrCertificateRotationPaused marks a rotation intentionally skipped by admission.
+var ErrCertificateRotationPaused = errors.New("certificate rotation paused")
+
 // RotateProjectCertificates reloads the deploy config for a rotatable deployment (identified by
 // its doco-cd labels, see DocoCDLabels.Deployment.CertRotatable), re-resolves its external secrets
 // (reissuing any pki-role certificates through the configured secret provider), and redeploys so
 // the fresh values take effect.
+//
+// contextName identifies the Docker context dockerCli was created for (empty for the local
+// default context, see NormalizeContextName/DisplayContextName); it namespaces the per-stack
+// scheduler/deploy lock (see lock.StackKey) and identifies the target to opts.Admission.
+// Discovered resources need no extra "context" label: the caller (certrotation.Watcher) already
+// knows which context's client produced labels, since it scans one context's resources at a time.
 //
 // Compose deployments only recreate the services actually consuming a rotated certificate/key.
 // Swarm stacks redeploy the whole stack, but Swarm's own spec diffing (see
 // stableSwarmMetadataLabels) still limits recreation to the affected services.
 func RotateProjectCertificates(
 	ctx context.Context,
+	contextName string,
 	dockerCli command.Cli,
 	labels map[string]string,
-	secretProvider *secretprovider.SecretProvider,
+	secretProvider secretprovider.SecretProvider,
 	swarmMode bool,
+	opts CertificateRotationOptions,
 ) error {
 	if swarmMode {
-		return rotateSwarmProjectCertificates(ctx, dockerCli, labels, secretProvider)
+		return rotateSwarmProjectCertificates(ctx, contextName, dockerCli, labels, secretProvider, opts)
 	}
 
 	ref, err := composeScheduledServiceRefFromLabels(labels)
@@ -52,10 +65,32 @@ func RotateProjectCertificates(
 		stackName = ref.Project
 	}
 
-	lock.LockStack(stackName)
-	defer lock.UnlockStack(stackName)
+	stackLockKey := lock.StackKey(contextName, stackName)
 
-	project, deployConfig, err := loadComposeScheduledProjectAll(ctx, dockerCli, ref, secretProvider)
+	lock.LockStack(stackLockKey)
+	defer lock.UnlockStack(stackLockKey)
+
+	if opts.Admission != nil && !opts.Admission(contextName, labels) {
+		return ErrCertificateRotationPaused
+	}
+
+	// Lock the same cached-source path source.Prepare/recreateManagedProject use: reloading
+	// the project here decrypts files in place and must not race a concurrent Prepare or
+	// managed-recreate for the same repository.
+	sourceRepoPath, _, err := resolveScheduledSourceRepo(ref, opts.Scheduled.ComposeLoad.DataMountPath)
+	if err != nil {
+		return fmt.Errorf("%w: cannot resolve cached source for project %s: %v",
+			ErrComposeSourceRevisionConflict, ref.Project, err)
+	}
+
+	unlockSource, err := lockScheduledSource(ctx, ref, opts.Scheduled.ComposeLoad.DataMountPath, sourceRepoPath)
+	if err != nil {
+		return fmt.Errorf("%w: lock cached source for project %s: %v",
+			ErrComposeSourceRevisionConflict, ref.Project, err)
+	}
+	defer unlockSource()
+
+	project, deployConfig, err := loadComposeScheduledProjectAll(ctx, dockerCli, ref, secretProvider, opts.Scheduled)
 	if err != nil {
 		return fmt.Errorf("reload deploy config for cert rotation of %s: %w", ref.Project, err)
 	}
@@ -78,15 +113,19 @@ func RotateProjectCertificates(
 		return fmt.Errorf("select certificate-consuming services for rotation of %s: %w", ref.Project, err)
 	}
 
-	payload := certRotationPayload(labels)
+	payload := certRotationPayload(labels, resolvedSourceType(ref, opts.Scheduled))
 
-	timestamp := time.Now().UTC().Format(time.RFC3339)
+	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	latestCommit := strings.TrimSpace(labels[DocoCDLabels.Deployment.CommitSHA])
 	projectHash := strings.TrimSpace(labels[DocoCDLabels.Deployment.ComposeHash])
+	sourceURL := strings.TrimSpace(labels[DocoCDLabels.Source.URL])
 
-	addComposeServiceLabels(selectedProject, deployConfig, payload, ref.WorkingDir, app.Version, timestamp, ComposeVersion, latestCommit, projectHash)
+	addComposeServiceLabels(selectedProject, deployConfig, payload, sourceURL, ref.WorkingDir, app.Version, timestamp, ComposeVersion, latestCommit, projectHash)
 
-	if err = deployCompose(ctx, dockerCli, selectedProject, deployConfig, api.RecreateForce, serviceNames, nil, func(string) {}); err != nil {
+	deployOpts := composeDeployOptions{ArtifactRoot: artifactRootFromWorkingDir(ref.WorkingDir, deployConfig.WorkingDirectory)}
+
+	if err = deployCompose(ctx, dockerCli, selectedProject, deployConfig, api.RecreateForce, serviceNames, nil, func(string) {},
+		SelfDeployInputFromLabels(labels), deployOpts); err != nil {
 		return fmt.Errorf("redeploy project %s for cert rotation: %w", ref.Project, err)
 	}
 
@@ -97,40 +136,80 @@ func RotateProjectCertificates(
 // redeploys the whole stack. Unlike the standalone Compose path, no per-service selection is
 // needed: Swarm only recreates the tasks of services whose spec actually changed, so only the
 // services consuming the rotated certificate values end up being redeployed.
+//
+// contextName namespaces the per-stack lock and identifies the target to certOpts.Admission,
+// as in RotateProjectCertificates.
 func rotateSwarmProjectCertificates(
 	ctx context.Context,
+	contextName string,
 	dockerCli command.Cli,
 	labels map[string]string,
-	secretProvider *secretprovider.SecretProvider,
+	secretProvider secretprovider.SecretProvider,
+	certOpts CertificateRotationOptions,
 ) error {
 	ref, err := composeScheduledServiceRefFromSwarmLabels(labels)
 	if err != nil {
 		return fmt.Errorf("parse deployment labels for cert rotation: %w", err)
 	}
 
-	lock.LockStack(ref.Project)
-	defer lock.UnlockStack(ref.Project)
+	stackLockKey := lock.StackKey(contextName, ref.Project)
 
-	project, deployConfig, err := loadComposeScheduledProjectAll(ctx, dockerCli, ref, secretProvider)
+	lock.LockStack(stackLockKey)
+	defer lock.UnlockStack(stackLockKey)
+
+	if certOpts.Admission != nil && !certOpts.Admission(contextName, labels) {
+		return ErrCertificateRotationPaused
+	}
+
+	sourceRepoPath, _, err := resolveScheduledSourceRepo(ref, certOpts.Scheduled.ComposeLoad.DataMountPath)
+	if err != nil {
+		return fmt.Errorf("%w: cannot resolve cached source for project %s: %v",
+			ErrComposeSourceRevisionConflict, ref.Project, err)
+	}
+
+	unlockSource, err := lockScheduledSource(ctx, ref, certOpts.Scheduled.ComposeLoad.DataMountPath, sourceRepoPath)
+	if err != nil {
+		return fmt.Errorf("%w: lock cached source for project %s: %v",
+			ErrComposeSourceRevisionConflict, ref.Project, err)
+	}
+	defer unlockSource()
+
+	project, deployConfig, err := loadComposeScheduledProjectAll(ctx, dockerCli, ref, secretProvider, certOpts.Scheduled)
 	if err != nil {
 		return fmt.Errorf("reload deploy config for cert rotation of %s: %w", ref.Project, err)
 	}
 
-	payload := certRotationPayload(labels)
+	payload := certRotationPayload(labels, resolvedSourceType(ref, certOpts.Scheduled))
 
-	timestamp := time.Now().UTC().Format(time.RFC3339)
+	timestamp := time.Now().UTC().Format(time.RFC3339Nano)
 	latestCommit := strings.TrimSpace(labels[DocoCDLabels.Deployment.CommitSHA])
 	projectHash := strings.TrimSpace(labels[DocoCDLabels.Deployment.ComposeHash])
+	sourceURL := strings.TrimSpace(labels[DocoCDLabels.Source.URL])
 
 	cfg, opts, err := LoadSwarmStack(dockerCli, project, deployConfig, ref.WorkingDir)
 	if err != nil {
 		return fmt.Errorf("load swarm stack for cert rotation of %s: %w", ref.Project, err)
 	}
 
-	addSwarmServiceLabels(cfg, project, deployConfig, payload, ref.WorkingDir, app.Version, timestamp, latestCommit, projectHash)
-	addSwarmVolumeLabels(cfg, deployConfig, payload, ref.WorkingDir)
-	addSwarmConfigLabels(cfg, deployConfig, payload, ref.WorkingDir, app.Version, timestamp, latestCommit)
-	addSwarmSecretLabels(cfg, deployConfig, payload, ref.WorkingDir, app.Version, timestamp, latestCommit)
+	opts.Logger = slog.Default().With(slog.String("stack", ref.Project))
+
+	// Rotation updates the metadata of unchanged siblings too. Recover their stale
+	// mounts in that same update before the new timestamp can hide the replacement.
+	opts.ForceUpdateServices, err = staleSwarmArtifactServices(ctx, dockerCli.Client(), ref.Project, certOpts.Scheduled.ComposeLoad)
+	if err != nil {
+		return fmt.Errorf("check swarm artifacts for cert rotation of %s: %w", ref.Project, err)
+	}
+
+	addSwarmServiceLabels(cfg, project, deployConfig, payload, sourceURL, ref.WorkingDir, app.Version, timestamp, latestCommit, projectHash)
+	addSwarmVolumeLabels(cfg, deployConfig, payload)
+	addSwarmConfigLabels(cfg, deployConfig, payload, sourceURL, ref.WorkingDir, app.Version, timestamp, latestCommit)
+	addSwarmSecretLabels(cfg, deployConfig, payload, sourceURL, ref.WorkingDir, app.Version, timestamp, latestCommit)
+
+	artifactRoot := artifactRootFromWorkingDir(ref.WorkingDir, deployConfig.WorkingDirectory)
+	if err = pinUnchangedSwarmServices(ctx, dockerCli.Client(), cfg, ref.Project, artifactRoot, slog.Default()); err != nil {
+		slog.Warn("failed to keep unchanged services on their current artifact",
+			slog.String("project", ref.Project), logger.ErrAttr(err))
+	}
 
 	if err = removeMismatchedRecreatableVolumes(ctx, dockerCli.Client(), ref.Project, project); err != nil {
 		return fmt.Errorf("remove mismatched recreatable volumes for cert rotation of %s: %w", ref.Project, err)
@@ -140,7 +219,7 @@ func rotateSwarmProjectCertificates(
 		return fmt.Errorf("redeploy swarm stack %s for cert rotation: %w", ref.Project, err)
 	}
 
-	pruneSwarmStackRevisions(ctx, dockerCli, ref.Project, deployConfig)
+	pruneSwarmStackRevisions(ctx, dockerCli, ref.Project, deployConfig, certOpts)
 
 	return nil
 }
@@ -149,23 +228,15 @@ func rotateSwarmProjectCertificates(
 // rotation redeploy, honoring the same retention settings as a normal Swarm deploy. Prune
 // failures are only logged, not returned, since the certificate has already been redeployed
 // successfully by the time this runs.
-func pruneSwarmStackRevisions(ctx context.Context, dockerCli command.Cli, stackName string, deployConfig *deploy.Config) {
-	appConfig, err := app.GetConfig()
-	if err != nil {
-		slog.Warn("skipping swarm config/secret prune after cert rotation: failed to load app config",
-			slog.String("project", stackName), logger.ErrAttr(err))
-
-		return
-	}
-
-	if retention := deployConfig.ResolveSwarmConfigRetention(appConfig.DockerSwarmConfigRetention); retention >= 0 {
+func pruneSwarmStackRevisions(ctx context.Context, dockerCli command.Cli, stackName string, deployConfig *deploy.Config, opts CertificateRotationOptions) {
+	if retention := deployConfig.ResolveSwarmConfigRetention(opts.SwarmRetention.Config); retention >= 0 {
 		if err := PruneStackConfigs(ctx, dockerCli.Client(), stackName, retention); err != nil {
 			slog.Warn("failed to prune swarm stack configs after cert rotation",
 				slog.String("project", stackName), logger.ErrAttr(err))
 		}
 	}
 
-	if retention := deployConfig.ResolveSwarmSecretRetention(appConfig.DockerSwarmSecretRetention); retention >= 0 {
+	if retention := deployConfig.ResolveSwarmSecretRetention(opts.SwarmRetention.Secret); retention >= 0 {
 		if err := PruneStackSecrets(ctx, dockerCli.Client(), stackName, retention); err != nil {
 			slog.Warn("failed to prune swarm stack secrets after cert rotation",
 				slog.String("project", stackName), logger.ErrAttr(err))
@@ -173,14 +244,24 @@ func pruneSwarmStackRevisions(ctx context.Context, dockerCli command.Cli, stackN
 	}
 }
 
-// certRotationPayload builds a synthetic payload for relabeling purposes only. CommitSHA is
-// intentionally left as the zero value: ParsedPayload.TriggerString() falls back to
-// CommitSHAString(), which itself returns "" for a zero hash instead of panicking, but Trigger is
-// set explicitly anyway so the resulting label clearly identifies this as a rotation-driven
-// redeploy rather than an empty commit SHA.
-func certRotationPayload(labels map[string]string) *webhook.ParsedPayload {
+// resolvedSourceType reports the source type whose on-disk layout ref's repository actually
+// matches, falling back to the labeled one when neither directory is present.
+func resolvedSourceType(ref composeScheduledServiceRef, opts ScheduledComposeOptions) config.SourceType {
+	_, sourceType, err := resolveScheduledSourceRepo(ref, opts.ComposeLoad.DataMountPath)
+	if err != nil {
+		return config.NormalizeSourceType(config.SourceType(ref.SourceType))
+	}
+
+	return sourceType
+}
+
+// certRotationPayload builds a synthetic payload for relabeling rotated services.
+// Trigger identifies the rotation-driven redeploy, while CommitSHA remains unset.
+// sourceType reflects the source that actually resolved rather than a potentially stale label,
+// keeping recreated services consistent with the rest of the deployment.
+func certRotationPayload(labels map[string]string, sourceType config.SourceType) *webhook.ParsedPayload {
 	return &webhook.ParsedPayload{
-		Source:   webhook.PayloadSourceGit,
+		Source:   webhook.PayloadSource(SourceTypeLabelValue(string(sourceType), labels[DocoCDLabels.Source.Type])),
 		Trigger:  certRotationTrigger,
 		FullName: strings.TrimSpace(labels[DocoCDLabels.Source.Name]),
 		WebURL:   strings.TrimSpace(labels[DocoCDLabels.Source.URL]),

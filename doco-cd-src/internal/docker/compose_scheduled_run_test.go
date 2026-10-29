@@ -3,16 +3,23 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/compose-spec/compose-go/v2/types"
 	"github.com/docker/compose/v5/pkg/api"
+	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 
+	"github.com/kimdre/doco-cd/internal/config"
 	"github.com/kimdre/doco-cd/internal/config/deploy"
+	"github.com/kimdre/doco-cd/internal/git"
 	"github.com/kimdre/doco-cd/internal/secretprovider"
 	secrettypes "github.com/kimdre/doco-cd/internal/secretprovider/types"
+	"github.com/kimdre/doco-cd/internal/source/oci"
+	"github.com/kimdre/doco-cd/internal/source/store"
 )
 
 // stubSecretProvider is a minimal SecretProvider whose ResolveSecretReferences
@@ -37,10 +44,21 @@ func (s *stubSecretProvider) ResolveSecretReferences(_ context.Context, _ map[st
 	return s.resolved, s.err
 }
 
-// newStubProvider returns a secretprovider.SecretProvider pointer backed by stub.
-func newStubProvider(resolved map[string]string, err error) *secretprovider.SecretProvider {
+// stubBulkProvider adds bulk path support to stubSecretProvider.
+type stubBulkProvider struct {
+	stubSecretProvider
+
+	byPath map[string]map[string]string
+}
+
+func (s *stubBulkProvider) GetSecretsByPath(_ context.Context, path string, _ bool) (map[string]string, error) {
+	return s.byPath[path], nil
+}
+
+// newStubProvider returns a secretprovider.SecretProvider backed by stub.
+func newStubProvider(resolved map[string]string, err error) secretprovider.SecretProvider {
 	var sp secretprovider.SecretProvider = &stubSecretProvider{resolved: resolved, err: err}
-	return &sp
+	return sp
 }
 
 func TestComposeScheduledServiceRefFromLabels(t *testing.T) {
@@ -56,6 +74,7 @@ func TestComposeScheduledServiceRefFromLabels(t *testing.T) {
 			api.ConfigFilesLabel:                 "/repo/stack/compose.yaml, /repo/stack/compose.override.yaml",
 			DocoCDLabels.Source.Name:             "owner/repo",
 			DocoCDLabels.Source.URL:              "https://example.com/owner/repo",
+			DocoCDLabels.Source.Type:             "oci",
 			DocoCDLabels.Deployment.Name:         "stack-a",
 			DocoCDLabels.Deployment.ConfigTarget: "nas",
 			DocoCDLabels.Deployment.TargetRef:    "refs/heads/main",
@@ -81,6 +100,10 @@ func TestComposeScheduledServiceRefFromLabels(t *testing.T) {
 		// reconstruct a host-qualified repository path.
 		if ref.RepositoryURL != "https://example.com/owner/repo" {
 			t.Fatalf("unexpected repository url: %q", ref.RepositoryURL)
+		}
+
+		if ref.SourceType != "oci" {
+			t.Fatalf("unexpected source type: %q", ref.SourceType)
 		}
 
 		if ref.DeploymentName != "stack-a" {
@@ -110,6 +133,31 @@ func TestComposeScheduledServiceRefFromLabels(t *testing.T) {
 		}
 
 		if ref.RepositoryURL != "owner/repo" {
+			t.Fatalf("unexpected repository url: %q", ref.RepositoryURL)
+		}
+	})
+
+	// Regression test for https://github.com/kimdre/doco-cd/issues/1850: when the Git
+	// host serves HTTP(S) and SSH on different hostnames, the resolved URL used to
+	// clone/name the on-disk source (recorded in Source.URL) can be an SSH URL even
+	// though the webhook/poll payload's browsable URL used for commit statuses is
+	// HTTP(S). The reconstructed RepositoryURL must match the on-disk directory, i.e.
+	// come from Source.URL as recorded at deploy time, regardless of scheme.
+	t.Run("resolves repository url from source url label even when it is an ssh clone url", func(t *testing.T) {
+		t.Parallel()
+
+		ref, err := composeScheduledServiceRefFromLabels(map[string]string{
+			api.ProjectLabel:             "project-a",
+			api.ServiceLabel:             "backup",
+			DocoCDLabels.Source.Name:     "owner/repo",
+			DocoCDLabels.Source.URL:      "ssh://git@gits.example.com:222/owner/repo.git",
+			DocoCDLabels.Deployment.Name: "stack-a",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if ref.RepositoryURL != "ssh://git@gits.example.com:222/owner/repo.git" {
 			t.Fatalf("unexpected repository url: %q", ref.RepositoryURL)
 		}
 	})
@@ -184,6 +232,7 @@ func TestComposeScheduledServiceRefFromSwarmLabels(t *testing.T) {
 			DocoCDLabels.Deployment.WorkingDir:   "/repo/stack",
 			DocoCDLabels.Source.Name:             "owner/repo",
 			DocoCDLabels.Source.URL:              "https://example.com/owner/repo",
+			DocoCDLabels.Source.Type:             "oci",
 			DocoCDLabels.Deployment.ConfigTarget: "nas",
 			DocoCDLabels.Deployment.TargetRef:    "refs/heads/main",
 		})
@@ -211,6 +260,10 @@ func TestComposeScheduledServiceRefFromSwarmLabels(t *testing.T) {
 			t.Fatalf("unexpected repository url: %q", ref.RepositoryURL)
 		}
 
+		if ref.SourceType != "oci" {
+			t.Fatalf("unexpected source type: %q", ref.SourceType)
+		}
+
 		if ref.ConfigTarget != "nas" {
 			t.Fatalf("unexpected config target: %q", ref.ConfigTarget)
 		}
@@ -236,6 +289,25 @@ func TestComposeScheduledServiceRefFromSwarmLabels(t *testing.T) {
 		}
 	})
 
+	// Regression test for https://github.com/kimdre/doco-cd/issues/1850, see the
+	// equivalent case in TestComposeScheduledServiceRefFromLabels for details.
+	t.Run("resolves repository url from source url label even when it is an ssh clone url", func(t *testing.T) {
+		t.Parallel()
+
+		ref, err := composeScheduledServiceRefFromSwarmLabels(map[string]string{
+			DocoCDLabels.Deployment.Name: "stack-a",
+			DocoCDLabels.Source.Name:     "owner/repo",
+			DocoCDLabels.Source.URL:      "ssh://git@gits.example.com:222/owner/repo.git",
+		})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if ref.RepositoryURL != "ssh://git@gits.example.com:222/owner/repo.git" {
+			t.Fatalf("unexpected repository url: %q", ref.RepositoryURL)
+		}
+	})
+
 	t.Run("fails on nil label map", func(t *testing.T) {
 		t.Parallel()
 
@@ -255,6 +327,651 @@ func TestComposeScheduledServiceRefFromSwarmLabels(t *testing.T) {
 			t.Fatalf("expected ErrComposeScheduledMetadataUnavailable, got %v", err)
 		}
 	})
+}
+
+// TestLoadComposeScheduledDeployConfigResolvesRepoPathBySourceType reproduces the cert-rotation
+// bug where an OCI-sourced deployment's on-disk repository path was reconstructed with
+// git.GetRepoName() (which leaves the ":<tag>" suffix in place), pointing at a directory that
+// was never created on disk (the real directory, extracted at deploy time via
+// oci.RepositoryNameFromArtifact(), has no tag suffix). loadComposeScheduledDeployConfig must
+// branch on ref.SourceType the same way internal/source/prepare.go does for a fresh deploy.
+func TestLoadComposeScheduledDeployConfigResolvesRepoPathBySourceType(t *testing.T) {
+	t.Parallel()
+
+	writeDeployConfig := func(t *testing.T, repoDir, name string) {
+		t.Helper()
+
+		content := fmt.Sprintf("name: %s\n", name)
+		if err := os.WriteFile(filepath.Join(repoDir, ".doco-cd.yaml"), []byte(content), 0o600); err != nil {
+			t.Fatalf("write deploy config: %v", err)
+		}
+	}
+
+	t.Run("oci source resolves repo path without the artifact tag", func(t *testing.T) {
+		t.Parallel()
+
+		dataMountPath := t.TempDir()
+		artifactRef := "ghcr.io/kimdre/doco-cd_tests:compose-oci"
+		repoDir := filepath.Join(dataMountPath, oci.RepositoryNameFromArtifact(artifactRef))
+
+		if err := os.MkdirAll(repoDir, 0o755); err != nil {
+			t.Fatalf("mkdir repo dir: %v", err)
+		}
+
+		writeDeployConfig(t, repoDir, "compose-oci")
+
+		ref := composeScheduledServiceRef{
+			Project:        "compose-oci",
+			RepositoryURL:  artifactRef,
+			SourceType:     "oci",
+			DeploymentName: "compose-oci",
+		}
+
+		opts := ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}}
+
+		cfg, repoPath, err := loadComposeScheduledDeployConfig(context.Background(), ref, newStubProvider(nil, nil), opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if cfg.Name != "compose-oci" {
+			t.Fatalf("unexpected config name: %q", cfg.Name)
+		}
+
+		if repoPath != repoDir {
+			t.Fatalf("expected repo path %q, got %q", repoDir, repoPath)
+		}
+	})
+
+	t.Run("stale git label on an oci artifact still finds the extracted directory", func(t *testing.T) {
+		t.Parallel()
+
+		dataMountPath := t.TempDir()
+		artifactRef := "ghcr.io/kimdre/doco-cd_tests:compose-oci"
+		repoDir := filepath.Join(dataMountPath, oci.RepositoryNameFromArtifact(artifactRef))
+
+		if err := os.MkdirAll(repoDir, 0o755); err != nil {
+			t.Fatalf("mkdir repo dir: %v", err)
+		}
+
+		writeDeployConfig(t, repoDir, "compose-oci")
+
+		// Deployments created before the source type label existed carry "git" even though the
+		// source URL is an OCI artifact reference, see resolveScheduledSourceRepoPath.
+		ref := composeScheduledServiceRef{
+			Project:        "compose-oci",
+			RepositoryURL:  artifactRef,
+			SourceType:     "git",
+			DeploymentName: "compose-oci",
+		}
+
+		opts := ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}}
+
+		cfg, repoPath, err := loadComposeScheduledDeployConfig(context.Background(), ref, newStubProvider(nil, nil), opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if cfg.Name != "compose-oci" {
+			t.Fatalf("unexpected config name: %q", cfg.Name)
+		}
+
+		if repoPath != repoDir {
+			t.Fatalf("expected repo path %q, got %q", repoDir, repoPath)
+		}
+	})
+
+	t.Run("git source still resolves repo path via git.GetRepoName", func(t *testing.T) {
+		t.Parallel()
+
+		dataMountPath := t.TempDir()
+		repositoryURL := "https://example.com/owner/repo"
+		repoDir := filepath.Join(dataMountPath, git.GetRepoName(repositoryURL))
+
+		if err := os.MkdirAll(repoDir, 0o755); err != nil {
+			t.Fatalf("mkdir repo dir: %v", err)
+		}
+
+		writeDeployConfig(t, repoDir, "stack-a")
+
+		ref := composeScheduledServiceRef{
+			Project:        "stack-a",
+			RepositoryURL:  repositoryURL,
+			SourceType:     "git",
+			DeploymentName: "stack-a",
+		}
+
+		opts := ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}}
+
+		cfg, repoPath, err := loadComposeScheduledDeployConfig(context.Background(), ref, newStubProvider(nil, nil), opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if cfg.Name != "stack-a" {
+			t.Fatalf("unexpected config name: %q", cfg.Name)
+		}
+
+		if repoPath != repoDir {
+			t.Fatalf("expected repo path %q, got %q", repoDir, repoPath)
+		}
+	})
+
+	t.Run("git source resolves published artifact directory under the store base dir", func(t *testing.T) {
+		t.Parallel()
+
+		dataMountPath := t.TempDir()
+		repositoryURL := "https://example.com/owner/artifact-repo"
+		storeBaseDir := filepath.Join(dataMountPath, git.GetRepoName(repositoryURL))
+		commitSHA := "abc123def456"
+		artifactDir := filepath.Join(storeBaseDir, "artifacts", commitSHA)
+
+		if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+			t.Fatalf("mkdir artifact dir: %v", err)
+		}
+
+		writeDeployConfig(t, artifactDir, "stack-artifact")
+
+		ref := composeScheduledServiceRef{
+			Project:        "stack-artifact",
+			WorkingDir:     artifactDir,
+			RepositoryURL:  repositoryURL,
+			SourceType:     "git",
+			DeploymentName: "stack-artifact",
+		}
+
+		opts := ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}}
+
+		cfg, repoPath, err := loadComposeScheduledDeployConfig(context.Background(), ref, newStubProvider(nil, nil), opts)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if cfg.Name != "stack-artifact" {
+			t.Fatalf("unexpected config name: %q", cfg.Name)
+		}
+
+		if repoPath != artifactDir {
+			t.Fatalf("expected repo path %q, got %q", artifactDir, repoPath)
+		}
+	})
+
+	t.Run("config source and deployment repository use their own artifacts", func(t *testing.T) {
+		t.Parallel()
+
+		dataMountPath := t.TempDir()
+		configURL := "ghcr.io/owner/config:latest"
+		configRevision := "sha256:config123"
+		configStore := filepath.Join(dataMountPath, oci.RepositoryNameFromArtifact(configURL))
+		configArtifact := filepath.Join(configStore, store.ArtifactsSubdir, store.ArtifactDirName(store.Revision(configRevision)))
+
+		deploymentURL := "https://example.com/owner/app.git"
+		deploymentStore := filepath.Join(dataMountPath, git.GetRepoName(deploymentURL))
+		deploymentArtifact := filepath.Join(deploymentStore, store.ArtifactsSubdir, "abcdef123456")
+
+		if err := os.MkdirAll(configArtifact, 0o755); err != nil {
+			t.Fatalf("mkdir config artifact: %v", err)
+		}
+
+		if err := os.MkdirAll(deploymentArtifact, 0o755); err != nil {
+			t.Fatalf("mkdir deployment artifact: %v", err)
+		}
+
+		configYAML := "name: mixed-source\nrepository_url: " + deploymentURL + "\nreference: main\n"
+		if err := os.WriteFile(filepath.Join(configArtifact, ".doco-cd.yaml"), []byte(configYAML), 0o600); err != nil {
+			t.Fatalf("write deploy config: %v", err)
+		}
+
+		ref := composeScheduledServiceRef{
+			Project:          "mixed-source",
+			WorkingDir:       deploymentArtifact,
+			RepositoryURL:    configURL,
+			SourceType:       "oci",
+			DeploymentName:   "mixed-source",
+			ConfigRevision:   configRevision,
+			ConfigWorkingDir: configArtifact,
+		}
+
+		opts := ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}}
+
+		cfg, repoPath, err := loadComposeScheduledDeployConfig(context.Background(), ref, newStubProvider(nil, nil), opts)
+		if err != nil {
+			t.Fatalf("load mixed-source config: %v", err)
+		}
+
+		if cfg.RepositoryUrl != config.GitUrl(deploymentURL) {
+			t.Fatalf("RepositoryUrl = %q, want %q", cfg.RepositoryUrl, deploymentURL)
+		}
+
+		if repoPath != deploymentArtifact {
+			t.Fatalf("repo path = %q, want deployment artifact %q", repoPath, deploymentArtifact)
+		}
+	})
+}
+
+// TestLoadComposeScheduledDeployConfigReportsUnavailableSource covers the cold-start case the
+// certificate rotation watcher relies on: until the first poll has fetched a deployment's source
+// into the data mount, the reload must fail with ErrComposeScheduledSourceUnavailable so callers
+// can retry later instead of treating it as a broken deployment.
+func TestLoadComposeScheduledDeployConfigReportsUnavailableSource(t *testing.T) {
+	t.Parallel()
+
+	dataMountPath := t.TempDir()
+
+	ref := composeScheduledServiceRef{
+		Project:        "compose-oci",
+		Service:        "envoy",
+		RepositoryURL:  "ghcr.io/kimdre/doco-cd_tests:compose-oci",
+		SourceType:     "oci",
+		DeploymentName: "compose-oci",
+	}
+
+	opts := ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}}
+
+	_, _, err := loadComposeScheduledDeployConfig(context.Background(), ref, newStubProvider(nil, nil), opts)
+	if !errors.Is(err, ErrComposeScheduledSourceUnavailable) {
+		t.Fatalf("expected ErrComposeScheduledSourceUnavailable, got %v", err)
+	}
+}
+
+func TestLoadComposeScheduledDeployConfigDiscoversDeploymentReference(t *testing.T) {
+	t.Parallel()
+
+	for name, config := range map[string]string{
+		"explicit deployment reference":  "reference: feature\nworking_dir: stacks\nauto_discovery: true\n",
+		"inherited deployment reference": "working_dir: stacks\nauto_discovery: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			repo := newLayoutRepo(t)
+			repo.write(map[string]string{
+				".doco-cd.yaml":              config,
+				"stacks/shared/compose.yaml": "services: {}\n",
+			})
+
+			main := repo.commit("main config source")
+			if err := repo.wt.Checkout(&gogit.CheckoutOptions{
+				Branch: plumbing.NewBranchReferenceName("feature"),
+				Create: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			repo.write(map[string]string{
+				".doco-cd.yaml":                     "invalid: [\n",
+				"stacks/feature-only/compose.yaml":  "services: {}\n",
+				"stacks/feature-only/.doco-cd.yaml": "name: scheduled-feature\n",
+			})
+			feature := repo.commit("feature deployment source")
+
+			dataMountPath := t.TempDir()
+			repositoryURL := "file://" + filepath.ToSlash(repo.dir)
+
+			gitStore, err := store.NewGitStore(store.GitStoreOptions{
+				CloneURL: repositoryURL,
+				BaseDir:  filepath.Join(dataMountPath, git.GetRepoName(repositoryURL)),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			mainRevision, err := gitStore.Resolve(t.Context(), "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := gitStore.Publish(t.Context(), mainRevision); err != nil {
+				t.Fatal(err)
+			}
+
+			featureRevision, err := gitStore.Resolve(t.Context(), "feature")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			artifact, err := gitStore.Publish(t.Context(), featureRevision)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			cfg, repoPath, err := loadComposeScheduledDeployConfig(t.Context(), composeScheduledServiceRef{
+				Project:          "scheduled-feature",
+				Service:          "backup",
+				RepositoryURL:    repositoryURL,
+				SourceType:       "git",
+				DeploymentName:   "scheduled-feature",
+				Reference:        "feature",
+				ConfigRevision:   main.String(),
+				ConfigWorkingDir: ".",
+				WorkingDir:       filepath.Join(artifact.Path, "stacks", "feature-only"),
+			}, newStubProvider(nil, nil), ScheduledComposeOptions{
+				DeployConfigBaseDir: ".",
+				ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if cfg.Reference != "feature" || cfg.Internal.ConfigSourceRevision != main.String() ||
+				cfg.Internal.ConfigSourceWorkingDir != "." {
+				t.Fatalf("reloaded config lost separate deployment/config-source metadata: %+v", cfg)
+			}
+
+			if origin := cfg.Internal.AutoDiscoveryOrigin; origin == nil || origin.Revision != feature.String() {
+				t.Fatalf("discovery origin = %+v, want feature revision %s", origin, feature)
+			}
+
+			if repoPath != artifact.Path || cfg.WorkingDirectory != filepath.Join("stacks", "feature-only") {
+				t.Fatalf("deployment paths = %q, %q, want feature artifact %q and feature-only directory",
+					repoPath, cfg.WorkingDirectory, artifact.Path)
+			}
+		})
+	}
+}
+
+func TestLoadComposeScheduledDeployConfigUsesRecordedSnapshots(t *testing.T) {
+	t.Parallel()
+
+	for _, layout := range []string{
+		"same reference", "different reference", "qualified parent reference", "inherited reference",
+		"repository_url", "nested reference",
+	} {
+		for _, remoteState := range []string{"offline", "advanced", "removed branch"} {
+			t.Run(layout+"/"+remoteState, func(t *testing.T) {
+				t.Parallel()
+
+				deploymentRepo := newLayoutRepo(t)
+				repositoryURL := "file://" + filepath.ToSlash(deploymentRepo.dir)
+				deploymentReference := "main"
+
+				rootConfig := "working_dir: stacks\nauto_discovery: true\nenvironment:\n  CONFIG_SNAPSHOT: recorded\n"
+
+				switch layout {
+				case "different reference", "nested reference":
+					rootConfig = "reference: feature\n" + rootConfig
+				case "qualified parent reference":
+					rootConfig = "reference: refs/heads/feature\n" + rootConfig
+				}
+				// An unrelated discovery entry must not cause a reload to resolve another ref.
+				if layout != "nested reference" {
+					rootConfig += "---\nreference: unrelated\nworking_dir: stacks\nauto_discovery: true\n"
+				}
+
+				deploymentRepo.write(map[string]string{".doco-cd.yaml": rootConfig})
+				configRevision := deploymentRepo.commit("config source")
+
+				if layout != "same reference" {
+					deploymentReference = "feature"
+					if err := deploymentRepo.wt.Checkout(&gogit.CheckoutOptions{
+						Branch: plumbing.NewBranchReferenceName(deploymentReference),
+						Create: true,
+					}); err != nil {
+						t.Fatal(err)
+					}
+
+					deploymentRepo.write(map[string]string{".doco-cd.yaml": "invalid: [\n"})
+				}
+
+				nestedConfig := "name: scheduled-snapshot\nenvironment:\n  DEPLOYMENT_SNAPSHOT: recorded\n"
+				if layout == "nested reference" {
+					nestedConfig = "reference: other\n" + nestedConfig
+				}
+
+				deploymentRepo.write(map[string]string{
+					"stacks/alpha/compose.yaml": "services: {}\n",
+					"shared/deploy.yaml":        nestedConfig,
+				})
+
+				if err := os.Symlink("../../shared/deploy.yaml", filepath.Join(deploymentRepo.dir, "stacks/alpha/.doco-cd.yaml")); err != nil {
+					t.Fatal(err)
+				}
+
+				if _, err := deploymentRepo.wt.Add("stacks/alpha/.doco-cd.yaml"); err != nil {
+					t.Fatal(err)
+				}
+
+				deploymentRevision := deploymentRepo.commit("deployed snapshot")
+				if layout == "same reference" {
+					configRevision = deploymentRevision
+				}
+
+				dataMountPath := t.TempDir()
+				newStore := func(url string) *store.GitStore {
+					t.Helper()
+
+					gitStore, err := store.NewGitStore(store.GitStoreOptions{
+						CloneURL: url,
+						BaseDir:  filepath.Join(dataMountPath, git.GetRepoName(url)),
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					return gitStore
+				}
+				publish := func(gitStore *store.GitStore, reference string) store.Artifact {
+					t.Helper()
+
+					revision, err := gitStore.Resolve(t.Context(), reference)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					artifact, err := gitStore.Publish(t.Context(), revision)
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					return artifact
+				}
+
+				deploymentStore := newStore(repositoryURL)
+				configArtifact := publish(deploymentStore, "main")
+				deploymentArtifact := publish(deploymentStore, deploymentReference)
+
+				recordedReference := "refs/heads/" + deploymentReference
+				if layout == "qualified parent reference" {
+					recordedReference = deploymentReference
+				}
+
+				if layout == "nested reference" {
+					initialConfigs, err := deploy.GetConfigs(t.Context(), configArtifact.Path, ".", "", "main",
+						deploymentStore.MirrorDir(), configRevision.String(), &deploy.GitOptions{
+							SourceURL:     repositoryURL,
+							SourceBaseDir: dataMountPath,
+						})
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					initialConfig, err := findComposeScheduledDeployConfig(initialConfigs, "scheduled-snapshot")
+					if err != nil {
+						t.Fatal(err)
+					}
+
+					if origin := initialConfig.Internal.AutoDiscoveryOrigin; origin == nil ||
+						initialConfig.Reference != "feature" || origin.Reference != "feature" {
+						t.Fatalf("nested reference must not override parent discovery reference: config=%s origin=%+v",
+							initialConfig.Reference, origin)
+					}
+
+					recordedReference = initialConfig.Reference
+				}
+
+				if layout == "repository_url" {
+					configRepo := newLayoutRepo(t)
+					remoteConfig := "repository_url: " + repositoryURL + "\nreference: feature\n" + rootConfig
+					// Another repository using the same ref is not the recorded deployment source.
+					remoteConfig += "---\nrepository_url: file:///unavailable/other.git\nreference: feature\nauto_discovery: true\n"
+					configRepo.write(map[string]string{".doco-cd.yaml": remoteConfig})
+					configRevision = configRepo.commit("separate config repository")
+					repositoryURL = "file://" + filepath.ToSlash(configRepo.dir)
+					configArtifact = publish(newStore(repositoryURL), "main")
+				}
+
+				switch remoteState {
+				case "offline":
+					offlineDir := deploymentRepo.dir + "-offline"
+					if err := os.Rename(deploymentRepo.dir, offlineDir); err != nil {
+						t.Fatal(err)
+					}
+
+					t.Cleanup(func() {
+						if err := os.Rename(offlineDir, deploymentRepo.dir); err != nil {
+							t.Error(err)
+						}
+					})
+				case "advanced":
+					deploymentRepo.write(map[string]string{
+						"shared/deploy.yaml": "name: scheduled-snapshot\nenvironment:\n  DEPLOYMENT_SNAPSHOT: advanced\n",
+						".doco-cd.yaml":      "working_dir: stacks\nauto_discovery: true\nenvironment:\n  CONFIG_SNAPSHOT: advanced\n",
+					})
+					deploymentRepo.commit("remote branch advanced")
+					// Advance the mirror too: reading the locally cached branch is also incorrect.
+					if _, err := deploymentStore.Resolve(t.Context(), deploymentReference); err != nil {
+						t.Fatal(err)
+					}
+				case "removed branch":
+					if err := deploymentRepo.wt.Checkout(&gogit.CheckoutOptions{
+						Branch: plumbing.NewBranchReferenceName("replacement"),
+						Create: true,
+					}); err != nil {
+						t.Fatal(err)
+					}
+
+					if err := deploymentRepo.repo.Storer.RemoveReference(plumbing.NewBranchReferenceName(deploymentReference)); err != nil {
+						t.Fatal(err)
+					}
+
+					mirror, err := gogit.PlainOpen(deploymentStore.MirrorDir())
+					if err != nil {
+						t.Fatal(err)
+					}
+					// The reload must not depend on a surviving mirror ref either.
+					for _, reference := range []plumbing.ReferenceName{
+						plumbing.NewBranchReferenceName(deploymentReference),
+						plumbing.NewRemoteReferenceName("origin", deploymentReference),
+					} {
+						if err := mirror.Storer.RemoveReference(reference); err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+
+				ref := composeScheduledServiceRef{
+					Project:          "scheduled-snapshot",
+					Service:          "backup",
+					RepositoryURL:    repositoryURL,
+					SourceType:       "git",
+					DeploymentName:   "scheduled-snapshot",
+					Reference:        recordedReference,
+					ConfigRevision:   configRevision.String(),
+					ConfigWorkingDir: configArtifact.Path,
+					WorkingDir:       filepath.Join(deploymentArtifact.Path, "stacks", "alpha"),
+				}
+
+				cfg, repoPath, err := loadComposeScheduledDeployConfig(t.Context(), ref, newStubProvider(nil, nil),
+					ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}})
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if repoPath != deploymentArtifact.Path || cfg.WorkingDirectory != filepath.Join("stacks", "alpha") {
+					t.Fatalf("deployment paths = %q, %q, want recorded artifact %q and stacks/alpha",
+						repoPath, cfg.WorkingDirectory, deploymentArtifact.Path)
+				}
+
+				if cfg.Internal.ConfigSourceRevision != configRevision.String() ||
+					cfg.Internal.ConfigSourceWorkingDir != configArtifact.Path {
+					t.Fatalf("config source = %q, %q, want %s, %s", cfg.Internal.ConfigSourceRevision,
+						cfg.Internal.ConfigSourceWorkingDir, configRevision, configArtifact.Path)
+				}
+
+				if cfg.Internal.Environment["CONFIG_SNAPSHOT"] != "recorded" ||
+					cfg.Internal.Environment["DEPLOYMENT_SNAPSHOT"] != "recorded" {
+					t.Fatalf("reload used moving source settings: %v", cfg.Internal.Environment)
+				}
+
+				if layout == "nested reference" && cfg.Reference != recordedReference {
+					t.Fatalf("nested reference changed during reload: got %s, want %s", cfg.Reference, recordedReference)
+				}
+
+				if origin := cfg.Internal.AutoDiscoveryOrigin; origin == nil || origin.Revision != deploymentRevision.String() ||
+					origin.MirrorDir != deploymentStore.MirrorDir() {
+					t.Fatalf("discovery origin = %+v, want recorded revision %s and mirror %s",
+						origin, deploymentRevision, deploymentStore.MirrorDir())
+				}
+			})
+		}
+	}
+}
+
+func TestLoadComposeScheduledDeployConfigRequiresRecordedDeploymentArtifact(t *testing.T) {
+	t.Parallel()
+
+	dataMountPath := t.TempDir()
+	repositoryURL := "https://example.com/owner/config.git"
+	configRevision := "abcdef0123456789abcdef0123456789abcdef0123"
+	configArtifact := filepath.Join(dataMountPath, git.GetRepoName(repositoryURL), store.ArtifactsSubdir, configRevision)
+
+	if err := os.MkdirAll(configArtifact, 0o750); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(configArtifact, ".doco-cd.yaml"), []byte("auto_discovery: true\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err := loadComposeScheduledDeployConfig(t.Context(), composeScheduledServiceRef{
+		Project:        "scheduled",
+		RepositoryURL:  repositoryURL,
+		SourceType:     "git",
+		DeploymentName: "scheduled",
+		Reference:      "feature",
+		ConfigRevision: configRevision,
+		WorkingDir:     filepath.Join(dataMountPath, "deployment", store.ArtifactsSubdir, configRevision, "stack"),
+	}, newStubProvider(nil, nil), ScheduledComposeOptions{ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath}})
+	if !errors.Is(err, ErrComposeScheduledSourceUnavailable) {
+		t.Fatalf("missing recorded artifact error = %v, want ErrComposeScheduledSourceUnavailable", err)
+	}
+}
+
+func TestLoadComposeScheduledDeployConfigSetsConfigHash(t *testing.T) {
+	t.Parallel()
+
+	dataMountPath := t.TempDir()
+	repositoryURL := "https://example.com/owner/repo"
+
+	repoPath := filepath.Join(dataMountPath, git.GetRepoName(repositoryURL))
+	if err := os.MkdirAll(repoPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(repoPath, ".doco-cd.yaml"), []byte("name: stack-a\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	config, _, err := loadComposeScheduledDeployConfig(context.Background(), composeScheduledServiceRef{
+		Project:        "stack-a",
+		RepositoryURL:  repositoryURL,
+		SourceType:     "git",
+		DeploymentName: "stack-a",
+	}, newStubProvider(nil, nil), ScheduledComposeOptions{
+		ComposeLoad: ComposeLoadOptions{DataMountPath: dataMountPath},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	want, err := config.Hash()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if config.Internal.Hash != want {
+		t.Fatalf("config hash = %q, want %q", config.Internal.Hash, want)
+	}
 }
 
 func TestSplitCommaSeparatedLabelValues(t *testing.T) {
@@ -299,7 +1016,7 @@ func TestLoadComposeScheduledProject_RequiresComposeMetadata(t *testing.T) {
 		_, err := loadComposeScheduledProject(context.Background(), nil, composeScheduledServiceRef{
 			Project: "project-a",
 			Service: "backup",
-		}, nil)
+		}, nil, ScheduledComposeOptions{})
 		if !errors.Is(err, ErrComposeScheduledMetadataUnavailable) {
 			t.Fatalf("expected ErrComposeScheduledMetadataUnavailable, got %v", err)
 		}
@@ -312,7 +1029,7 @@ func TestLoadComposeScheduledProject_RequiresComposeMetadata(t *testing.T) {
 			Project:    "project-a",
 			Service:    "backup",
 			WorkingDir: "/some/dir",
-		}, nil)
+		}, nil, ScheduledComposeOptions{})
 		if !errors.Is(err, ErrComposeScheduledMetadataUnavailable) {
 			t.Fatalf("expected ErrComposeScheduledMetadataUnavailable, got %v", err)
 		}
@@ -325,7 +1042,7 @@ func TestLoadComposeScheduledProject_RequiresComposeMetadata(t *testing.T) {
 			Project:     "project-a",
 			Service:     "backup",
 			ConfigFiles: []string{"/some/compose.yaml"},
-		}, nil)
+		}, nil, ScheduledComposeOptions{})
 		if !errors.Is(err, ErrComposeScheduledMetadataUnavailable) {
 			t.Fatalf("expected ErrComposeScheduledMetadataUnavailable, got %v", err)
 		}
@@ -355,7 +1072,7 @@ func TestPrepareComposeScheduledDeployConfig(t *testing.T) {
 			},
 		}
 
-		if err := prepareComposeScheduledDeployConfig(context.Background(), cfg, sourceRepoPath, sourceRepoPath, provider); err != nil {
+		if err := prepareComposeScheduledDeployConfig(context.Background(), cfg, sourceRepoPath, sourceRepoPath, provider, ScheduledComposeOptions{}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
@@ -369,6 +1086,56 @@ func TestPrepareComposeScheduledDeployConfig(t *testing.T) {
 
 		if cfg.Internal.Environment["API_KEY"] != "abc123" {
 			t.Fatalf("expected API_KEY from provider, got %q", cfg.Internal.Environment["API_KEY"])
+		}
+	})
+
+	t.Run("resolves bulk secret paths", func(t *testing.T) {
+		t.Parallel()
+
+		provider := &stubBulkProvider{
+			resolved: map[string]string{"SECRET": "explicit"},
+			byPath: map[string]map[string]string{
+				"apps": {"db-password": "bulk-pw", "SECRET": "bulk-secret"},
+			},
+		}
+
+		cfg := &deploy.Config{
+			Name:             "project-a",
+			WorkingDirectory: ".",
+			ExternalSecrets: map[string]secrettypes.ExternalSecretRef{
+				"SECRET": {LegacyRef: "store/secret"}, //nolint:gosec // test data, not real credentials
+			},
+			ExternalSecretsPaths: []secrettypes.ExternalSecretsPath{{Path: "apps", Prefix: "APP_"}},
+		}
+
+		repoPath := t.TempDir()
+		if err := prepareComposeScheduledDeployConfig(context.Background(), cfg, repoPath, repoPath, provider, ScheduledComposeOptions{}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if got := cfg.Internal.Environment["APP_DB_PASSWORD"]; got != "bulk-pw" {
+			t.Fatalf("expected APP_DB_PASSWORD from bulk path, got %q", got)
+		}
+
+		if got := cfg.Internal.Environment["SECRET"]; got != "explicit" {
+			t.Fatalf("expected explicit secret to win, got %q", got)
+		}
+	})
+
+	t.Run("bulk secret paths need a provider with bulk support", func(t *testing.T) {
+		t.Parallel()
+
+		cfg := &deploy.Config{
+			Name:                 "project-a",
+			WorkingDirectory:     ".",
+			ExternalSecretsPaths: []secrettypes.ExternalSecretsPath{{Path: "apps"}},
+		}
+
+		repoPath := t.TempDir()
+
+		err := prepareComposeScheduledDeployConfig(context.Background(), cfg, repoPath, repoPath, newStubProvider(nil, nil), ScheduledComposeOptions{})
+		if !errors.Is(err, secrettypes.ErrBulkNotSupported) {
+			t.Fatalf("expected ErrBulkNotSupported, got %v", err)
 		}
 	})
 
@@ -386,7 +1153,7 @@ func TestPrepareComposeScheduledDeployConfig(t *testing.T) {
 			},
 		}
 
-		err := prepareComposeScheduledDeployConfig(context.Background(), cfg, t.TempDir(), t.TempDir(), provider)
+		err := prepareComposeScheduledDeployConfig(context.Background(), cfg, t.TempDir(), t.TempDir(), provider, ScheduledComposeOptions{})
 		if !errors.Is(err, providerErr) {
 			t.Fatalf("expected provider error, got %v", err)
 		}
@@ -406,7 +1173,7 @@ func TestPrepareComposeScheduledDeployConfig(t *testing.T) {
 			EnvFiles:         []string{".env"},
 		}
 
-		if err := prepareComposeScheduledDeployConfig(context.Background(), cfg, repoPath, repoPath, nil); err != nil {
+		if err := prepareComposeScheduledDeployConfig(context.Background(), cfg, repoPath, repoPath, nil, ScheduledComposeOptions{}); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
@@ -418,8 +1185,10 @@ func TestPrepareComposeScheduledDeployConfig(t *testing.T) {
 
 func TestLoadComposeScheduledProject_InterpolatesDeployConfigEnvironment(t *testing.T) {
 	dataMountPath := t.TempDir()
-	t.Setenv("DATA_MOUNT_PATH", dataMountPath)
-	t.Setenv("DEPLOY_CONFIG_BASE_DIR", "/")
+	opts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
 
 	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
 
@@ -453,7 +1222,7 @@ environment:
 		RepositoryURL:  "https://example.com/owner/repo",
 		DeploymentName: "adguard-dns",
 		Reference:      "refs/heads/main",
-	}, nil)
+	}, nil, opts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -472,6 +1241,55 @@ environment:
 	}
 }
 
+// TestLoadComposeScheduledProject_FallsBackWhenLabeledComposeFileIsStale is a
+// regression test for https://github.com/kimdre/doco-cd/issues/1737.
+func TestLoadComposeScheduledProject_FallsBackWhenLabeledComposeFileIsStale(t *testing.T) {
+	dataMountPath := t.TempDir()
+	opts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
+
+	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
+
+	workingDir := filepath.Join(repoRoot, "apps", "imap-backup")
+	if err := os.MkdirAll(workingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the renamed file exists; the label still points at the old name.
+	createComposeFile(t, filepath.Join(workingDir, "compose.yaml"), `services:
+  backup:
+    image: busybox:latest
+`)
+
+	createComposeFile(t, filepath.Join(repoRoot, ".doco-cd.yml"), `name: imap-backup
+reference: refs/heads/main
+working_dir: apps/imap-backup
+compose_files:
+  - compose.yaml
+`)
+
+	staleComposePath := filepath.Join(workingDir, "docker-compose.yml")
+
+	project, err := loadComposeScheduledProject(context.Background(), nil, composeScheduledServiceRef{
+		Project:        "imap-backup",
+		Service:        "backup",
+		WorkingDir:     workingDir,
+		ConfigFiles:    []string{staleComposePath},
+		RepositoryURL:  "https://example.com/owner/repo",
+		DeploymentName: "imap-backup",
+		Reference:      "refs/heads/main",
+	}, nil, opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if _, err := project.GetService("backup"); err != nil {
+		t.Fatalf("failed to get backup service: %v", err)
+	}
+}
+
 // TestLoadComposeScheduledProject_ResolvesExternalSecrets is a regression test
 // for https://github.com/kimdre/doco-cd/issues/1674: external secrets must be
 // re-resolved and interpolated into the compose service environment when a
@@ -479,8 +1297,10 @@ environment:
 // its deploy config at run time.
 func TestLoadComposeScheduledProject_ResolvesExternalSecrets(t *testing.T) {
 	dataMountPath := t.TempDir()
-	t.Setenv("DATA_MOUNT_PATH", dataMountPath)
-	t.Setenv("DEPLOY_CONFIG_BASE_DIR", "/")
+	opts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
 
 	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
 
@@ -522,7 +1342,7 @@ external_secrets:
 		RepositoryURL:  "https://example.com/owner/repo",
 		DeploymentName: "backup-job",
 		Reference:      "refs/heads/main",
-	}, newStubProvider(map[string]string{"MY_SECRET": "resolved-secret"}, nil))
+	}, newStubProvider(map[string]string{"MY_SECRET": "resolved-secret"}, nil), opts)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -538,6 +1358,236 @@ external_secrets:
 
 	if *svc.Environment["MY_SECRET"] != "resolved-secret" {
 		t.Fatalf("expected MY_SECRET to be resolved from external secret provider, got %q", *svc.Environment["MY_SECRET"])
+	}
+}
+
+// TestLoadComposeScheduledProject_ResolvesExternalSecretsFromFile proves that
+// external secrets declared via external_secrets_files (rather than inline
+// external_secrets) are loaded and resolved correctly when a scheduled job
+// reloads its deploy config at run time, exercising the
+// deploy.LoadExternalSecretsFiles/MergeExternalSecretsFromFiles wiring added
+// to prepareComposeScheduledDeployConfig.
+func TestLoadComposeScheduledProject_ResolvesExternalSecretsFromFile(t *testing.T) {
+	dataMountPath := t.TempDir()
+	opts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
+
+	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
+
+	workingDir := filepath.Join(repoRoot, "stacks", "nas", "backup")
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(workingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	composePath := filepath.Join(workingDir, "compose.yml")
+	createComposeFile(t, composePath, `services:
+  backup:
+    image: busybox:latest
+    environment:
+      MY_SECRET: ${MY_SECRET}
+`)
+
+	createComposeFile(t, filepath.Join(workingDir, "secrets.doco-cd.yaml"), `MY_SECRET:
+  store_ref: bitwarden-login
+  remote_ref:
+    key: my-bitwarden-item-id
+    property: password
+`)
+
+	createComposeFile(t, filepath.Join(repoRoot, ".doco-cd.yml"), `name: backup-job
+reference: refs/heads/main
+working_dir: stacks/nas/backup
+compose_files:
+  - compose.yml
+external_secrets_files:
+  - secrets.doco-cd.yaml
+`)
+
+	project, err := loadComposeScheduledProject(context.Background(), nil, composeScheduledServiceRef{
+		Project:        "backup-job",
+		Service:        "backup",
+		WorkingDir:     workingDir,
+		ConfigFiles:    []string{composePath},
+		RepositoryURL:  "https://example.com/owner/repo",
+		DeploymentName: "backup-job",
+		Reference:      "refs/heads/main",
+	}, newStubProvider(map[string]string{"MY_SECRET": "resolved-from-file"}, nil), opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	svc, err := project.GetService("backup")
+	if err != nil {
+		t.Fatalf("failed to get backup service: %v", err)
+	}
+
+	if svc.Environment == nil || svc.Environment["MY_SECRET"] == nil {
+		t.Fatal("expected MY_SECRET to be present in service environment")
+	}
+
+	if *svc.Environment["MY_SECRET"] != "resolved-from-file" {
+		t.Fatalf("expected MY_SECRET to be resolved from external_secrets_files, got %q", *svc.Environment["MY_SECRET"])
+	}
+}
+
+// TestLoadComposeScheduledProject_InlineExternalSecretsWinOverFile proves that
+// when the same env var is defined both in external_secrets_files and inline
+// external_secrets, the inline value is what actually reaches the resolved
+// compose service environment, through the full prepareComposeScheduledDeployConfig
+// wiring (not just the isolated MergeExternalSecretsFromFiles unit test).
+func TestLoadComposeScheduledProject_InlineExternalSecretsWinOverFile(t *testing.T) {
+	dataMountPath := t.TempDir()
+	opts := ScheduledComposeOptions{
+		ComposeLoad:         ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir: "/",
+	}
+
+	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
+
+	workingDir := filepath.Join(repoRoot, "stacks", "nas", "backup")
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(workingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	composePath := filepath.Join(workingDir, "compose.yml")
+	createComposeFile(t, composePath, `services:
+  backup:
+    image: busybox:latest
+    environment:
+      MY_SECRET: ${MY_SECRET}
+`)
+
+	createComposeFile(t, filepath.Join(workingDir, "secrets.doco-cd.yaml"), `MY_SECRET:
+  store_ref: file-store
+  remote_ref:
+    key: file-item-id
+    property: password
+`)
+
+	createComposeFile(t, filepath.Join(repoRoot, ".doco-cd.yml"), `name: backup-job
+reference: refs/heads/main
+working_dir: stacks/nas/backup
+compose_files:
+  - compose.yml
+external_secrets_files:
+  - secrets.doco-cd.yaml
+external_secrets:
+  MY_SECRET:
+    store_ref: bitwarden-login
+    remote_ref:
+      key: my-bitwarden-item-id
+      property: password
+`)
+
+	project, err := loadComposeScheduledProject(context.Background(), nil, composeScheduledServiceRef{
+		Project:        "backup-job",
+		Service:        "backup",
+		WorkingDir:     workingDir,
+		ConfigFiles:    []string{composePath},
+		RepositoryURL:  "https://example.com/owner/repo",
+		DeploymentName: "backup-job",
+		Reference:      "refs/heads/main",
+	}, newStubProvider(map[string]string{"MY_SECRET": "resolved-inline"}, nil), opts)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	svc, err := project.GetService("backup")
+	if err != nil {
+		t.Fatalf("failed to get backup service: %v", err)
+	}
+
+	if svc.Environment == nil || svc.Environment["MY_SECRET"] == nil {
+		t.Fatal("expected MY_SECRET to be present in service environment")
+	}
+
+	if *svc.Environment["MY_SECRET"] != "resolved-inline" {
+		t.Fatalf("expected MY_SECRET to be resolved from inline external_secrets (taking precedence over the file), got %q", *svc.Environment["MY_SECRET"])
+	}
+}
+
+// TestLoadComposeScheduledProject_InterpolateExternalSecretsHonoredIndependentOfEnvVar
+// proves that legacy external secret reference interpolation is controlled solely by
+// ScheduledComposeOptions.InterpolateExternalSecrets, not by reading the
+// INTERPOLATE_EXTERNAL_SECRETS environment variable directly. A legacy reference containing
+// an unset variable is left untouched (and so resolves without error) when the option is
+// false, even if a stale INTERPOLATE_EXTERNAL_SECRETS=true is set in the environment; it only
+// fails interpolation (as expected) when the option is explicitly enabled.
+func TestLoadComposeScheduledProject_InterpolateExternalSecretsHonoredIndependentOfEnvVar(t *testing.T) {
+	dataMountPath := t.TempDir()
+
+	repoRoot := filepath.Join(dataMountPath, "example.com", "owner", "repo")
+	workingDir := filepath.Join(repoRoot, "stacks", "nas", "backup")
+
+	if err := os.MkdirAll(filepath.Join(repoRoot, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.MkdirAll(workingDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	composePath := filepath.Join(workingDir, "compose.yml")
+	createComposeFile(t, composePath, `services:
+  backup:
+    image: busybox:latest
+    environment:
+      MY_SECRET: ${MY_SECRET}
+`)
+
+	// The legacy reference contains an unguarded variable that is never set in the
+	// process environment; interpolating it must fail because it becomes a
+	// required-but-absent variable.
+	createComposeFile(t, filepath.Join(repoRoot, ".doco-cd.yml"), `name: backup-job
+reference: refs/heads/main
+working_dir: stacks/nas/backup
+compose_files:
+  - compose.yml
+external_secrets:
+  MY_SECRET: item-$UNSET_SECRET_SUFFIX
+`)
+
+	ref := composeScheduledServiceRef{
+		Project:        "backup-job",
+		Service:        "backup",
+		WorkingDir:     workingDir,
+		ConfigFiles:    []string{composePath},
+		RepositoryURL:  "https://example.com/owner/repo",
+		DeploymentName: "backup-job",
+		Reference:      "refs/heads/main",
+	}
+	provider := newStubProvider(map[string]string{"MY_SECRET": "resolved-secret"}, nil)
+
+	// A stale INTERPOLATE_EXTERNAL_SECRETS=true must have no effect: production code no
+	// longer reads this environment variable, only the explicit
+	// ScheduledComposeOptions.InterpolateExternalSecrets field.
+	t.Setenv("INTERPOLATE_EXTERNAL_SECRETS", "true")
+
+	disabledOpts := ScheduledComposeOptions{
+		ComposeLoad:                ComposeLoadOptions{DataMountPath: dataMountPath},
+		DeployConfigBaseDir:        "/",
+		InterpolateExternalSecrets: false,
+	}
+
+	if _, err := loadComposeScheduledProject(context.Background(), nil, ref, provider, disabledOpts); err != nil {
+		t.Fatalf("expected no error with InterpolateExternalSecrets=false despite INTERPOLATE_EXTERNAL_SECRETS=true, got: %v", err)
+	}
+
+	enabledOpts := disabledOpts
+	enabledOpts.InterpolateExternalSecrets = true
+
+	if _, err := loadComposeScheduledProject(context.Background(), nil, ref, provider, enabledOpts); err == nil {
+		t.Fatal("expected an error with InterpolateExternalSecrets=true and an unset reference variable, got nil")
 	}
 }
 
@@ -679,6 +1729,60 @@ func TestGetServiceSchedulerLabels(t *testing.T) {
 	})
 }
 
+func TestPrepareComposeScheduledHookProject(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		policy string
+		want   string
+	}{
+		{policy: "", want: types.PullPolicyMissing},
+		{policy: types.PullPolicyMissing, want: types.PullPolicyMissing},
+		{policy: types.PullPolicyIfNotPresent, want: types.PullPolicyMissing},
+		{policy: types.PullPolicyAlways, want: types.PullPolicyMissing},
+		{policy: types.PullPolicyRefresh, want: types.PullPolicyMissing},
+		{policy: "daily", want: types.PullPolicyMissing},
+		{policy: "every_12h", want: types.PullPolicyMissing},
+		{policy: types.PullPolicyNever, want: types.PullPolicyNever},
+		{policy: types.PullPolicyBuild, want: types.PullPolicyBuild},
+	} {
+		t.Run("policy "+tt.policy, func(t *testing.T) {
+			t.Parallel()
+
+			project := &types.Project{
+				Name:         "stack",
+				WorkingDir:   "/stacks/stack",
+				ComposeFiles: []string{"/stacks/stack/compose.yaml"},
+				Services: types.Services{
+					"backup": {
+						Name: "backup",
+						ContainerSpec: types.ContainerSpec{
+							Image:        "alpine:3.22",
+							PullPolicy:   tt.policy,
+							CustomLabels: map[string]string{"user": "label"},
+						},
+						PreStart: []types.PreStartHook{{}},
+					},
+				},
+			}
+
+			prepareComposeScheduledHookProject(project, "backup")
+
+			svc := project.Services["backup"]
+			if svc.PullPolicy != tt.want {
+				t.Fatalf("pull policy = %q, want %q", svc.PullPolicy, tt.want)
+			}
+
+			if svc.CustomLabels["user"] != "label" ||
+				svc.CustomLabels[api.ProjectLabel] != "stack" ||
+				svc.CustomLabels[api.ServiceLabel] != "backup" ||
+				svc.CustomLabels[api.OneoffLabel] != "False" {
+				t.Fatalf("missing Compose tracking labels: %v", svc.CustomLabels)
+			}
+		})
+	}
+}
+
 func TestPrepareComposeProjectForOneOffRun(t *testing.T) {
 	t.Parallel()
 
@@ -764,4 +1868,60 @@ func TestPrepareComposeProjectForOneOffRun(t *testing.T) {
 			t.Fatal("expected error for missing service, got nil")
 		}
 	})
+
+	t.Run("rejects pre_start before preparing an execution", func(t *testing.T) {
+		t.Parallel()
+
+		project := &types.Project{Services: types.Services{
+			"backup": {Name: "backup", PreStart: []types.PreStartHook{{}}},
+		}}
+
+		got, err := prepareComposeProjectForOneOffRunWithOptions(project, "backup", ComposeOneOffOptions{RunID: "run"})
+		if !errors.Is(err, ErrComposeOneOffPreStartUnsupported) || got != nil {
+			t.Fatalf("one-off project = %v, error = %v, want unsupported pre_start", got, err)
+		}
+
+		if project.Services["backup"].Labels[DocoCDJobLabels.JobEphemeral] != "" {
+			t.Fatal("rejected execution mutated the source")
+		}
+	})
+}
+
+func TestScheduledDiscoveryGitOptions(t *testing.T) {
+	t.Parallel()
+
+	load := ComposeLoadOptions{
+		SkipTLSVerify:           true,
+		GitCloneSubmodules:      true,
+		GitCloneDepth:           5,
+		SSHPrivateKey:           "key",
+		SSHPrivateKeyPassphrase: "passphrase",
+		DataMountPath:           "/data",
+	}
+
+	got := scheduledDiscoveryGitOptions(composeScheduledServiceRef{RepositoryURL: "https://example.com/owner/repo.git"}, load)
+
+	want := deploy.GitOptions{
+		SSHPrivateKey:           "key",
+		SSHPrivateKeyPassphrase: "passphrase",
+		SkipTLSVerification:     true,
+		GitCloneSubmodules:      true,
+		GitCloneDepth:           5,
+		SourceURL:               "https://example.com/owner/repo.git",
+		SourceBaseDir:           "/data",
+	}
+	if *got != want {
+		t.Fatalf("scheduledDiscoveryGitOptions() = %+v, want %+v", *got, want)
+	}
+
+	for _, repositoryURL := range []string{"git@example.com:owner/repo.git", "ssh://git@example.com/owner/repo.git"} {
+		if got := scheduledDiscoveryGitOptions(composeScheduledServiceRef{RepositoryURL: repositoryURL}, load); got.SourceURL != repositoryURL {
+			t.Errorf("SourceURL = %q, want %q", got.SourceURL, repositoryURL)
+		}
+	}
+
+	// The short source name label cannot be fetched.
+	if got := scheduledDiscoveryGitOptions(composeScheduledServiceRef{RepositoryURL: "owner/repo"}, load); got.SourceURL != "" {
+		t.Errorf("SourceURL = %q for a short source name, want empty", got.SourceURL)
+	}
 }
